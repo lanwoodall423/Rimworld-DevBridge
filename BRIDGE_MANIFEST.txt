@@ -1,0 +1,5 @@
+bridge=1.4.1
+protocol=9
+schema=e12b709c
+handoff=BRIDGE_HANDOFF.md
+changes=Failed feature-test suites now remain queued with retry metadata until they pass
