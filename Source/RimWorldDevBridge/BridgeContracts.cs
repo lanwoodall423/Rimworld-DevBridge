@@ -1,0 +1,255 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using Verse;
+
+namespace RimWorldDevBridge
+{
+    public enum BridgeStatus
+    {
+        OK,
+        NOT_FOUND,
+        INVALID_ARGUMENT,
+        UNAVAILABLE,
+        INCOMPATIBLE,
+        FORBIDDEN,
+        TIMEOUT,
+        CANCELLED,
+        BUSY,
+        PARTIAL,
+        BLOCKED,
+        ERROR
+    }
+
+    public enum BridgeCommandMode
+    {
+        PureRead = 0,
+        UiOnly = 1,
+        Reversible = 2,
+        TemporaryTestMutation = 3,
+        PersistentMutation = 4,
+        PotentiallyDestructive = 5
+    }
+
+    public enum BridgeCostClass
+    {
+        Trivial = 0,
+        Normal = 1,
+        Expensive = 2,
+        Simulation = 3
+    }
+
+    public sealed class BridgeCommandDescriptor
+    {
+        public string Name { get; set; }
+        public string Description { get; set; }
+        public string Provider { get; set; }
+        public string ProviderVersion { get; set; }
+        public BridgeCommandMode Mode { get; set; }
+        public BridgeCostClass Cost { get; set; }
+        public bool RequiresMap { get; set; }
+        public string ArgumentSchema { get; set; }
+        public string ResultSchema { get; set; }
+        public int SchemaVersion { get; set; } = 1;
+        public int MinimumExecutionBudgetMs { get; set; } = 25;
+
+        public BridgeCommandDescriptor Clone()
+        {
+            return (BridgeCommandDescriptor)MemberwiseClone();
+        }
+    }
+
+    public sealed class BridgeField
+    {
+        public string Name { get; set; }
+        public string Value { get; set; }
+
+        public BridgeField() { }
+        public BridgeField(string name, object value)
+        {
+            Name = name ?? "value";
+            Value = BridgeText.Invariant(value);
+        }
+    }
+
+    public sealed class BridgeResult
+    {
+        public string RequestId { get; set; }
+        public string SessionId { get; set; }
+        public string Command { get; set; }
+        public string Provider { get; set; } = "core";
+        public string ProviderVersion { get; set; } = BridgeProtocol.BridgeVersion;
+        public BridgeCommandMode Mode { get; set; } = BridgeCommandMode.PureRead;
+        public BridgeStatus Status { get; set; } = BridgeStatus.OK;
+        public string Schema { get; set; } = "core.result";
+        public int SchemaVersion { get; set; } = 1;
+        public double QueueDelayMs { get; set; }
+        public double ExecutionMs { get; set; }
+        public int TickBefore { get; set; } = -1;
+        public int TickAfter { get; set; } = -1;
+        public bool Truncated { get; set; }
+        public string ContinuationCursor { get; set; }
+        public string MutationSummary { get; set; } = "none";
+        public List<BridgeField> Data { get; } = new List<BridgeField>();
+        public List<string> Lines { get; } = new List<string>();
+        public List<string> Warnings { get; } = new List<string>();
+
+        public bool IsSuccess => Status == BridgeStatus.OK || Status == BridgeStatus.PARTIAL;
+
+        public BridgeResult Add(string name, object value)
+        {
+            Data.Add(new BridgeField(name, value));
+            return this;
+        }
+
+        public BridgeResult AddLine(string line)
+        {
+            Lines.Add(BridgeText.Clean(line));
+            return this;
+        }
+
+        public BridgeResult Warn(string warning)
+        {
+            if (!string.IsNullOrWhiteSpace(warning)) Warnings.Add(BridgeText.Clean(warning));
+            return this;
+        }
+
+        public static BridgeResult Ok(string schema = "core.result") =>
+            new BridgeResult { Status = BridgeStatus.OK, Schema = schema };
+
+        public static BridgeResult Fail(BridgeStatus status, string code, string detail = null)
+        {
+            BridgeResult result = new BridgeResult { Status = status };
+            if (!string.IsNullOrEmpty(code)) result.Add("error", code);
+            if (!string.IsNullOrEmpty(detail)) result.Add("detail", detail);
+            return result;
+        }
+
+        public static BridgeResult FromLegacy(IEnumerable<string> values)
+        {
+            BridgeResult result = Ok("legacy.lines");
+            foreach (string value in values ?? Enumerable.Empty<string>())
+                result.AddLine(value);
+            string joined = string.Join("\n", result.Lines);
+            if (result.Lines.Count == 0)
+                return Fail(BridgeStatus.ERROR, "empty_adapter_response");
+            if (ContainsSemantic(joined, "not_found") || ContainsSemantic(joined, "not found"))
+                result.Status = BridgeStatus.NOT_FOUND;
+            else if (result.Lines.Any(line => line.IndexOf("=invalid", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                ContainsSemantic(joined, "expected:"))
+                result.Status = BridgeStatus.INVALID_ARGUMENT;
+            else if (ContainsSemantic(joined, "no active map") || ContainsSemantic(joined, "map=none"))
+                result.Status = BridgeStatus.UNAVAILABLE;
+            else if (result.Lines.Any(line => line.StartsWith("error=", StringComparison.OrdinalIgnoreCase)))
+                result.Status = BridgeStatus.ERROR;
+            return result;
+        }
+
+        private static bool ContainsSemantic(string value, string token) =>
+            value?.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    public sealed class BridgeRequest
+    {
+        public string RequestId { get; set; }
+        public string SessionId { get; set; }
+        public string Command { get; set; }
+        public string Argument { get; set; }
+        public DateTime EnqueuedUtc { get; set; }
+        public DateTime DeadlineUtc { get; set; }
+        public string IdempotencyKey { get; set; }
+        public string OutputFormat { get; set; } = "line";
+        public string DetailLevel { get; set; } = "compact";
+        public bool AllowExpensive { get; set; }
+        public BridgeCommandMode Mode { get; set; }
+        public BridgeCostClass Cost { get; set; }
+        public volatile bool Cancelled;
+        public volatile bool ClientDisconnected;
+        public volatile bool Started;
+        internal string AuthToken;
+        internal string PreparedAdapterId;
+        internal string PreparedAdapterGeneration;
+        internal BridgeCommandDescriptor PreparedDescriptor;
+        internal object PreparedPayload;
+        internal int NestingDepth;
+        internal readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
+        internal BridgeResult Result;
+
+        public bool Expired => DateTime.UtcNow >= DeadlineUtc;
+        public TimeSpan Remaining => DeadlineUtc - DateTime.UtcNow;
+    }
+
+    public sealed class BridgeExecutionContext
+    {
+        private readonly Func<bool> cancellation;
+        public BridgeRequest Request { get; }
+        public string SessionId => Request.SessionId;
+        public Map Map { get; }
+        public int Tick => Find.TickManager?.TicksGame ?? -1;
+        public DateTime DeadlineUtc => Request.DeadlineUtc;
+        public bool IsCancellationRequested => cancellation?.Invoke() == true || Request.Expired;
+
+        internal BridgeExecutionContext(BridgeRequest request, Map map, Func<bool> cancellation)
+        {
+            Request = request;
+            Map = map;
+            this.cancellation = cancellation;
+        }
+
+        public void ThrowIfCancellationRequested()
+        {
+            if (IsCancellationRequested) throw new OperationCanceledException("Bridge request was cancelled or expired.");
+        }
+
+        public string SafeOutputPath(string category, string fileName)
+        {
+            return BridgePaths.SafeOutputPath(category, fileName);
+        }
+    }
+
+    public sealed class BridgeAdapterMetadata
+    {
+        public string Id { get; set; }
+        public string DisplayName { get; set; }
+        public string Version { get; set; }
+        public string Generation { get; set; }
+        public string ChangeSummary { get; set; }
+    }
+
+    public interface IBridgeAdapterProvider
+    {
+        BridgeAdapterMetadata Metadata { get; }
+        IEnumerable<BridgeCommandDescriptor> Commands { get; }
+        BridgeResult Execute(BridgeExecutionContext context);
+    }
+
+    internal static class BridgeText
+    {
+        internal static string Clean(string value)
+        {
+            return (value ?? "none").Replace('|', '/').Replace('\r', ' ').Replace('\n', ' ');
+        }
+
+        internal static string Invariant(object value)
+        {
+            if (value == null) return "null";
+            if (value is bool boolean) return boolean ? "true" : "false";
+            if (value is IFormattable formattable)
+                return Clean(formattable.ToString(null, System.Globalization.CultureInfo.InvariantCulture));
+            return Clean(value.ToString());
+        }
+
+        internal static string NormalizeCommand(string command)
+        {
+            return (command ?? string.Empty).Trim().ToUpperInvariant();
+        }
+    }
+
+    internal static class BridgeTiming
+    {
+        internal static double Milliseconds(long start) =>
+            (Stopwatch.GetTimestamp() - start) * 1000d / Stopwatch.Frequency;
+    }
+}

@@ -1,0 +1,153 @@
+# RimWorld Dev Bridge architecture
+
+## Objective
+
+Provide an on-demand, local-only bridge that gives development clients compact,
+typed evidence from RimWorld while adding effectively no gameplay cost when it is
+installed but unused. RimWorld and Unity state is accessed only on the game main
+thread. Filesystem indexing, hashing, protocol validation, and report storage are
+performed off-thread or by stateless external tools.
+
+## Baseline evidence (1.4.1 / protocol 9)
+
+- The unchanged project builds with zero warnings and errors.
+- `Game.FinalizeInit` calls `BridgeHost.Initialize`, which calls
+  `ReloadProviders` before creating the wake watcher.
+- Provider reload scans types from every loaded AppDomain assembly, initializes
+  macros, enumerates and hashes every hot DLL, and loads each unseen DLL from
+  bytes. The live session retained 80 hot generations: 60 Horticulture, 14
+  Aquaculture, and 6 Flockmaster assemblies (4,676,096 source bytes total).
+- First wake plus `SYNC` measured about 1,277 ms in the live baseline. Subsequent
+  local PowerShell calls measured about 18-33 ms before the process exited.
+- The active game process had about 11.1 GB working set and 14.5 GB private bytes;
+  this whole-process value cannot isolate bridge memory, so no bridge-only memory
+  claim is made for the baseline.
+- Missing `THING`, `PAWN`, and `INSPECT` targets returned `status=OK` with a
+  `not_found` line.
+- TCP workers post unbounded callbacks to `SynchronizationContext` and wait 30
+  seconds. A timeout or disconnect does not cancel the posted callback, so it may
+  execute later. There is no request deadline, session identity, cancellation,
+  write lease, or idempotency cache.
+- Adapter `R`/`W` metadata is used only by help text. Macro mutation declarations
+  are trusted and nested command modes are not derived. Batches have no enforced
+  aggregate mode.
+- Responses are capped by line count only. Large collections use fixed `Take`
+  limits without stable cursors. Generic inspection invokes public property
+  getters.
+- Feature tests are substring assertions parsed on demand but their queue and
+  history live under the mod installation. Lifecycle initialization is attached
+  only to `Game.FinalizeInit`; no explicit game-unload/session invalidation path
+  exists.
+
+## Options considered
+
+| Design | Dormant potential | Activation | Complexity/reliability | Decision |
+| --- | --- | --- | --- | --- |
+| Harden current monolith | Low after extensive surgery | Good | Coupled transport, reflection, commands, lifecycle, and serialization remain hard to verify | Rejected |
+| Minimal in-game core | Watcher and fixed status only | Best; no process spawn | Clear main-thread and safety boundary; easiest to test | Selected |
+| In-game shim plus persistent external host | Similar shim cost | Adds process startup and another IPC hop | More failure modes; cannot move RimWorld access out of process | Rejected as a required service |
+
+Stateless PowerShell tools remain useful for manifest publication, queueing tests,
+retry coordination, and large report management. They run only when requested and
+cannot bypass the in-game authorization boundary.
+
+`DevTools/Launch-And-Test-RimWorld.ps1` is the bounded end-to-end operator tool. It
+builds only when no RimWorld process is active, launches `-quicktest` or attaches to
+an existing process, binds readiness to the observed process ID and disk manifest,
+and invokes the normal authenticated client. It only stops a process it launched.
+
+## Selected architecture
+
+1. **Bootstrap and lifecycle**
+   - The mod constructor records paths, installs only explicit lifecycle patches,
+     creates one save-data wake watcher, and writes a fixed dormant status.
+   - Dormant mode performs no tick/update callback, provider scan, adapter load,
+     macro/test parse, fingerprint, map scan, timer, or TCP work.
+   - Every loaded game receives a random session ID. Game replacement/unload
+     rotates authorization, cancels queued requests, and invalidates references.
+
+2. **Transport and protocol boundary**
+   - Loopback TCP starts only after a wake request and stops after bounded idle.
+   - Requests are byte-bounded and parsed into `BridgeRequest`; responses are
+     `BridgeResult` values with status, schema, timing, provider, mode, mutation,
+     truncation, warnings, and structured fields.
+   - Protocol 9 line requests remain accepted. Protocol 10 adds key/value request
+     options and JSON output without changing the legacy PowerShell entry point.
+
+3. **Main-thread scheduler**
+   - Background clients enqueue into a bounded priority queue. Only one scheduled
+     main-thread drain callback exists at a time.
+   - Drain work has a per-frame time/operation budget. Expired, cancelled,
+     disconnected, stale-session, unauthorized, or invalid requests are rejected
+     before command execution.
+   - Cost classes and cooperative continuations prevent expensive work from
+     monopolizing a frame. Deliberately expensive operations require an override.
+
+4. **Authorization and idempotency**
+   - Sessions start read-only. Writes require an explicit short-lived lease bound
+     to the session and a declared sandbox/live context. Remote mutation can be
+     disabled in settings.
+   - Command, macro, batch, and feature-test modes are derived transitively.
+     Unknown commands are forbidden rather than implicitly safe.
+   - Completed writes are cached by session plus idempotency key. A retry returns
+     the original result. A bounded audit records every accepted mutation.
+
+5. **Commands and inspection**
+   - Core commands use typed handlers and meaningful statuses. Lists use stable
+     ordering, requested fields, byte/scan budgets, `limit`, and opaque cursors.
+   - Object references carry session, map, and object IDs. No live object is cached
+     across requests or sessions.
+   - Generic inspection reads fields and an explicit safe-property allowlist only;
+     adapters own complex inspection.
+
+6. **Adapters**
+   - Sidecar manifests are indexed off-thread only after activation. The newest
+     compatible manifest per stable adapter ID is selected without loading DLLs.
+   - A selected assembly loads only when one of its commands is requested. Exact
+     provider types avoid assembly-wide type scans. Malformed, partial,
+     incompatible, colliding, and failing generations are isolated and reported.
+   - Live replacements switch command ownership atomically. Mono-retained old
+     generations are reported honestly and trigger a restart recommendation at a
+     configurable threshold.
+   - Legacy convention discovery is explicit and lazy; it never runs during
+     ordinary launch.
+
+7. **Macros, feature tests, captures, and reports**
+   - Macros are declarative, cycle-checked, bounded, typed, and mode-derived.
+   - Feature tests use phased execution and typed assertions, support `BLOCKED`,
+     always attempt cleanup, and store queues/history under RimWorld user data.
+     Existing XML suites migrate lazily.
+   - Large state captures, diffs, screenshots, and reports are stored outside live
+     memory and represented by safe paths plus hashes.
+
+## Backward-compatibility framework
+
+`DevTools/CompatibilityHarness` exercises protocol parsing, line serialization,
+legacy command spelling, semantic-status mapping, byte limits, pagination,
+authorization, deadlines, cancellation, idempotency, queue limits, macro mode
+derivation, session invalidation, and manifest selection without launching the
+game. Live acceptance then uses the existing `Send-RimWorldBridge.ps1` and current
+mod adapters against an isolated save.
+
+The replacement is introduced as a vertical slice before legacy code is removed:
+
+1. Dormant bootstrap and activation.
+2. Typed `STATUS` read.
+3. Authorized idempotent `SET_SPEED` write.
+4. One manifest-selected lazy adapter command.
+5. One typed feature test.
+6. Legacy PowerShell line-protocol request and response.
+
+Only after all six pass may the superseded host path be deleted or disconnected.
+
+## Completion gates
+
+- Source verifier proves dormant bootstrap does not call provider, macro, test,
+  hash, adapter, TCP timer, or map paths and has no tick patch.
+- Cold game measurement reports bootstrap, Harmony, and `Game.FinalizeInit`
+  contributions; target is approximately 5 ms or less after assembly loading.
+- Live probes cover activation, first/repeated command latency, bounded concurrent
+  clients, queue expiry, disconnected writes, idempotent retry, old sessions,
+  write leases, byte limits, pagination, adapter selection/reload, malformed
+  manifests, lifecycle cleanup, safe no-map commands, and feature-test migration.
+- No completion claim relies only on a green build or source substring checks.

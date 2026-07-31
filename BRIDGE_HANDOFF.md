@@ -30,6 +30,35 @@ Failed suites remain in `Pending` with attempt time and failure metadata. Read t
 file, correct the feature or its test, and leave the suite queued; the next **Test Features** run
 will retry it automatically.
 
+## Launch RimWorld and Test
+
+Use the bounded launcher to build the current core, start RimWorld with `-quicktest` when it is not
+already running, verify the bridge PID/version/protocol/schema, and execute an in-game command:
+
+```powershell
+& "C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge\DevTools\Launch-And-Test-RimWorld.ps1"
+```
+
+Run all queued feature suites with a sandbox write lease and map-ready gate:
+
+```powershell
+& "C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge\DevTools\Launch-And-Test-RimWorld.ps1" `
+  -Command RUN_FEATURE_TESTS -StartupTimeoutSeconds 600
+```
+
+The launcher stops only a RimWorld process it started unless `-KeepRunning` is supplied. It never
+stops an attached process. Bridge wake has a separate 10-second timeout configurable with
+`-BridgeWakeTimeoutSeconds`; game/map startup retains the longer startup timeout. Launch/build/
+stdout/stderr logs are stored under `.tura\log`, and failures include bounded tails from those logs
+and RimWorld's `Player.log`.
+
+Core version 2.0.2 uses a bridge-owned queue drained from RimWorld's main update loop instead of
+depending on `SynchronizationContext.Current`, which is null in RimWorld 1.6. Early wake requests
+remain pending until the main loop can activate the transport. Attached games retain the short
+bridge-wake timeout; a game started by the launcher uses the bounded startup deadline while mods load.
+Forced cleanup removes status/wake/legacy files only when their status PID and boot ID match the
+launcher-owned process, so an attached or newer RimWorld session is never cleaned as collateral.
+
 It is local-only, requires RimWorld Dev mode, remains dormant until requested, and keeps a requested TCP session warm for three minutes.
 
 ## Session Context

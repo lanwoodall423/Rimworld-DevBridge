@@ -1,8 +1,12 @@
 param(
     [Parameter(Position=0)][string]$Command = "SYNC",
     [Parameter(Position=1)][string]$Argument = "",
-    [int]$TimeoutMs = 5000
+    [int]$TimeoutMs = 5000,
+    [string]$Options = "",
+    [switch]$NoExitOnRestartRequired
 )
+
+$ErrorActionPreference = "Stop"
 
 $saveDir = Join-Path $env:USERPROFILE "AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios"
 $statusPath = Join-Path $saveDir "RimWorld-DevBridge-Status.txt"
@@ -34,6 +38,7 @@ function Assert-BridgeCurrent($Status, $Manifest) {
             $Status["version"], $loadedProtocol, $Status["schema"])
         Write-Output ("disk=version:{0} protocol:{1} schema:{2}" -f
             $Manifest["bridge"], $Manifest["protocol"], $Manifest["schema"])
+        if ($NoExitOnRestartRequired) { throw "Restart RimWorld to load the bridge version on disk." }
         exit 5
     }
 }
@@ -41,6 +46,13 @@ function Assert-BridgeCurrent($Status, $Manifest) {
 $manifest = Read-KeyFile $manifestPath
 $status = Read-KeyFile $statusPath
 Assert-BridgeCurrent $status $manifest
+
+if ($TimeoutMs -lt 50 -or $TimeoutMs -gt 120000) {
+    throw "TimeoutMs must be between 50 and 120000."
+}
+if ($Options -notmatch '(^|&)timeoutMs=') {
+    $Options = (($Options.Trim('&') + "&timeoutMs=$TimeoutMs").Trim('&'))
+}
 if ($status["bridge"] -ne "ON") {
     [IO.File]::WriteAllText($wakePath, "")
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
@@ -65,7 +77,8 @@ try {
     $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $false, 4096, $true)
     $writer.AutoFlush = $true
     $id = [Guid]::NewGuid().ToString("N")
-    $writer.WriteLine($status["token"] + "|" + $id + "|" + $Command.ToUpperInvariant() + "|" + $Argument)
+    $writer.WriteLine($status["token"] + "|" + $id + "|" + $Command.ToUpperInvariant() + "|" +
+        $Argument + "|" + $Options)
     $response = $reader.ReadToEnd()
     $response
 }

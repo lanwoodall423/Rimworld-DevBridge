@@ -1,3 +1,6 @@
+2.0.2|v10-typed-core|Added a bridge-owned main-thread dispatcher, ownership-aware bounded readiness, and PID/boot-guarded launcher cleanup.
+2.0.1|v10-typed-core|Recaptured the game-thread context for reliable wake activation and bounded bridge readiness waits.
+2.0.0|v10-typed-core|Added typed phased feature tests, transitive authorization, and the launch-and-test tool.
 1.4.1|e12b709c|Kept failed feature-test suites pending with attempt metadata until they pass.
 1.4.0|c4a91e72|Added persistent cross-chat feature tests with an in-game pass/fail window and compact output.
 1.3.0|73e5f8a1|Declared bridge sessions non-representative test saves unless the user explicitly identifies live play.

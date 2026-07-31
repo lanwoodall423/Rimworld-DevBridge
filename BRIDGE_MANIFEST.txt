@@ -1,5 +1,5 @@
-bridge=1.4.1
-protocol=9
-schema=e12b709c
+bridge=2.0.2
+protocol=10
+schema=v10-typed-core
 handoff=BRIDGE_HANDOFF.md
-changes=Failed feature-test suites now remain queued with retry metadata until they pass
+changes=Added a bridge-owned main-thread dispatcher and ownership-aware bounded launch readiness
