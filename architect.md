@@ -59,10 +59,13 @@ and invokes the normal authenticated client. It only stops a process it launched
 ## Selected architecture
 
 1. **Bootstrap and lifecycle**
-   - The mod constructor records paths, installs only explicit lifecycle patches,
-     creates one save-data wake watcher, and writes a fixed dormant status.
+   - The mod constructor records paths, installs one explicit game-change patch,
+     creates one save-data wake watcher, registers process shutdown, and writes a
+     fixed dormant status. `GameComponent.FinalizeInit` supplies game readiness.
    - Dormant mode performs no tick/update callback, provider scan, adapter load,
      macro/test parse, fingerprint, map scan, timer, or TCP work.
+   - The `Root.Update` drain patch is installed dynamically during activation and
+     removed when the TCP session returns to dormant mode.
    - Every loaded game receives a random session ID. Game replacement/unload
      rotates authorization, cancels queued requests, and invalidates references.
 
@@ -80,8 +83,10 @@ and invokes the normal authenticated client. It only stops a process it launched
    - Drain work has a per-frame time/operation budget. Expired, cancelled,
      disconnected, stale-session, unauthorized, or invalid requests are rejected
      before command execution.
-   - Cost classes and cooperative continuations prevent expensive work from
-     monopolizing a frame. Deliberately expensive operations require an override.
+   - Cost classes, operation/time drain budgets, bounded core scans, and one
+     expensive operation per drain limit bridge-owned stalls. Deliberately
+     expensive operations require an override. Arbitrary adapter code remains
+     cooperative and is reported when slow; it cannot be safely preempted.
 
 4. **Authorization and idempotency**
    - Sessions start read-only. Writes require an explicit short-lived lease bound
@@ -109,8 +114,9 @@ and invokes the normal authenticated client. It only stops a process it launched
    - Live replacements switch command ownership atomically. Mono-retained old
      generations are reported honestly and trigger a restart recommendation at a
      configurable threshold.
-   - Legacy convention discovery is explicit and lazy; it never runs during
-     ordinary launch.
+   - Legacy convention providers require an explicit manifest with an exact
+     loaded assembly identity and provider type. They are resolved only on first
+     command and never trigger assembly/type discovery scans.
 
 7. **Macros, feature tests, captures, and reports**
    - Macros are declarative, cycle-checked, bounded, typed, and mode-derived.
@@ -151,3 +157,36 @@ Only after all six pass may the superseded host path be deleted or disconnected.
   write leases, byte limits, pagination, adapter selection/reload, malformed
   manifests, lifecycle cleanup, safe no-map commands, and feature-test migration.
 - No completion claim relies only on a green build or source substring checks.
+
+## Implemented v2.1 evidence
+
+- The offline compatibility harness covers 28 protocol, bound, cursor, scheduler,
+  cancellation, idempotency, manifest, feature-test, batch, and macro cases.
+- A source invariant check confirms no dormant update hook, AppDomain-wide
+  provider scan, eager adapter load, macro parse, or feature-test parse.
+- Final cold launches measured 16.329-21.568 ms construction/bootstrap including
+  status publication, 1.022-1.474 ms in the single permanent Harmony patch, and
+  0.094-0.122 ms in `FinalizeInit`. This is an honest miss of the approximately
+  5 ms target. Approximate managed-heap deltas ranged from 1.9-3.0 MB while other
+  mods were loading and are not claimed as bridge-only allocations.
+- First fully loaded activation measured 219.415 ms internally and 880.446 ms at
+  the external wake poll; this includes first-use Harmony detouring, JSON/JIT, and
+  a 147.413 ms off-thread manifest pass. After idle, a second activation measured
+  29.751 ms internally and 518.635 ms through the polling client; steady reindex
+  measured 13.652 ms. A wake issued during mod loading can wait tens of seconds
+  for RimWorld to resume root updates and is reported separately from bridge work.
+- Raw loopback `STATUS` measured 35.288 ms for the first command and 5.813 ms
+  repeated mean (1.845 ms minimum). The compatibility PowerShell process adds
+  startup and script parsing overhead.
+- Before first adapter use, four adapters and 116 commands were available with
+  zero retained hot generations. First hot-provider loads measured about 5 ms
+  each. A live Aquaculture replacement selected the new manifest before load,
+  retained the old Mono generation honestly, and loaded the new generation only
+  when requested.
+- Seventy-seven unmanifested historical DLLs were then pruned. Final cold/live
+  verification found five manifests, four logical adapters, one superseded
+  generation, zero ignored DLLs, and zero retained hot assemblies before use.
+- An unfiltered 20,000-object `THINGS limit=5` query fell from 98.567 ms in the
+  initial v2 implementation to 0.052-0.225 ms after JIT. Sixteen concurrent
+  compatibility clients returned isolated successful IDs. Feature-test discovery
+  measured 35.244 ms off-thread and 0.673 ms on the game thread.

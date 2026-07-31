@@ -16,7 +16,7 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult Prepare(BridgeRequest request)
         {
-            if (BridgeCommands.Describe(request.Command) != null) return null;
+            if (BridgeCommands.Describe(request.Command) != null) return BridgeCommands.Prepare(request);
             if (BridgeAdapterCatalog.Describe(request.Command) != null)
                 return BridgeAdapterCatalog.Prepare(request);
             if (BridgeFeatureTests.Describe(request) != null)
@@ -43,6 +43,7 @@ namespace RimWorldDevBridge
                 Command = BridgeText.NormalizeCommand(command),
                 Argument = argument ?? string.Empty,
                 EnqueuedUtc = parent.EnqueuedUtc,
+                ReceivedUtc = parent.ReceivedUtc,
                 DeadlineUtc = parent.DeadlineUtc,
                 OutputFormat = parent.OutputFormat,
                 DetailLevel = parent.DetailLevel,
@@ -69,7 +70,8 @@ namespace RimWorldDevBridge
                 return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "map_required");
             BridgeExecutionContext context = new BridgeExecutionContext(call.Request, parent.Map,
                 () => parent.IsCancellationRequested);
-            return Execute(context) ?? BridgeResult.Fail(BridgeStatus.ERROR, "empty_nested_result");
+            return DecorateChild(Execute(context) ?? BridgeResult.Fail(BridgeStatus.ERROR,
+                "empty_nested_result"), call);
         }
 
         internal static BridgeResult ExecuteCleanupChild(BridgeExecutionContext parent, PreparedCall call)
@@ -82,6 +84,7 @@ namespace RimWorldDevBridge
                 Command = source.Command,
                 Argument = source.Argument,
                 EnqueuedUtc = source.EnqueuedUtc,
+                ReceivedUtc = source.ReceivedUtc,
                 DeadlineUtc = DateTime.UtcNow.AddSeconds(2),
                 OutputFormat = source.OutputFormat,
                 DetailLevel = source.DetailLevel,
@@ -92,12 +95,25 @@ namespace RimWorldDevBridge
                 IdempotencyKey = source.IdempotencyKey,
                 PreparedAdapterId = source.PreparedAdapterId,
                 PreparedAdapterGeneration = source.PreparedAdapterGeneration,
+                PreparedAdapter = source.PreparedAdapter,
                 PreparedDescriptor = source.PreparedDescriptor?.Clone(),
                 PreparedPayload = source.PreparedPayload,
                 NestingDepth = source.NestingDepth
             };
             BridgeExecutionContext context = new BridgeExecutionContext(cleanup, parent.Map, () => false);
-            return Execute(context) ?? BridgeResult.Fail(BridgeStatus.ERROR, "empty_cleanup_result");
+            return DecorateChild(Execute(context) ?? BridgeResult.Fail(BridgeStatus.ERROR,
+                "empty_cleanup_result"), call);
+        }
+
+        private static BridgeResult DecorateChild(BridgeResult result, PreparedCall call)
+        {
+            result.RequestId = call.Request.RequestId;
+            result.SessionId = call.Request.SessionId;
+            result.Command = call.Request.Command;
+            result.Provider = call.Descriptor.Provider ?? "core";
+            result.ProviderVersion = call.Descriptor.ProviderVersion ?? BridgeProtocol.BridgeVersion;
+            result.Mode = call.Descriptor.Mode;
+            return result;
         }
 
         internal static BridgeCommandMode MaximumMode(IEnumerable<PreparedCall> calls) =>

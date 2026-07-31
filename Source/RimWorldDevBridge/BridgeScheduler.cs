@@ -10,7 +10,10 @@ namespace RimWorldDevBridge
     {
         private readonly object gate = new object();
         private readonly List<BridgeRequest> queue = new List<BridgeRequest>();
+        private readonly Dictionary<string, BridgeRequest> running =
+            new Dictionary<string, BridgeRequest>(StringComparer.Ordinal);
         private readonly Func<BridgeRequest, BridgeResult> executor;
+        private readonly Action<BridgeRequest, BridgeResult> completed;
         private SynchronizationContext mainContext;
         private string sessionId;
         private int capacity;
@@ -23,9 +26,11 @@ namespace RimWorldDevBridge
         private double slowestMs;
         private string slowestCommand = "none";
 
-        internal BridgeScheduler(Func<BridgeRequest, BridgeResult> executor)
+        internal BridgeScheduler(Func<BridgeRequest, BridgeResult> executor,
+            Action<BridgeRequest, BridgeResult> completed = null)
         {
             this.executor = executor ?? throw new ArgumentNullException(nameof(executor));
+            this.completed = completed;
         }
 
         internal void Configure(SynchronizationContext context, string activeSessionId, int queueCapacity,
@@ -50,6 +55,9 @@ namespace RimWorldDevBridge
                     return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_session");
                 if (request.Expired)
                     return BridgeResult.Fail(BridgeStatus.TIMEOUT, "queue_deadline_expired");
+                if (queue.Any(item => item.RequestId == request.RequestId) ||
+                    running.ContainsKey(request.RequestId))
+                    return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "duplicate_request_id");
                 if (queue.Count >= capacity)
                 {
                     rejected++;
@@ -67,6 +75,7 @@ namespace RimWorldDevBridge
             lock (gate)
             {
                 BridgeRequest request = queue.FirstOrDefault(item => item.RequestId == requestId);
+                if (request == null) running.TryGetValue(requestId ?? string.Empty, out request);
                 if (request == null) return false;
                 request.Cancelled = true;
                 return true;
@@ -81,6 +90,7 @@ namespace RimWorldDevBridge
                 sessionId = newSessionId;
                 stale = queue.ToList();
                 queue.Clear();
+                foreach (BridgeRequest request in running.Values) request.Cancelled = true;
             }
             foreach (BridgeRequest request in stale)
                 CompleteRejected(request, BridgeStatus.CANCELLED, "session_ended");
@@ -142,6 +152,7 @@ namespace RimWorldDevBridge
                 else
                     Execute(request);
                 operations++;
+                if (request.Cost >= BridgeCostClass.Expensive) break;
             }
             lock (gate)
             {
@@ -159,6 +170,7 @@ namespace RimWorldDevBridge
         private void Execute(BridgeRequest request)
         {
             request.Started = true;
+            lock (gate) running[request.RequestId] = request;
             long start = Stopwatch.GetTimestamp();
             BridgeResult result;
             try
@@ -186,9 +198,17 @@ namespace RimWorldDevBridge
             }
             else if (DateTime.UtcNow >= request.DeadlineUtc && request.Mode != BridgeCommandMode.PureRead)
                 result.Warn("Mutation completed after its deadline; result retained to avoid ambiguous retries.");
+            if (executionMs >= 50d || executionMs > budgetMs)
+                result.Warn("slow main-thread command: " + executionMs.ToString("0.###") + " ms");
+            try { completed?.Invoke(request, result); }
+            catch (Exception exception)
+            {
+                result.Warn("completion bookkeeping failed: " + exception.GetBaseException().Message);
+            }
             request.Result = result;
             lock (gate)
             {
+                running.Remove(request.RequestId);
                 executed++;
                 totalQueueMs += result.QueueDelayMs;
                 totalExecutionMs += executionMs;

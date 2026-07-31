@@ -24,7 +24,7 @@ $playerLog = Join-Path $saveDir "Player.log"
 $manifestPath = Join-Path $modRoot "BRIDGE_MANIFEST.txt"
 $clientPath = Join-Path $PSScriptRoot "Send-RimWorldBridge.ps1"
 $projectPath = Join-Path $modRoot "Source\RimWorldDevBridge\RimWorldDevBridge.csproj"
-$logRoot = Join-Path $modRoot ".tura\log"
+$logRoot = Join-Path $saveDir "RimWorldDevBridge\LauncherLogs"
 $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
 $stdoutLog = Join-Path $logRoot "rimworld-$stamp.stdout.log"
 $stderrLog = Join-Path $logRoot "rimworld-$stamp.stderr.log"
@@ -80,13 +80,21 @@ function Fail([int]$Code, [string]$Message) {
 function Assert-ProcessRunning {
     if ($null -eq $process) { Fail 2 "rimworld_process_missing" }
     $process.Refresh()
-    if ($process.HasExited) { Fail 2 ("rimworld_exited_{0}" -f $process.ExitCode) }
+    if ($process.HasExited) {
+        try { $process.WaitForExit(); $code = $process.ExitCode }
+        catch { $code = "unknown" }
+        if ($null -eq $code -or "$code".Length -eq 0) { $code = "unknown" }
+        Fail 2 ("rimworld_exited_{0}" -f $code)
+    }
 }
 
 function Invoke-Bridge([string]$Name, [string]$Value, [string]$Options = "") {
     $shellPath = (Get-Process -Id $PID).Path
-    $lines = & $shellPath -NoProfile -ExecutionPolicy Bypass -File $clientPath `
-        -Command $Name -Argument $Value -TimeoutMs $CommandTimeoutMs -Options $Options 2>&1
+    $clientArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $clientPath,
+        "-Command", $Name, "-TimeoutMs", "$CommandTimeoutMs")
+    if (-not [string]::IsNullOrEmpty($Value)) { $clientArguments += @("-Argument", $Value) }
+    if (-not [string]::IsNullOrEmpty($Options)) { $clientArguments += @("-Options", $Options) }
+    $lines = & $shellPath $clientArguments 2>&1
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         $lines | ForEach-Object { Write-Output $_ }

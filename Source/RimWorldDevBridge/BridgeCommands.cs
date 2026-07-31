@@ -43,6 +43,8 @@ namespace RimWorldDevBridge
                 BridgeCommandMode.PureRead, BridgeCostClass.Normal, false);
             Register("RELOAD_ADAPTERS", "Compatibility alias for manifest reindexing.",
                 BridgeCommandMode.PureRead, BridgeCostClass.Normal, false);
+            Register("RELOAD_BRIDGE", "Reindex adapter manifests and reload declarative macros.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false);
             Register("MODS", "Loaded mod identities in load order.", BridgeCommandMode.PureRead,
                 BridgeCostClass.Normal, false, "limit,cursor,filter");
             Register("DLC", "Active official expansions.", BridgeCommandMode.PureRead,
@@ -90,6 +92,9 @@ namespace RimWorldDevBridge
                 case "HOT_ADAPTER_STATUS": return BridgeAdapterCatalog.Health();
                 case "RELOAD_HOT_ADAPTERS":
                 case "RELOAD_ADAPTERS": return BridgeAdapterCatalog.Reindex();
+                case "RELOAD_BRIDGE":
+                    BridgeOrchestration.Reload();
+                    return BridgeAdapterCatalog.Reindex().Add("macros", "reloaded");
                 case "MODS": return Mods(context.Request);
                 case "DLC": return Dlc();
                 case "MAPS": return Maps();
@@ -100,6 +105,11 @@ namespace RimWorldDevBridge
                 case "RESEARCH": return Research();
                 default: return BridgeDiagnostics.Execute(context);
             }
+        }
+
+        internal static BridgeResult Prepare(BridgeRequest request)
+        {
+            return BridgeDiagnostics.Prepare(request);
         }
 
         private static void Register(string name, string description, BridgeCommandMode mode,
@@ -129,13 +139,15 @@ namespace RimWorldDevBridge
                 .Add("gameVersion", VersionControl.CurrentVersionStringWithoutBuild)
                 .Add("devMode", Prefs.DevMode)
                 .Add("session", BridgeRuntime.SessionId)
-                .Add("map", Find.CurrentMap?.uniqueID.ToString() ?? "none")
-                .Add("tick", Find.TickManager?.TicksGame ?? -1)
+                .Add("map", BridgeGameState.CurrentMap?.uniqueID.ToString() ?? "none")
+                .Add("tick", BridgeGameState.TickManager?.TicksGame ?? -1)
                 .Add("clients", BridgeRuntime.ActiveClients)
                 .Add("adapterIndex", BridgeAdapterCatalog.State)
                 .Add("bootstrapMs", BridgeRuntime.BootstrapMs)
                 .Add("harmonyMs", BridgeRuntime.HarmonyMs)
                 .Add("finalizeInitMs", BridgeRuntime.FinalizeInitMs)
+                .Add("activationMs", BridgeRuntime.ActivationMs)
+                .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes)
                 .Add("context", "test-save")
                 .Add("representativePlayerBehavior", false);
             return result;
@@ -146,7 +158,7 @@ namespace RimWorldDevBridge
             return BridgeResult.Ok("core.session")
                 .Add("session", BridgeRuntime.SessionId)
                 .Add("gameLoaded", Current.Game != null)
-                .Add("mapLoaded", Find.CurrentMap != null)
+                .Add("mapLoaded", BridgeGameState.CurrentMap != null)
                 .Add("writeContext", BridgeRuntime.WriteContext)
                 .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? true);
         }
@@ -262,7 +274,8 @@ namespace RimWorldDevBridge
                 .Add("offset", query.Offset).Add("limit", query.Limit);
             foreach (var pair in source.Select((mod, index) => new { mod, index }).Skip(query.Offset).Take(query.Limit))
                 result.AddLine("mod=index:" + pair.index + " packageId:" +
-                    BridgeText.Clean(pair.mod.PackageIdPlayerFacing) + " name:" + BridgeText.Clean(pair.mod.Name));
+                    BridgeText.Clean(pair.mod.PackageIdPlayerFacing) + " name:" + BridgeText.Clean(pair.mod.Name) +
+                    " version:" + BridgeText.Clean(pair.mod.ModMetaData?.ModVersion));
             ApplyPage(result, request, query, source.Count);
             return result;
         }
@@ -280,9 +293,9 @@ namespace RimWorldDevBridge
         private static BridgeResult Maps()
         {
             BridgeResult result = BridgeResult.Ok("core.maps");
-            foreach (Map map in Find.Maps.OrderBy(item => item.uniqueID))
+            foreach (Map map in (BridgeGameState.Maps ?? new List<Map>()).OrderBy(item => item.uniqueID))
                 result.AddLine("map=id:" + map.uniqueID + " tile:" + map.Tile + " size:" + map.Size.x +
-                    "x" + map.Size.z + " current:" + (map == Find.CurrentMap));
+                    "x" + map.Size.z + " current:" + (map == BridgeGameState.CurrentMap));
             return result.Add("count", result.Lines.Count);
         }
 
@@ -292,7 +305,7 @@ namespace RimWorldDevBridge
             IReadOnlyList<Pawn> pawns = map.mapPawns.AllPawnsSpawned;
             return BridgeResult.Ok("core.mapSummary")
                 .Add("mapId", map.uniqueID).Add("tile", map.Tile).Add("width", map.Size.x).Add("height", map.Size.z)
-                .Add("tick", Find.TickManager?.TicksGame ?? -1).Add("speed", Find.TickManager?.CurTimeSpeed.ToString() ?? "none")
+                .Add("tick", BridgeGameState.TickManager?.TicksGame ?? -1).Add("speed", BridgeGameState.TickManager?.CurTimeSpeed.ToString() ?? "none")
                 .Add("pawns", pawns.Count).Add("colonists", map.mapPawns.FreeColonistsSpawned.Count)
                 .Add("animals", pawns.Count(pawn => pawn.RaceProps?.Animal == true))
                 .Add("hostile", pawns.Count(pawn => pawn.HostileTo(Faction.OfPlayer)))
@@ -306,8 +319,8 @@ namespace RimWorldDevBridge
             return BridgeResult.Ok("core.saveInfo")
                 .Add("gameLoaded", Current.Game != null)
                 .Add("programState", Current.ProgramState)
-                .Add("worldSeed", Find.World?.info?.seedString ?? "none")
-                .Add("maps", Find.Maps?.Count ?? 0)
+                .Add("worldSeed", BridgeGameState.World?.info?.seedString ?? "none")
+                .Add("maps", BridgeGameState.Maps?.Count ?? 0)
                 .Add("session", BridgeRuntime.SessionId)
                 .Add("context", BridgeRuntime.WriteContext);
         }
@@ -325,11 +338,13 @@ namespace RimWorldDevBridge
 
         private static BridgeResult Research()
         {
-            ResearchProjectDef current = Find.ResearchManager?.GetProject();
+            ResearchManager manager = Current.Game == null ? null : Find.ResearchManager;
+            if (manager == null) return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "game_required");
+            ResearchProjectDef current = manager.GetProject();
             int finished = DefDatabase<ResearchProjectDef>.AllDefsListForReading.Count(def => def.IsFinished);
             return BridgeResult.Ok("core.research")
                 .Add("current", current?.defName ?? "none")
-                .Add("progress", current == null ? 0f : Find.ResearchManager.GetProgress(current))
+                .Add("progress", current == null ? 0f : manager.GetProgress(current))
                 .Add("finished", finished)
                 .Add("total", DefDatabase<ResearchProjectDef>.DefCount);
         }
@@ -345,7 +360,8 @@ namespace RimWorldDevBridge
             if (next < total)
             {
                 result.Truncated = true;
-                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command, query.Filter, next);
+                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command,
+                    query.CursorScope, next);
                 result.Add("hasMore", true);
             }
             else result.Add("hasMore", false);

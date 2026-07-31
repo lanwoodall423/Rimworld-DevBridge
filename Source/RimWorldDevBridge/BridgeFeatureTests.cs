@@ -65,6 +65,18 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult Prepare(BridgeRequest request)
         {
+            if (request.Command == "FEATURE_TESTS")
+            {
+                request.PreparedPayload = Status();
+                return null;
+            }
+            if (request.Command == "FEATURE_TEST_DRY_RUN")
+            {
+                BridgeResult dryFailure = LoadPlan(request, out TestRunPlan dryPlan);
+                if (dryFailure != null) return dryFailure;
+                request.PreparedPayload = DryRun(dryPlan);
+                return null;
+            }
             if (request.Command != "RUN_FEATURE_TESTS") return null;
             if (request.NestingDepth > 0)
                 return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "nested_feature_test_run_forbidden");
@@ -78,8 +90,8 @@ namespace RimWorldDevBridge
         {
             switch (context.Request.Command)
             {
-                case "FEATURE_TESTS": return Status();
-                case "FEATURE_TEST_DRY_RUN": return DryRun();
+                case "FEATURE_TESTS": return context.Request.PreparedPayload as BridgeResult ?? Status();
+                case "FEATURE_TEST_DRY_RUN": return context.Request.PreparedPayload as BridgeResult ?? DryRun();
                 case "FEATURE_TEST_RETRY": return Manage(context.Request.Argument, "retry");
                 case "FEATURE_TEST_DISABLE": return Manage(context.Request.Argument, "disable");
                 case "FEATURE_TEST_REMOVE": return Manage(context.Request.Argument, "remove");
@@ -92,8 +104,30 @@ namespace RimWorldDevBridge
             allowedGameStates = AllowedGameStates.PlayingOnMap)]
         public static void TestFeatures()
         {
-            Messages.Message("Use RUN_FEATURE_TESTS through the bridge so write leases, deadlines, and evidence are enforced.",
-                MessageTypeDefOf.CautionInput, false);
+            BridgeRequest request = SyntheticParent();
+            request.RequestId = "local-feature-" + Guid.NewGuid().ToString("N");
+            request.Command = "RUN_FEATURE_TESTS";
+            request.DeadlineUtc = DateTime.UtcNow.AddSeconds(120);
+            BridgeResult failure = LoadPlan(request, out TestRunPlan plan);
+            if (failure != null)
+            {
+                Messages.Message("Feature tests: " + failure.Status + " " +
+                    Field(failure, "detail", Field(failure, "error", "invalid suite")),
+                    MessageTypeDefOf.RejectInput, false);
+                return;
+            }
+            request.PreparedPayload = plan;
+            request.Mode = plan.Mode;
+            request.Cost = plan.Cost;
+            BridgeResult result = Run(new BridgeExecutionContext(request, BridgeGameState.CurrentMap,
+                () => request.Expired));
+            string passed = Field(result, "passed", "0");
+            string failed = Field(result, "failed", "0");
+            string blocked = Field(result, "blocked", "0");
+            Messages.Message("Feature tests: " + result.Status + " passed=" + passed +
+                " failed=" + failed + " blocked=" + blocked + ". Evidence: " + LatestPath,
+                result.Status == BridgeStatus.OK ? MessageTypeDefOf.TaskCompletion : MessageTypeDefOf.RejectInput,
+                false);
         }
 
         private static BridgeResult Status()
@@ -124,6 +158,11 @@ namespace RimWorldDevBridge
         {
             BridgeResult failure = LoadPlan(null, out TestRunPlan plan);
             if (failure != null) return failure;
+            return DryRun(plan);
+        }
+
+        private static BridgeResult DryRun(TestRunPlan plan)
+        {
             BridgeResult result = BridgeResult.Ok("core.featureTestDryRun").Add("suites", plan.Suites.Count)
                 .Add("tests", plan.Suites.Sum(suite => suite.Tests.Count)).Add("mode", plan.Mode)
                 .Add("cost", plan.Cost).Add("schemaVersion", 2);
@@ -210,6 +249,8 @@ namespace RimWorldDevBridge
             }
             Dictionary<string, BridgeResult> results = new Dictionary<string, BridgeResult>(StringComparer.OrdinalIgnoreCase);
             int tickStart = context.Tick;
+            DateTime testDeadline = test.TimeoutMs > 0
+                ? DateTime.UtcNow.AddMilliseconds(test.TimeoutMs) : context.DeadlineUtc;
             bool pushedRandom = false;
             bool started = false;
             try
@@ -218,7 +259,11 @@ namespace RimWorldDevBridge
                 foreach (PreparedTestStep step in test.Steps.Where(item => item.Phase != "cleanup"))
                 {
                     context.ThrowIfCancellationRequested();
+                    if (DateTime.UtcNow >= testDeadline)
+                        throw new OperationCanceledException("feature test deadline expired");
                     started = true;
+                    if (testDeadline < step.Call.Request.DeadlineUtc)
+                        step.Call.Request.DeadlineUtc = testDeadline;
                     BridgeResult result = BridgeDispatch.ExecuteChild(context, step.Call);
                     results[step.Id] = result;
                     evidence.Steps.Add(step.Phase + ":" + step.Id + ":" + result.Status);
@@ -230,6 +275,8 @@ namespace RimWorldDevBridge
                     if (test.TickBudget > 0 && context.Tick - tickStart > test.TickBudget)
                         throw new FeatureAssertionException("tick_budget", "tick budget exceeded");
                     context.ThrowIfCancellationRequested();
+                    if (DateTime.UtcNow >= testDeadline)
+                        throw new OperationCanceledException("feature test deadline expired");
                 }
                 foreach (TestAssertion assertion in test.Assertions)
                     assertion.Assert(results);
@@ -242,8 +289,9 @@ namespace RimWorldDevBridge
             }
             catch (OperationCanceledException)
             {
-                evidence.Status = context.Request.Expired ? BridgeStatus.TIMEOUT : BridgeStatus.CANCELLED;
-                evidence.Category = context.Request.Expired ? "timeout" : "cancelled";
+                bool timedOut = context.Request.Expired || DateTime.UtcNow >= testDeadline;
+                evidence.Status = timedOut ? BridgeStatus.TIMEOUT : BridgeStatus.CANCELLED;
+                evidence.Category = timedOut ? "timeout" : "cancelled";
                 evidence.Detail = "request cancelled during feature test";
             }
             catch (Exception exception)
@@ -335,7 +383,7 @@ namespace RimWorldDevBridge
             if (suite.MaximumAttempts > 0 && attempts >= suite.MaximumAttempts)
                 suite.BlockedReason = "maximum retry policy reached";
             foreach (XElement testElement in root.Elements("Test"))
-                suite.Tests.Add(ParseTest(testElement, parent));
+                suite.Tests.Add(ParseTest(testElement, parent, suite.Requirements));
             if (suite.Tests.Count == 0) throw new InvalidDataException("Suite has no tests.");
             if (suite.Tests.Count > MaximumTestsPerSuite) throw new InvalidDataException("Suite has too many tests.");
             suite.Mode = suite.Tests.Select(test => test.Mode).Max();
@@ -343,14 +391,18 @@ namespace RimWorldDevBridge
             return suite;
         }
 
-        private static TestPlan ParseTest(XElement element, BridgeRequest parent)
+        private static TestPlan ParseTest(XElement element, BridgeRequest parent,
+            RequirementPlan inheritedRequirements)
         {
             TestPlan test = new TestPlan
             {
                 Name = Attribute(element, "name", "unnamed"),
                 TickBudget = IntAttribute(element, "tickBudget", 0),
+                TimeoutMs = IntAttribute(element, "timeoutMs", 0),
                 RandomSeed = NullableIntAttribute(element, "randomSeed")
             };
+            XElement requirementElement = element.Element("Requirements");
+            if (requirementElement != null) test.Requirements = ParseRequirements(requirementElement);
             IEnumerable<XElement> phaseElements = element.Elements().Where(child =>
                 child.Name == "Requirements" || child.Name == "Setup" || child.Name == "Action" ||
                 child.Name == "Assertions" || child.Name == "Cleanup");
@@ -366,7 +418,6 @@ namespace RimWorldDevBridge
                 string phaseName = phase.Name.LocalName.ToLowerInvariant();
                 if (phaseName == "requirements")
                 {
-                    test.Requirements = ParseRequirements(phase);
                     continue;
                 }
                 if (phaseName == "assertions")
@@ -380,8 +431,30 @@ namespace RimWorldDevBridge
                     string command = Attribute(callElement, "command", null);
                     BridgeResult failure = BridgeDispatch.PrepareChild(owner, command,
                         Attribute(callElement, "argument", string.Empty), out PreparedCall call);
-                    if (failure != null) throw new InvalidDataException(test.Name + ": " + Field(failure, "detail",
-                        Field(failure, "error", failure.Status.ToString())));
+                    if (failure != null && failure.Status == BridgeStatus.NOT_FOUND &&
+                        HasMissingAdapterRequirement(inheritedRequirements, test.Requirements))
+                    {
+                        call = new PreparedCall
+                        {
+                            Request = new BridgeRequest
+                            {
+                                RequestId = owner.RequestId, SessionId = owner.SessionId,
+                                Command = BridgeText.NormalizeCommand(command),
+                                Argument = Attribute(callElement, "argument", string.Empty),
+                                EnqueuedUtc = owner.EnqueuedUtc, DeadlineUtc = owner.DeadlineUtc,
+                                NestingDepth = owner.NestingDepth + 1
+                            },
+                            Descriptor = new BridgeCommandDescriptor
+                            {
+                                Name = BridgeText.NormalizeCommand(command), Provider = "blocked-prerequisite",
+                                ProviderVersion = "unavailable", Mode = BridgeCommandMode.PotentiallyDestructive,
+                                Cost = BridgeCostClass.Simulation, RequiresMap = false,
+                                ArgumentSchema = "unavailable", ResultSchema = "unavailable"
+                            }
+                        };
+                    }
+                    else if (failure != null) throw new InvalidDataException(test.Name + ": " +
+                        Field(failure, "detail", Field(failure, "error", failure.Status.ToString())));
                     test.Steps.Add(new PreparedTestStep
                     {
                         Id = Attribute(callElement, "id", phaseName + test.Steps.Count),
@@ -404,6 +477,14 @@ namespace RimWorldDevBridge
                 throw new InvalidDataException(test.Name + ": too many assertions.");
             test.Mode = test.Steps.Select(step => step.Call.Descriptor.Mode).Max();
             test.Cost = test.Steps.Select(step => step.Call.Descriptor.Cost).Max();
+            string declaredMutation = Attribute(element, "mutation", null);
+            if (!string.IsNullOrEmpty(declaredMutation))
+            {
+                BridgeCommandMode declared = ParseMode(declaredMutation);
+                if (declared < test.Mode)
+                    throw new InvalidDataException(test.Name + ": declared mutation " + declared +
+                        " hides actual mode " + test.Mode + ".");
+            }
             return test;
         }
 
@@ -547,16 +628,20 @@ namespace RimWorldDevBridge
             {
                 RequiresMap = string.Equals(Attribute(element, "requiredMap", null), "true",
                     StringComparison.OrdinalIgnoreCase),
-                RequiredSave = Attribute(element, "requiredSave", null)
+                RequiredSave = Attribute(element, "requiredSave", null),
+                CoreFingerprint = Attribute(element, "coreFingerprint", null),
+                AdapterFingerprint = Attribute(element, "adapterFingerprint", null)
             };
             plan.RequiredMods.AddRange(Split(Attribute(element, "requiredMods", null)));
             plan.RequiredAdapters.AddRange(Split(Attribute(element, "requiredAdapters", null)));
             foreach (XElement child in element?.Elements() ?? Enumerable.Empty<XElement>())
             {
                 if (child.Name == "Mod")
-                    plan.RequiredMods.Add(Attribute(child, "packageId", Attribute(child, "id", null)));
+                    plan.RequiredMods.Add(Requirement(Attribute(child, "packageId", Attribute(child, "id", null)),
+                        Attribute(child, "version", null)));
                 else if (child.Name == "Adapter")
-                    plan.RequiredAdapters.Add(Attribute(child, "id", null));
+                    plan.RequiredAdapters.Add(Requirement(Attribute(child, "id", null),
+                        Attribute(child, "version", null)));
                 else if (child.Name == "Map") plan.RequiresMap = true;
             }
             plan.RequiredMods.RemoveAll(string.IsNullOrWhiteSpace);
@@ -567,17 +652,61 @@ namespace RimWorldDevBridge
         private static string EvaluateRequirements(RequirementPlan plan)
         {
             if (plan == null) return null;
-            if (plan.RequiresMap && Find.CurrentMap == null) return "current map required";
+            if (plan.RequiresMap && BridgeGameState.CurrentMap == null) return "current map required";
+            if (!string.IsNullOrEmpty(plan.CoreFingerprint) && !string.Equals(plan.CoreFingerprint,
+                BridgeProtocol.CoreSchema, StringComparison.OrdinalIgnoreCase))
+                return "core fingerprint mismatch: " + plan.CoreFingerprint;
+            if (!string.IsNullOrEmpty(plan.AdapterFingerprint) && !string.Equals(plan.AdapterFingerprint,
+                BridgeAdapterCatalog.Fingerprint, StringComparison.OrdinalIgnoreCase))
+                return "adapter fingerprint mismatch: " + plan.AdapterFingerprint;
             if (!string.IsNullOrEmpty(plan.RequiredSave) &&
                 !File.Exists(GenFilePaths.FilePathForSavedGame(plan.RequiredSave)))
                 return "required save missing: " + plan.RequiredSave;
             foreach (string package in plan.RequiredMods)
-                if (!LoadedModManager.RunningModsListForReading.Any(mod => string.Equals(
-                    mod.PackageIdPlayerFacing, package, StringComparison.OrdinalIgnoreCase)))
+            {
+                SplitRequirement(package, out string packageId, out string minimumVersion);
+                ModContentPack mod = LoadedModManager.RunningModsListForReading.FirstOrDefault(item => string.Equals(
+                    item.PackageIdPlayerFacing, packageId, StringComparison.OrdinalIgnoreCase));
+                if (mod == null)
                     return "required mod missing: " + package;
+                if (!VersionAtLeast(mod.ModMetaData?.ModVersion, minimumVersion))
+                    return "required mod version missing: " + package;
+            }
             foreach (string adapter in plan.RequiredAdapters)
-                if (!BridgeAdapterCatalog.IsAvailable(adapter)) return "required adapter missing: " + adapter;
+            {
+                SplitRequirement(adapter, out string adapterId, out string minimumVersion);
+                if (!BridgeAdapterCatalog.IsAvailable(adapterId, minimumVersion))
+                    return "required adapter missing: " + adapter;
+            }
             return null;
+        }
+
+        private static bool HasMissingAdapterRequirement(params RequirementPlan[] plans)
+        {
+            return plans.Where(plan => plan != null).SelectMany(plan => plan.RequiredAdapters)
+                .Any(adapter =>
+                {
+                    SplitRequirement(adapter, out string id, out string version);
+                    return !BridgeAdapterCatalog.IsAvailable(id, version);
+                });
+        }
+
+        private static string Requirement(string id, string version) => string.IsNullOrWhiteSpace(version)
+            ? id : id + "@" + version;
+
+        private static void SplitRequirement(string value, out string id, out string version)
+        {
+            int separator = (value ?? string.Empty).LastIndexOf('@');
+            id = separator > 0 ? value.Substring(0, separator) : value;
+            version = separator > 0 ? value.Substring(separator + 1) : null;
+        }
+
+        private static bool VersionAtLeast(string actual, string minimum)
+        {
+            if (string.IsNullOrWhiteSpace(minimum)) return true;
+            if (Version.TryParse(actual, out Version actualVersion) &&
+                Version.TryParse(minimum, out Version minimumVersion)) return actualVersion >= minimumVersion;
+            return string.Equals(actual, minimum, StringComparison.OrdinalIgnoreCase);
         }
 
         private static string Field(BridgeResult result, string name, string fallback) =>
@@ -623,6 +752,15 @@ namespace RimWorldDevBridge
         private static string SafeId(string value) => !string.IsNullOrWhiteSpace(value) && value.Length <= 96 &&
             value.All(character => char.IsLetterOrDigit(character) || character == '-' || character == '_')
             ? value : null;
+        private static BridgeCommandMode ParseMode(string value)
+        {
+            if (string.Equals(value, "read", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "R", StringComparison.OrdinalIgnoreCase)) return BridgeCommandMode.PureRead;
+            if (string.Equals(value, "write", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "W", StringComparison.OrdinalIgnoreCase)) return BridgeCommandMode.PersistentMutation;
+            if (Enum.TryParse(value, true, out BridgeCommandMode mode)) return mode;
+            throw new InvalidDataException("Unknown mutation classification: " + value + ".");
+        }
         private static BridgeRequest SyntheticParent() => new BridgeRequest
         {
             RequestId = "feature-describe", SessionId = BridgeRuntime.SessionId, EnqueuedUtc = DateTime.UtcNow,
@@ -669,6 +807,7 @@ namespace RimWorldDevBridge
         {
             internal string Name;
             internal int TickBudget;
+            internal int TimeoutMs;
             internal int? RandomSeed;
             internal RequirementPlan Requirements;
             internal List<PreparedTestStep> Steps = new List<PreparedTestStep>();
@@ -681,6 +820,8 @@ namespace RimWorldDevBridge
         {
             internal bool RequiresMap;
             internal string RequiredSave;
+            internal string CoreFingerprint;
+            internal string AdapterFingerprint;
             internal List<string> RequiredMods = new List<string>();
             internal List<string> RequiredAdapters = new List<string>();
         }
@@ -710,6 +851,8 @@ namespace RimWorldDevBridge
                 string kind = (Kind ?? string.Empty).ToLowerInvariant();
                 if (kind == "status") Compare(result.Status.ToString(), Value, "status");
                 else if (kind == "schema") Compare(result.Schema, Value, "schema");
+                else if (kind == "schemaversion") Compare(result.SchemaVersion.ToString(CultureInfo.InvariantCulture),
+                    Value, "schemaVersion");
                 else if (kind == "noexception")
                 {
                     if (result.Status == BridgeStatus.ERROR) throw new FeatureAssertionException("exception", Step + " errored");

@@ -9,9 +9,9 @@ namespace RimWorldDevBridge
 {
     public static class BridgeProtocol
     {
-        public const string BridgeVersion = "2.0.2";
+        public const string BridgeVersion = "2.1.0";
         public const int ProtocolVersion = 10;
-        public const string CoreSchema = "v10-typed-core";
+        public const string CoreSchema = "v10.1-typed-core";
         public const int MaxRequestBytes = 32768;
         public const int MaxArgumentBytes = 24576;
         public const int MaxResponseBytes = 262144;
@@ -80,20 +80,29 @@ namespace RimWorldDevBridge
                     "timeoutMs must be an integer from 50 through " + MaximumDeadlineMs + ".");
                 return false;
             }
+            DateTime receivedUtc = DateTime.UtcNow;
             request = new BridgeRequest
             {
                 RequestId = id,
                 SessionId = Value(options, "session") ?? currentSessionId,
                 Command = command,
                 Argument = argument,
-                EnqueuedUtc = DateTime.UtcNow,
-                DeadlineUtc = DateTime.UtcNow.AddMilliseconds(timeoutMs),
+                ReceivedUtc = receivedUtc,
+                EnqueuedUtc = receivedUtc,
+                DeadlineUtc = receivedUtc.AddMilliseconds(timeoutMs),
                 IdempotencyKey = Value(options, "idempotency"),
                 OutputFormat = NormalizeFormat(Value(options, "format")),
                 DetailLevel = Value(options, "detail") ?? "compact",
                 AllowExpensive = ParseBool(Value(options, "allowExpensive")),
                 AuthToken = Value(options, "lease")
             };
+            if (!ValidOptionValue(request.SessionId, 128) || !ValidOptionValue(request.IdempotencyKey, 128) ||
+                !ValidOptionValue(request.AuthToken, 128) || !ValidOptionValue(request.DetailLevel, 32))
+            {
+                request = null;
+                failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_request_option_length");
+                return false;
+            }
             return true;
         }
 
@@ -117,7 +126,9 @@ namespace RimWorldDevBridge
                 "mode=" + (result?.Mode.ToString() ?? BridgeCommandMode.PureRead.ToString()),
                 "schema=" + BridgeText.Clean(result?.Schema ?? "core.result") + " version:" +
                     (result?.SchemaVersion ?? 1),
-                "timing=queueMs:" + (result?.QueueDelayMs ?? 0d).ToString("0.###",
+                "timing=prepareMs:" + (result?.PreparationMs ?? 0d).ToString("0.###",
+                    System.Globalization.CultureInfo.InvariantCulture) + " queueMs:" +
+                    (result?.QueueDelayMs ?? 0d).ToString("0.###",
                     System.Globalization.CultureInfo.InvariantCulture) + " executionMs:" +
                     (result?.ExecutionMs ?? 0d).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                 "ticks=before:" + (result?.TickBefore ?? -1) + " after:" + (result?.TickAfter ?? -1),
@@ -153,17 +164,35 @@ namespace RimWorldDevBridge
         private static string BoundLines(IEnumerable<string> source, BridgeResult result)
         {
             StringBuilder output = new StringBuilder();
+            int outputBytes = 0;
+            bool lineTruncated = false;
+            bool responseTruncated = false;
             foreach (string original in source ?? Enumerable.Empty<string>())
             {
+                if (Encoding.UTF8.GetByteCount(original ?? string.Empty) > MaxLineBytes)
+                {
+                    lineTruncated = true;
+                    if (result != null) result.Truncated = true;
+                }
                 string line = BoundUtf8(original ?? string.Empty, MaxLineBytes);
                 int candidate = Encoding.UTF8.GetByteCount(line) + (output.Length == 0 ? 0 : 1);
-                if (Encoding.UTF8.GetByteCount(output.ToString()) + candidate > MaxResponseBytes)
+                const string marker = "truncated=true reason:responseBytes";
+                int reserve = Encoding.UTF8.GetByteCount(marker) + 1;
+                if (outputBytes + candidate > MaxResponseBytes - reserve)
                 {
                     if (result != null) result.Truncated = true;
                     Append(output, "truncated=true reason:responseBytes");
+                    responseTruncated = true;
                     break;
                 }
                 Append(output, line);
+                outputBytes += candidate;
+            }
+            if (lineTruncated && !responseTruncated)
+            {
+                const string marker = "truncated=true reason:lineBytes";
+                int markerBytes = Encoding.UTF8.GetByteCount(marker) + (output.Length == 0 ? 0 : 1);
+                if (outputBytes + markerBytes <= MaxResponseBytes) Append(output, marker);
             }
             return output.ToString();
         }
@@ -228,6 +257,9 @@ namespace RimWorldDevBridge
         private static string NormalizeFormat(string value) =>
             string.Equals(value, "json", StringComparison.OrdinalIgnoreCase) ? "json" : "line";
 
+        private static bool ValidOptionValue(string value, int maximumLength) =>
+            value == null || value.Length <= maximumLength;
+
         [System.Runtime.Serialization.DataContract]
         private sealed class JsonResult
         {
@@ -242,6 +274,7 @@ namespace RimWorldDevBridge
             [System.Runtime.Serialization.DataMember(Order = 9)] public int schemaVersion;
             [System.Runtime.Serialization.DataMember(Order = 10)] public double queueDelayMs;
             [System.Runtime.Serialization.DataMember(Order = 11)] public double executionMs;
+            [System.Runtime.Serialization.DataMember(Order = 20)] public double preparationMs;
             [System.Runtime.Serialization.DataMember(Order = 12)] public int tickBefore;
             [System.Runtime.Serialization.DataMember(Order = 13)] public int tickAfter;
             [System.Runtime.Serialization.DataMember(Order = 14)] public bool truncated;
@@ -263,6 +296,7 @@ namespace RimWorldDevBridge
                 schema = result?.Schema,
                 schemaVersion = result?.SchemaVersion ?? 1,
                 queueDelayMs = result?.QueueDelayMs ?? 0d,
+                preparationMs = result?.PreparationMs ?? 0d,
                 executionMs = result?.ExecutionMs ?? 0d,
                 tickBefore = result?.TickBefore ?? -1,
                 tickAfter = result?.TickAfter ?? -1,
@@ -282,6 +316,7 @@ namespace RimWorldDevBridge
         internal int Limit = BridgeProtocol.DefaultPageSize;
         internal int Offset;
         internal string Fields;
+        internal string CursorScope => Filter + "\nfields=" + (Fields ?? string.Empty);
 
         internal static BridgeQuery Parse(string argument, string sessionId, string command,
             out BridgeResult failure)
@@ -301,7 +336,7 @@ namespace RimWorldDevBridge
                 BridgeProtocol.DefaultPageSize, 1, BridgeProtocol.MaxPageSize);
             string cursor = BridgeProtocol.Value(options, "cursor");
             if (!string.IsNullOrEmpty(cursor) && !BridgeCursor.TryDecode(cursor, sessionId, command,
-                query.Filter, out query.Offset))
+                query.CursorScope, out query.Offset))
             {
                 failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_cursor");
                 return null;
@@ -314,7 +349,8 @@ namespace RimWorldDevBridge
     {
         internal static string Encode(string session, string command, string filter, int offset)
         {
-            string raw = string.Join("\n", session ?? "", command ?? "", filter ?? "", offset.ToString());
+            string raw = string.Join("\n", EncodePart(session), EncodePart(command), EncodePart(filter),
+                offset.ToString(System.Globalization.CultureInfo.InvariantCulture));
             return Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         }
 
@@ -326,10 +362,17 @@ namespace RimWorldDevBridge
                 string value = cursor.Replace('-', '+').Replace('_', '/');
                 value = value.PadRight((value.Length + 3) / 4 * 4, '=');
                 string[] parts = Encoding.UTF8.GetString(Convert.FromBase64String(value)).Split('\n');
-                return parts.Length == 4 && parts[0] == (session ?? "") && parts[1] == (command ?? "") &&
-                    parts[2] == (filter ?? "") && int.TryParse(parts[3], out offset) && offset >= 0;
+                return parts.Length == 4 && DecodePart(parts[0]) == (session ?? "") &&
+                    DecodePart(parts[1]) == (command ?? "") && DecodePart(parts[2]) == (filter ?? "") &&
+                    int.TryParse(parts[3], out offset) && offset >= 0;
             }
             catch { return false; }
         }
+
+        private static string EncodePart(string value) =>
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(value ?? string.Empty));
+
+        private static string DecodePart(string value) =>
+            Encoding.UTF8.GetString(Convert.FromBase64String(value));
     }
 }

@@ -1,3 +1,5 @@
+using System;
+using System.Diagnostics;
 using UnityEngine;
 using Verse;
 
@@ -9,8 +11,10 @@ namespace RimWorldDevBridge
 
         public RimWorldDevBridgeMod(ModContentPack content) : base(content)
         {
+            long constructionStart = Stopwatch.GetTimestamp();
+            long managedBefore = GC.GetTotalMemory(false);
             Settings = GetSettings<BridgeSettings>();
-            BridgeRuntime.Bootstrap(content.RootDir);
+            BridgeRuntime.Bootstrap(content.RootDir, constructionStart, managedBefore);
         }
 
         public override string SettingsCategory() => "RimWorld Dev Bridge";

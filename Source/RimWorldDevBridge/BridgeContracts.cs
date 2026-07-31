@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
+using RimWorld.Planet;
 using Verse;
 
 namespace RimWorldDevBridge
@@ -65,17 +66,25 @@ namespace RimWorldDevBridge
     {
         public string Name { get; set; }
         public string Value { get; set; }
+        public string ValueType { get; set; }
 
         public BridgeField() { }
         public BridgeField(string name, object value)
         {
-            Name = name ?? "value";
-            Value = BridgeText.Invariant(value);
+            Name = BridgeText.Bound(name ?? "value", 256);
+            ValueType = value == null ? "null" : value is bool ? "boolean" :
+                value is byte || value is sbyte || value is short || value is ushort || value is int ||
+                value is uint || value is long || value is ulong ? "integer" :
+                value is float || value is double || value is decimal ? "number" : "string";
+            Value = BridgeText.Bound(value, 16384);
         }
     }
 
     public sealed class BridgeResult
     {
+        private const int MaximumFields = 512;
+        private const int MaximumLines = 1024;
+        private const int MaximumWarnings = 64;
         public string RequestId { get; set; }
         public string SessionId { get; set; }
         public string Command { get; set; }
@@ -86,6 +95,7 @@ namespace RimWorldDevBridge
         public string Schema { get; set; } = "core.result";
         public int SchemaVersion { get; set; } = 1;
         public double QueueDelayMs { get; set; }
+        public double PreparationMs { get; set; }
         public double ExecutionMs { get; set; }
         public int TickBefore { get; set; } = -1;
         public int TickAfter { get; set; } = -1;
@@ -100,19 +110,39 @@ namespace RimWorldDevBridge
 
         public BridgeResult Add(string name, object value)
         {
+            if (Data.Count >= MaximumFields)
+            {
+                Truncated = true;
+                return this;
+            }
+            if ((name?.Length ?? 0) > 256 || BridgeText.Invariant(value).Length > 16384)
+                Truncated = true;
             Data.Add(new BridgeField(name, value));
             return this;
         }
 
         public BridgeResult AddLine(string line)
         {
-            Lines.Add(BridgeText.Clean(line));
+            if (Lines.Count >= MaximumLines)
+            {
+                Truncated = true;
+                return this;
+            }
+            if (BridgeText.Invariant(line).Length > 16384) Truncated = true;
+            Lines.Add(BridgeText.Bound(line, 16384));
             return this;
         }
 
         public BridgeResult Warn(string warning)
         {
-            if (!string.IsNullOrWhiteSpace(warning)) Warnings.Add(BridgeText.Clean(warning));
+            if (string.IsNullOrWhiteSpace(warning)) return this;
+            if (Warnings.Count >= MaximumWarnings)
+            {
+                Truncated = true;
+                return this;
+            }
+            if (BridgeText.Invariant(warning).Length > 4096) Truncated = true;
+            Warnings.Add(BridgeText.Bound(warning, 4096));
             return this;
         }
 
@@ -131,7 +161,14 @@ namespace RimWorldDevBridge
         {
             BridgeResult result = Ok("legacy.lines");
             foreach (string value in values ?? Enumerable.Empty<string>())
+            {
+                if (result.Lines.Count >= MaximumLines)
+                {
+                    result.Truncated = true;
+                    break;
+                }
                 result.AddLine(value);
+            }
             string joined = string.Join("\n", result.Lines);
             if (result.Lines.Count == 0)
                 return Fail(BridgeStatus.ERROR, "empty_adapter_response");
@@ -144,11 +181,24 @@ namespace RimWorldDevBridge
                 result.Status = BridgeStatus.UNAVAILABLE;
             else if (result.Lines.Any(line => line.StartsWith("error=", StringComparison.OrdinalIgnoreCase)))
                 result.Status = BridgeStatus.ERROR;
+            else if (result.Lines.Any(ContainsFailureToken))
+                result.Status = BridgeStatus.ERROR;
             return result;
         }
 
         private static bool ContainsSemantic(string value, string token) =>
             value?.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private static bool ContainsFailureToken(string line)
+        {
+            string value = (line ?? string.Empty).ToUpperInvariant();
+            int index = value.IndexOf("=FAIL", StringComparison.Ordinal);
+            if (index < 0) index = value.IndexOf(":FAIL", StringComparison.Ordinal);
+            if (index < 0) return false;
+            int after = index + 5;
+            return after >= value.Length || char.IsWhiteSpace(value[after]) || value[after] == ':' ||
+                value[after] == '|' || value[after] == ';';
+        }
     }
 
     public sealed class BridgeRequest
@@ -158,6 +208,7 @@ namespace RimWorldDevBridge
         public string Command { get; set; }
         public string Argument { get; set; }
         public DateTime EnqueuedUtc { get; set; }
+        public DateTime ReceivedUtc { get; set; }
         public DateTime DeadlineUtc { get; set; }
         public string IdempotencyKey { get; set; }
         public string OutputFormat { get; set; } = "line";
@@ -171,9 +222,13 @@ namespace RimWorldDevBridge
         internal string AuthToken;
         internal string PreparedAdapterId;
         internal string PreparedAdapterGeneration;
+        internal object PreparedAdapter;
         internal BridgeCommandDescriptor PreparedDescriptor;
         internal object PreparedPayload;
         internal int NestingDepth;
+        internal bool IdempotentReplay;
+        internal bool ExecutionReached;
+        internal double PreparationMs;
         internal readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
         internal BridgeResult Result;
 
@@ -187,7 +242,7 @@ namespace RimWorldDevBridge
         public BridgeRequest Request { get; }
         public string SessionId => Request.SessionId;
         public Map Map { get; }
-        public int Tick => Find.TickManager?.TicksGame ?? -1;
+        public int Tick => BridgeGameState.TickManager?.TicksGame ?? -1;
         public DateTime DeadlineUtc => Request.DeadlineUtc;
         public bool IsCancellationRequested => cancellation?.Invoke() == true || Request.Expired;
 
@@ -241,6 +296,13 @@ namespace RimWorldDevBridge
             return Clean(value.ToString());
         }
 
+        internal static string Bound(object value, int maximumCharacters)
+        {
+            string text = Invariant(value);
+            if (text.Length <= maximumCharacters) return text;
+            return text.Substring(0, Math.Max(0, maximumCharacters - 14)) + "...<truncated>";
+        }
+
         internal static string NormalizeCommand(string command)
         {
             return (command ?? string.Empty).Trim().ToUpperInvariant();
@@ -251,5 +313,13 @@ namespace RimWorldDevBridge
     {
         internal static double Milliseconds(long start) =>
             (Stopwatch.GetTimestamp() - start) * 1000d / Stopwatch.Frequency;
+    }
+
+    internal static class BridgeGameState
+    {
+        internal static Map CurrentMap => Current.Game == null ? null : Find.CurrentMap;
+        internal static TickManager TickManager => Current.Game == null ? null : Find.TickManager;
+        internal static List<Map> Maps => Current.Game == null ? null : Find.Maps;
+        internal static World World => Current.Game == null ? null : Find.World;
     }
 }

@@ -1,5 +1,5 @@
-bridge=2.0.2
+bridge=2.1.0
 protocol=10
-schema=v10-typed-core
+schema=v10.1-typed-core
 handoff=BRIDGE_HANDOFF.md
-changes=Added a bridge-owned main-thread dispatcher and ownership-aware bounded launch readiness
+changes=Removed dormant frame work, added authoritative lazy manifests, hardened scheduling and safety, and expanded typed testing evidence

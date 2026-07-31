@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 
 namespace RimWorldDevBridge
 {
@@ -11,6 +12,7 @@ namespace RimWorldDevBridge
         private const int CompletedWriteLimit = 256;
         private const int AuditLimitBytes = 1024 * 1024;
         private readonly object gate = new object();
+        private readonly object auditGate = new object();
         private readonly Dictionary<string, WriteLease> leases = new Dictionary<string, WriteLease>(StringComparer.Ordinal);
         private readonly Dictionary<string, CachedWrite> completed = new Dictionary<string, CachedWrite>(StringComparer.Ordinal);
         private readonly Queue<string> completionOrder = new Queue<string>();
@@ -40,15 +42,16 @@ namespace RimWorldDevBridge
             if (normalized != "sandbox" && normalized != "live-confirmed")
                 return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_write_context",
                     "Use sandbox or live-confirmed.");
-            WriteLease lease = new WriteLease
-            {
-                Token = Guid.NewGuid().ToString("N"),
-                SessionId = sessionId,
-                Context = normalized,
-                ExpiresUtc = DateTime.UtcNow.AddSeconds(LeaseSeconds)
-            };
+            WriteLease lease;
             lock (gate)
             {
+                lease = new WriteLease
+                {
+                    Token = Guid.NewGuid().ToString("N"),
+                    SessionId = sessionId,
+                    Context = normalized,
+                    ExpiresUtc = DateTime.UtcNow.AddSeconds(LeaseSeconds)
+                };
                 context = normalized;
                 leases[lease.Token] = lease;
                 RemoveExpired();
@@ -94,6 +97,7 @@ namespace RimWorldDevBridge
                     return true;
                 }
                 result = cached.Result.CopyFor(request.RequestId);
+                request.IdempotentReplay = true;
                 result.Warn("idempotent replay; the original mutation was not executed again");
                 return true;
             }
@@ -106,6 +110,7 @@ namespace RimWorldDevBridge
             string key = request.SessionId + ":" + request.IdempotencyKey;
             lock (gate)
             {
+                if (request.SessionId != sessionId) return;
                 if (!completed.ContainsKey(key)) completionOrder.Enqueue(key);
                 completed[key] = new CachedWrite
                 {
@@ -121,19 +126,25 @@ namespace RimWorldDevBridge
         internal void Audit(BridgeRequest request, BridgeResult result)
         {
             if (request?.Mode == BridgeCommandMode.PureRead) return;
+            string line = DateTime.UtcNow.ToString("o") + "|session=" + BridgeText.Clean(request.SessionId) +
+                "|request=" + BridgeText.Clean(request.RequestId) + "|command=" +
+                BridgeText.Clean(request.Command) + "|mode=" + request.Mode + "|status=" +
+                (result?.Status.ToString() ?? "ERROR") + "|idempotency=" +
+                BridgeText.Clean(request.IdempotencyKey) + "|mutation=" +
+                BridgeText.Clean(result?.MutationSummary);
+            ThreadPool.QueueUserWorkItem(_ => WriteAudit(line));
+        }
+
+        private void WriteAudit(string line)
+        {
             try
             {
-                Directory.CreateDirectory(BridgePaths.UserRoot);
-                RotateAuditIfNeeded();
-                File.AppendAllLines(BridgePaths.AuditPath, new[]
+                lock (auditGate)
                 {
-                    DateTime.UtcNow.ToString("o") + "|session=" + BridgeText.Clean(request.SessionId) +
-                    "|request=" + BridgeText.Clean(request.RequestId) + "|command=" +
-                    BridgeText.Clean(request.Command) + "|mode=" + request.Mode + "|status=" +
-                    (result?.Status.ToString() ?? "ERROR") + "|idempotency=" +
-                    BridgeText.Clean(request.IdempotencyKey) + "|mutation=" +
-                    BridgeText.Clean(result?.MutationSummary)
-                });
+                    Directory.CreateDirectory(BridgePaths.UserRoot);
+                    RotateAuditIfNeeded();
+                    File.AppendAllLines(BridgePaths.AuditPath, new[] { line });
+                }
             }
             catch { }
         }
@@ -184,6 +195,7 @@ namespace RimWorldDevBridge
                 Schema = source.Schema,
                 SchemaVersion = source.SchemaVersion,
                 QueueDelayMs = source.QueueDelayMs,
+                PreparationMs = source.PreparationMs,
                 ExecutionMs = source.ExecutionMs,
                 TickBefore = source.TickBefore,
                 TickAfter = source.TickAfter,
@@ -191,7 +203,8 @@ namespace RimWorldDevBridge
                 ContinuationCursor = source.ContinuationCursor,
                 MutationSummary = source.MutationSummary
             };
-            copy.Data.AddRange(source.Data.Select(field => new BridgeField(field.Name, field.Value)));
+            copy.Data.AddRange(source.Data.Select(field => new BridgeField(field.Name, field.Value)
+                { ValueType = field.ValueType }));
             copy.Lines.AddRange(source.Lines);
             copy.Warnings.AddRange(source.Warnings);
             return copy;

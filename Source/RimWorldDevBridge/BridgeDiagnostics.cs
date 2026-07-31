@@ -17,6 +17,10 @@ namespace RimWorldDevBridge
 {
     internal static class BridgeDiagnostics
     {
+        private static readonly object PerformanceGate = new object();
+        private const int MaximumScannedObjects = 20000;
+        private static DateTime previousPerformanceUtc;
+        private static int previousPerformanceTick = -1;
         internal delegate void RegisterCommand(string name, string description, BridgeCommandMode mode,
             BridgeCostClass cost, bool requiresMap, string argumentSchema);
 
@@ -50,6 +54,9 @@ namespace RimWorldDevBridge
                 BridgeCostClass.Trivial, true, "x,z");
             register("SCREENSHOT", "Write a full-screen PNG under bridge user data.", BridgeCommandMode.UiOnly,
                 BridgeCostClass.Expensive, false, "name");
+            register("SCREENSHOT_REGION", "Write a bounded screen region PNG under bridge user data.",
+                BridgeCommandMode.UiOnly, BridgeCostClass.Expensive, false,
+                "x=<px>&y=<bottom-px>&width=<px>&height=<px>&name=<name>");
             register("REFRESH_CELL", "Mark one map cell mesh dirty for a narrow visual refresh.",
                 BridgeCommandMode.Reversible, BridgeCostClass.Trivial, true, "x,z");
             register("LOG_DELTA", "Stable paged RimWorld log messages.", BridgeCommandMode.PureRead,
@@ -96,6 +103,7 @@ namespace RimWorldDevBridge
                 case "SELECT": return Select(context);
                 case "JUMP": return Jump(context);
                 case "SCREENSHOT": return Screenshot(context);
+                case "SCREENSHOT_REGION": return ScreenshotRegion(context);
                 case "REFRESH_CELL": return RefreshCell(context);
                 case "LOG_DELTA": return Logs(context, null);
                 case "DEF_ERRORS": return Logs(context, "def");
@@ -103,7 +111,8 @@ namespace RimWorldDevBridge
                 case "HARMONY_PATCHES": return HarmonyPatches(context);
                 case "COMPATIBILITY_REPORT": return CompatibilityReport();
                 case "CAPTURE_STATE": return CaptureState(context);
-                case "DIFF_STATE": return DiffState(context);
+                case "DIFF_STATE": return context.Request.PreparedPayload as BridgeResult ??
+                    DiffState(context.Request);
                 case "EVENTS": return BridgeEventJournal.Report(context.Request);
                 case "PERFORMANCE": return Performance();
                 case "BENCHMARK": return Benchmark(context);
@@ -113,17 +122,31 @@ namespace RimWorldDevBridge
             }
         }
 
+        internal static BridgeResult Prepare(BridgeRequest request)
+        {
+            if (request?.Command != "DIFF_STATE") return null;
+            BridgeResult result = DiffState(request);
+            if (!result.IsSuccess) return result;
+            request.PreparedPayload = result;
+            return null;
+        }
+
         private static BridgeResult Pawns(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            List<Pawn> values = context.Map.mapPawns.AllPawnsSpawned
-                .Where(pawn => Matches(query.Filter, pawn.def?.defName, pawn.LabelShortCap))
-                .OrderBy(pawn => pawn.thingIDNumber).ToList();
-            BridgeResult result = Paged("core.pawns", context.Request, query, values.Count);
+            IReadOnlyList<Pawn> all = context.Map.mapPawns.AllPawnsSpawned;
+            bool scanTruncated = all.Count > MaximumScannedObjects;
+            List<Pawn> values = all.Take(MaximumScannedObjects)
+                .Where(pawn => string.IsNullOrWhiteSpace(query.Filter) ||
+                    Matches(query.Filter, pawn.def?.defName, pawn.LabelShortCap))
+                .ToList();
+            BridgeResult result = Paged("core.pawns", context.Request, query, values.Count)
+                .Add("scanned", Math.Min(all.Count, MaximumScannedObjects)).Add("available", all.Count);
             foreach (Pawn pawn in values.Skip(query.Offset).Take(query.Limit))
                 result.AddLine(PawnLine(pawn, context.SessionId, context.Map.uniqueID));
             FinishPage(result, context.Request, query, values.Count);
+            ApplyScanLimit(result, scanTruncated);
             return result;
         }
 
@@ -148,13 +171,30 @@ namespace RimWorldDevBridge
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            List<Thing> values = context.Map.listerThings.AllThings
-                .Where(thing => Matches(query.Filter, thing.def?.defName, thing.LabelShortCap, thing.GetType().FullName))
-                .OrderBy(thing => thing.thingIDNumber).ToList();
-            BridgeResult result = Paged("core.things", context.Request, query, values.Count);
-            foreach (Thing thing in values.Skip(query.Offset).Take(query.Limit))
+            List<Thing> all = context.Map.listerThings.AllThings;
+            bool scanTruncated = all.Count > MaximumScannedObjects;
+            int scannedCount = Math.Min(all.Count, MaximumScannedObjects);
+            List<Thing> filtered = null;
+            int total;
+            IEnumerable<Thing> page;
+            if (string.IsNullOrWhiteSpace(query.Filter))
+            {
+                total = scannedCount;
+                page = all.Take(scannedCount).Skip(query.Offset).Take(query.Limit);
+            }
+            else
+            {
+                filtered = all.Take(MaximumScannedObjects).Where(thing => Matches(query.Filter,
+                    thing.def?.defName, thing.LabelShortCap, thing.GetType().FullName)).ToList();
+                total = filtered.Count;
+                page = filtered.Skip(query.Offset).Take(query.Limit);
+            }
+            BridgeResult result = Paged("core.things", context.Request, query, total)
+                .Add("scanned", scannedCount).Add("available", all.Count);
+            foreach (Thing thing in page)
                 result.AddLine(ThingLine(thing, context.SessionId, context.Map.uniqueID));
-            FinishPage(result, context.Request, query, values.Count);
+            FinishPage(result, context.Request, query, total);
+            ApplyScanLimit(result, scanTruncated);
             return result;
         }
 
@@ -192,14 +232,19 @@ namespace RimWorldDevBridge
             }
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            List<Def> values = source.Where(def => Matches(query.Filter, def.defName, def.label, def.GetType().FullName))
+            List<Def> scanned = source.Take(MaximumScannedObjects + 1).ToList();
+            bool scanTruncated = scanned.Count > MaximumScannedObjects;
+            List<Def> values = scanned.Take(MaximumScannedObjects)
+                .Where(def => Matches(query.Filter, def.defName, def.label, def.GetType().FullName))
                 .OrderBy(def => def.defName, StringComparer.Ordinal).ToList();
-            BridgeResult result = Paged("core.defs", context.Request, query, values.Count).Add("kind", kind);
+            BridgeResult result = Paged("core.defs", context.Request, query, values.Count).Add("kind", kind)
+                .Add("scanned", Math.Min(scanned.Count, MaximumScannedObjects));
             foreach (Def def in values.Skip(query.Offset).Take(query.Limit))
                 result.AddLine("def=name:" + BridgeText.Clean(def.defName) + " type:" +
                     BridgeText.Clean(def.GetType().FullName) + " label:" + BridgeText.Clean(def.label) +
                     " mod:" + BridgeText.Clean(def.modContentPack?.PackageIdPlayerFacing));
             FinishPage(result, context.Request, query, values.Count);
+            ApplyScanLimit(result, scanTruncated);
             return result;
         }
 
@@ -212,7 +257,8 @@ namespace RimWorldDevBridge
                 .OrderBy(item => item.Scope).ThenBy(item => item.Index).ToList();
             BridgeResult result = Paged("core.components", context.Request, query, values.Count);
             foreach (ComponentRef item in values.Skip(query.Offset).Take(query.Limit))
-                result.AddLine("component=ref:" + item.Scope + ":" + item.Index + " type:" +
+                result.AddLine("component=ref:" + context.SessionId + ":" + item.Scope + ":" +
+                    item.Index + " type:" +
                     BridgeText.Clean(item.Value.GetType().FullName));
             FinishPage(result, context.Request, query, values.Count);
             return result;
@@ -221,11 +267,19 @@ namespace RimWorldDevBridge
         private static BridgeResult Component(BridgeExecutionContext context)
         {
             string value = (context.Request.Argument ?? string.Empty).Trim();
+            string[] reference = value.Split(':');
+            if (reference.Length == 3)
+            {
+                if (!string.Equals(reference[0], context.SessionId, StringComparison.Ordinal))
+                    return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_component_reference");
+                value = reference[1] + ":" + reference[2];
+            }
             ComponentRef target = ComponentRefs().FirstOrDefault(item =>
                 string.Equals(item.Scope + ":" + item.Index, value, StringComparison.OrdinalIgnoreCase) ||
                 item.Value.GetType().FullName.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0);
             if (target == null) return BridgeResult.Fail(BridgeStatus.NOT_FOUND, "component_not_found");
-            BridgeResult result = BridgeResult.Ok("core.component").Add("ref", target.Scope + ":" + target.Index)
+            BridgeResult result = BridgeResult.Ok("core.component").Add("ref", context.SessionId + ":" +
+                target.Scope + ":" + target.Index)
                 .Add("type", target.Value.GetType().FullName);
             foreach (FieldInfo field in target.Value.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public)
                 .Where(field => SafeFieldType(field.FieldType)).OrderBy(field => field.Name).Take(48))
@@ -240,9 +294,12 @@ namespace RimWorldDevBridge
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            List<Pawn> values = context.Map.mapPawns.AllPawnsSpawned.Where(pawn => pawn.CurJob != null)
-                .Where(pawn => Matches(query.Filter, pawn.CurJobDef?.defName, pawn.LabelShortCap))
-                .OrderBy(pawn => pawn.thingIDNumber).ToList();
+            IReadOnlyList<Pawn> all = context.Map.mapPawns.AllPawnsSpawned;
+            bool scanTruncated = all.Count > MaximumScannedObjects;
+            List<Pawn> values = all.Take(MaximumScannedObjects).Where(pawn => pawn.CurJob != null)
+                .Where(pawn => string.IsNullOrWhiteSpace(query.Filter) ||
+                    Matches(query.Filter, pawn.CurJobDef?.defName, pawn.LabelShortCap))
+                .ToList();
             BridgeResult result = Paged("core.jobs", context.Request, query, values.Count);
             foreach (Pawn pawn in values.Skip(query.Offset).Take(query.Limit))
                 result.AddLine("job=pawnRef:" + Reference(context.SessionId, context.Map.uniqueID, pawn.thingIDNumber) +
@@ -250,6 +307,7 @@ namespace RimWorldDevBridge
                     " targetA:" + Target(pawn.CurJob.targetA) + " startTick:" + pawn.CurJob.startTick +
                     " playerForced:" + pawn.CurJob.playerForced);
             FinishPage(result, context.Request, query, values.Count);
+            ApplyScanLimit(result, scanTruncated);
             return result;
         }
 
@@ -257,14 +315,18 @@ namespace RimWorldDevBridge
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            List<Designation> values = context.Map.designationManager.AllDesignations
-                .Where(item => Matches(query.Filter, item.def?.defName, item.target.ToString()))
+            List<Designation> all = context.Map.designationManager.AllDesignations;
+            bool scanTruncated = all.Count > MaximumScannedObjects;
+            List<Designation> values = all.Take(MaximumScannedObjects)
+                .Where(item => string.IsNullOrWhiteSpace(query.Filter) ||
+                    Matches(query.Filter, item.def?.defName, item.target.ToString()))
                 .OrderBy(item => item.def?.defName).ThenBy(item => item.target.ToString()).ToList();
             BridgeResult result = Paged("core.designations", context.Request, query, values.Count);
             foreach (Designation item in values.Skip(query.Offset).Take(query.Limit))
                 result.AddLine("designation=def:" + BridgeText.Clean(item.def?.defName) + " target:" +
                     BridgeText.Clean(item.target.ToString()));
             FinishPage(result, context.Request, query, values.Count);
+            ApplyScanLimit(result, scanTruncated);
             return result;
         }
 
@@ -322,16 +384,45 @@ namespace RimWorldDevBridge
         private static BridgeResult Screenshot(BridgeExecutionContext context)
         {
             string name = SafeArtifactName(context.Request.Argument, "screenshot-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff")) + ".png";
+            return CaptureScreenshot(new Rect(0f, 0f, Screen.width, Screen.height), Screen.width,
+                Screen.height, name, "core.screenshot");
+        }
+
+        private static BridgeResult ScreenshotRegion(BridgeExecutionContext context)
+        {
+            Dictionary<string, string> options;
+            try { options = BridgeProtocol.ParseOptions((context.Request.Argument ?? string.Empty).Replace(';', '&')); }
+            catch (Exception exception)
+            {
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_screenshot_options",
+                    exception.GetBaseException().Message);
+            }
+            if (!int.TryParse(BridgeProtocol.Value(options, "x"), out int x) ||
+                !int.TryParse(BridgeProtocol.Value(options, "y"), out int y) ||
+                !int.TryParse(BridgeProtocol.Value(options, "width"), out int width) ||
+                !int.TryParse(BridgeProtocol.Value(options, "height"), out int height) ||
+                x < 0 || y < 0 || width < 1 || height < 1 || width > Screen.width ||
+                height > Screen.height || x > Screen.width - width || y > Screen.height - height)
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_screenshot_region");
+            string name = SafeArtifactName(BridgeProtocol.Value(options, "name"),
+                "region-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff")) + ".png";
+            return CaptureScreenshot(new Rect(x, y, width, height), width, height, name,
+                "core.screenshotRegion").Add("x", x).Add("y", y);
+        }
+
+        private static BridgeResult CaptureScreenshot(Rect source, int width, int height, string name,
+            string schema)
+        {
             string path = BridgePaths.SafeOutputPath("Captures", name);
-            Texture2D image = new Texture2D(Screen.width, Screen.height, TextureFormat.RGB24, false);
+            Texture2D image = new Texture2D(width, height, TextureFormat.RGB24, false);
             try
             {
-                image.ReadPixels(new Rect(0f, 0f, Screen.width, Screen.height), 0, 0, false);
+                image.ReadPixels(source, 0, 0, false);
                 image.Apply(false, false);
                 byte[] bytes = image.EncodeToPNG();
                 File.WriteAllBytes(path, bytes);
-                return BridgeResult.Ok("core.screenshot").Add("path", path).Add("bytes", bytes.Length)
-                    .Add("sha256", Sha256(bytes)).Add("width", Screen.width).Add("height", Screen.height)
+                return BridgeResult.Ok(schema).Add("path", path).Add("bytes", bytes.Length)
+                    .Add("sha256", Sha256(bytes)).Add("width", width).Add("height", height)
                     .WithMutation("wrote screenshot artifact");
             }
             finally { UnityEngine.Object.Destroy(image); }
@@ -408,10 +499,10 @@ namespace RimWorldDevBridge
                 .Add("records", lines.Count).Add("bytes", bytes.Length).Add("sha256", Sha256(bytes));
         }
 
-        private static BridgeResult DiffState(BridgeExecutionContext context)
+        private static BridgeResult DiffState(BridgeRequest request)
         {
             Dictionary<string, string> options;
-            try { options = BridgeProtocol.ParseOptions((context.Request.Argument ?? string.Empty).Replace(';', '&')); }
+            try { options = BridgeProtocol.ParseOptions((request.Argument ?? string.Empty).Replace(';', '&')); }
             catch (Exception exception) { return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_diff_options", exception.Message); }
             string beforeName = SafeArtifactName(BridgeProtocol.Value(options, "before"), null);
             string afterName = SafeArtifactName(BridgeProtocol.Value(options, "after"), null);
@@ -448,13 +539,49 @@ namespace RimWorldDevBridge
         private static BridgeResult Performance()
         {
             Process process = Process.GetCurrentProcess();
-            return BridgeResult.Ok("core.performance")
-                .Add("managedBytes", GC.GetTotalMemory(false)).Add("workingSetBytes", process.WorkingSet64)
-                .Add("privateBytes", process.PrivateMemorySize64).Add("threads", process.Threads.Count)
+            try { process.Refresh(); } catch { }
+            long workingSet = 0;
+            long privateBytes = 0;
+            int threadCount = 0;
+            double processorMs = 0d;
+            try
+            {
+                workingSet = process.WorkingSet64;
+                privateBytes = process.PrivateMemorySize64;
+                threadCount = process.Threads.Count;
+                processorMs = process.TotalProcessorTime.TotalMilliseconds;
+            }
+            catch { }
+            int tick = BridgeGameState.TickManager?.TicksGame ?? -1;
+            DateTime now = DateTime.UtcNow;
+            double sampleSeconds = 0d;
+            int sampleTicks = 0;
+            lock (PerformanceGate)
+            {
+                if (previousPerformanceTick >= 0 && tick >= previousPerformanceTick)
+                {
+                    sampleSeconds = (now - previousPerformanceUtc).TotalSeconds;
+                    sampleTicks = tick - previousPerformanceTick;
+                }
+                previousPerformanceUtc = now;
+                previousPerformanceTick = tick;
+            }
+            BridgeResult result = BridgeResult.Ok("core.performance")
+                .Add("processId", process.Id).Add("managedBytes", GC.GetTotalMemory(false))
+                .Add("workingSetBytes", workingSet).Add("privateBytes", privateBytes)
+                .Add("threads", threadCount).Add("processorMs", processorMs)
                 .Add("bridgeClients", BridgeRuntime.ActiveClients).Add("adapterIndex", BridgeAdapterCatalog.State)
+                .Add("bootstrapMs", BridgeRuntime.BootstrapMs).Add("harmonyMs", BridgeRuntime.HarmonyMs)
+                .Add("finalizeInitMs", BridgeRuntime.FinalizeInitMs).Add("activationMs", BridgeRuntime.ActivationMs)
+                .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes)
+                .Add("sampleSeconds", sampleSeconds).Add("sampleTicks", sampleTicks)
+                .Add("sampleTicksPerSecond", sampleSeconds > 0d ? sampleTicks / sampleSeconds : 0d)
                 .Add("captureDirectory", BridgePaths.CapturePath)
                 .Add("captureFiles", Directory.Exists(BridgePaths.CapturePath)
                     ? Directory.GetFiles(BridgePaths.CapturePath).Length : 0);
+            if (workingSet <= 0 || threadCount <= 0)
+                result.Warn("Mono did not expose reliable OS process counters; managedBytes remains available.");
+            return result;
         }
 
         private static BridgeResult Benchmark(BridgeExecutionContext context)
@@ -501,9 +628,9 @@ namespace RimWorldDevBridge
                 "meta/tick=" + context.Tick,
                 "meta/gameVersion=" + VersionControl.CurrentVersionStringWithoutBuild,
                 "meta/adapterFingerprint=" + BridgeAdapterCatalog.Fingerprint,
-                "meta/mapCount=" + (Find.Maps?.Count ?? 0)
+                "meta/mapCount=" + (BridgeGameState.Maps?.Count ?? 0)
             };
-            foreach (Map map in (Find.Maps ?? new List<Map>()).OrderBy(value => value.uniqueID))
+            foreach (Map map in (BridgeGameState.Maps ?? new List<Map>()).OrderBy(value => value.uniqueID))
             {
                 context.ThrowIfCancellationRequested();
                 lines.Add("map/" + map.uniqueID + "/tile=" + map.Tile);
@@ -534,9 +661,9 @@ namespace RimWorldDevBridge
         private static List<ComponentRef> ComponentRefs()
         {
             List<ComponentRef> result = new List<ComponentRef>();
-            AddComponents(result, "map", Find.CurrentMap?.components);
+            AddComponents(result, "map", BridgeGameState.CurrentMap?.components);
             AddComponents(result, "game", Current.Game?.components);
-            AddComponents(result, "world", Find.World?.components);
+            AddComponents(result, "world", BridgeGameState.World?.components);
             return result;
         }
 
@@ -635,8 +762,17 @@ namespace RimWorldDevBridge
             if (more)
             {
                 result.Truncated = true;
-                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command, query.Filter, next);
+                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command,
+                    query.CursorScope, next);
             }
+        }
+
+        private static void ApplyScanLimit(BridgeResult result, bool scanTruncated)
+        {
+            if (!scanTruncated) return;
+            result.Status = BridgeStatus.PARTIAL;
+            result.Truncated = true;
+            result.Warn("scan budget reached; narrow the filter for complete evidence");
         }
 
         private static bool Matches(string filter, params string[] values) => string.IsNullOrWhiteSpace(filter) ||
@@ -718,7 +854,8 @@ namespace RimWorldDevBridge
             if (next < values.Count)
             {
                 result.Truncated = true;
-                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command, query.Filter, next);
+                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command,
+                    query.CursorScope, next);
             }
             return result;
         }

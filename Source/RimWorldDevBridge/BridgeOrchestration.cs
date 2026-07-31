@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace RimWorldDevBridge
@@ -9,6 +10,7 @@ namespace RimWorldDevBridge
     internal static class BridgeOrchestration
     {
         private const int MaximumDepth = 8;
+        private const long MaximumMacroBytes = 1024 * 1024;
         private static readonly object Gate = new object();
         private static Dictionary<string, MacroDefinition> macros =
             new Dictionary<string, MacroDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -79,10 +81,12 @@ namespace RimWorldDevBridge
             BridgeResult result = BridgeResult.Ok(plan.Schema).Add("steps", plan.Calls.Count)
                 .Add("mode", context.Request.Mode).Add("cost", context.Request.Cost);
             int failures = 0;
+            List<BridgeResult> childResults = new List<BridgeResult>();
             for (int i = 0; i < plan.Calls.Count; i++)
             {
                 PreparedCall call = plan.Calls[i];
                 BridgeResult child = BridgeDispatch.ExecuteChild(context, call);
+                childResults.Add(child);
                 result.AddLine("step=index:" + i + " command:" + call.Request.Command + " status:" + child.Status +
                     " schema:" + BridgeText.Clean(child.Schema) + " provider:" + BridgeText.Clean(child.Provider));
                 foreach (BridgeField field in child.Data.Take(12))
@@ -90,11 +94,21 @@ namespace RimWorldDevBridge
                         " value:" + BridgeText.Clean(field.Value));
                 foreach (string line in child.Lines.Take(12))
                     result.AddLine("stepLine=index:" + i + " value:" + BridgeText.Clean(line));
-                if (!child.IsSuccess)
+                bool statusExpected = plan.Assertions.Any(assertion => assertion.Step == i &&
+                    !string.IsNullOrEmpty(assertion.Status) && string.Equals(assertion.Status,
+                        child.Status.ToString(), StringComparison.OrdinalIgnoreCase));
+                if (!child.IsSuccess && !statusExpected)
                 {
                     failures++;
                     if (plan.StopOnError) break;
                 }
+            }
+            foreach (MacroAssertion assertion in plan.Assertions)
+            {
+                string failure = assertion.Validate(childResults);
+                result.AddLine("assertion=step:" + assertion.Step + " status:" +
+                    (failure == null ? "OK" : "ERROR") + " detail:" + BridgeText.Clean(failure));
+                if (failure != null) failures++;
             }
             result.Add("failures", failures);
             if (failures > 0) result.Status = BridgeStatus.PARTIAL;
@@ -154,6 +168,7 @@ namespace RimWorldDevBridge
                 if (failure != null) return failure;
                 plan.Calls.Add(call);
             }
+            plan.Assertions.AddRange(macro.ExpandedAssertions);
             return null;
         }
 
@@ -170,10 +185,25 @@ namespace RimWorldDevBridge
                 if (!File.Exists(BridgePaths.MacroPath)) return;
                 try
                 {
-                    XDocument document = XDocument.Load(BridgePaths.MacroPath, LoadOptions.None);
+                    FileInfo info = new FileInfo(BridgePaths.MacroPath);
+                    if (info.Length <= 0 || info.Length > MaximumMacroBytes)
+                        throw new InvalidDataException("Macro file size is invalid.");
+                    XmlReaderSettings settings = new XmlReaderSettings
+                    {
+                        DtdProcessing = DtdProcessing.Prohibit,
+                        XmlResolver = null,
+                        MaxCharactersInDocument = MaximumMacroBytes,
+                        IgnoreComments = true,
+                        IgnoreProcessingInstructions = true
+                    };
+                    XDocument document;
+                    using (XmlReader reader = XmlReader.Create(BridgePaths.MacroPath, settings))
+                        document = XDocument.Load(reader, LoadOptions.None);
                     XElement root = document.Root;
                     if (root == null || root.Name != "BridgeCommands")
                         throw new InvalidDataException("Expected BridgeCommands root.");
+                    if (!string.Equals((string)root.Attribute("version") ?? "2", "2",
+                        StringComparison.Ordinal)) throw new InvalidDataException("Unsupported macro schema version.");
                     foreach (XElement element in root.Elements("Command"))
                     {
                         string name = BridgeText.NormalizeCommand((string)element.Attribute("name"));
@@ -197,11 +227,35 @@ namespace RimWorldDevBridge
                                 Argument = (string)call.Attribute("argument") ?? string.Empty
                             });
                         }
+                        foreach (XElement assertion in element.Elements("Assert"))
+                        {
+                            if (macro.Assertions.Count >= BridgeProtocol.MaxMacroCalls)
+                                throw new InvalidDataException(name + " exceeds maximum assertions.");
+                            if (!int.TryParse((string)assertion.Attribute("step"), out int step) || step < 0)
+                                throw new InvalidDataException(name + ": assertion step is invalid.");
+                            macro.Assertions.Add(new MacroAssertion
+                            {
+                                Step = step,
+                                Status = (string)assertion.Attribute("status"),
+                                Schema = (string)assertion.Attribute("schema"),
+                                Field = (string)assertion.Attribute("field"),
+                                Expected = (string)assertion.Attribute("equals")
+                            });
+                        }
                         if (macro.Calls.Count == 0) errors.Add(name + ": no calls");
                         else macros[name] = macro;
                     }
+                    List<string> invalid = new List<string>();
                     foreach (MacroDefinition macro in macros.Values.ToList())
-                        ValidateAndExpand(macro, new Stack<string>());
+                    {
+                        try { ValidateAndExpand(macro, new Stack<string>()); }
+                        catch (Exception exception)
+                        {
+                            invalid.Add(macro.Name);
+                            errors.Add(macro.Name + ": " + exception.GetBaseException().Message);
+                        }
+                    }
+                    foreach (string name in invalid) macros.Remove(name);
                 }
                 catch (Exception exception)
                 {
@@ -219,13 +273,16 @@ namespace RimWorldDevBridge
             if (stack.Count >= MaximumDepth) throw new InvalidDataException("macro depth exceeds " + MaximumDepth + ".");
             stack.Push(macro.Name);
             List<MacroCall> expanded = new List<MacroCall>();
+            List<MacroAssertion> expandedAssertions = new List<MacroAssertion>();
             List<BridgeCommandDescriptor> descriptors = new List<BridgeCommandDescriptor>();
             foreach (MacroCall call in macro.Calls)
             {
                 if (macros.TryGetValue(call.Command, out MacroDefinition nested))
                 {
                     ValidateAndExpand(nested, stack);
+                    int offset = expanded.Count;
                     expanded.AddRange(nested.ExpandedCalls.Select(item => item.Clone()));
+                    expandedAssertions.AddRange(nested.ExpandedAssertions.Select(item => item.Clone(offset)));
                     descriptors.AddRange(nested.ExpandedCalls.Select(item =>
                         BridgeDispatch.Describe(Synthetic(item.Command, item.Argument))));
                 }
@@ -239,7 +296,15 @@ namespace RimWorldDevBridge
                 }
             }
             stack.Pop();
+            if (expanded.Count > BridgeProtocol.MaxMacroCalls)
+                throw new InvalidDataException(macro.Name + " expands beyond maximum calls.");
+            expandedAssertions.AddRange(macro.Assertions.Select(item => item.Clone(0)));
+            if (expandedAssertions.Count > BridgeProtocol.MaxMacroCalls)
+                throw new InvalidDataException(macro.Name + " expands beyond maximum assertions.");
+            if (expandedAssertions.Any(assertion => assertion.Step >= expanded.Count))
+                throw new InvalidDataException(macro.Name + ": assertion step is out of range.");
             macro.ExpandedCalls = expanded;
+            macro.ExpandedAssertions = expandedAssertions;
             PreparedPlan plan = new PreparedPlan { Calls = descriptors.Select((descriptor, index) => new PreparedCall
                 { Descriptor = descriptor, Request = Synthetic(expanded[index].Command, expanded[index].Argument) }).ToList() };
             macro.Descriptor = Descriptor(macro.Name, macro.Description, plan);
@@ -269,6 +334,10 @@ namespace RimWorldDevBridge
             for (int i = 0; i < macro.ExpandedCalls.Count; i++)
                 result.AddLine("step=index:" + i + " command:" + macro.ExpandedCalls[i].Command +
                     " argument:" + BridgeText.Clean(Substitute(macro.ExpandedCalls[i].Argument, parameters)));
+            foreach (MacroAssertion assertion in macro.ExpandedAssertions)
+                result.AddLine("assertion=step:" + assertion.Step + " status:" +
+                    BridgeText.Clean(assertion.Status) + " schema:" + BridgeText.Clean(assertion.Schema) +
+                    " field:" + BridgeText.Clean(assertion.Field) + " equals:" + BridgeText.Clean(assertion.Expected));
             return result;
         }
 
@@ -333,6 +402,8 @@ namespace RimWorldDevBridge
             internal bool StopOnError;
             internal List<MacroCall> Calls = new List<MacroCall>();
             internal List<MacroCall> ExpandedCalls = new List<MacroCall>();
+            internal List<MacroAssertion> Assertions = new List<MacroAssertion>();
+            internal List<MacroAssertion> ExpandedAssertions = new List<MacroAssertion>();
             internal BridgeCommandDescriptor Descriptor;
         }
 
@@ -348,6 +419,46 @@ namespace RimWorldDevBridge
             internal string Schema = "core.macro";
             internal bool StopOnError = true;
             internal List<PreparedCall> Calls = new List<PreparedCall>();
+            internal List<MacroAssertion> Assertions = new List<MacroAssertion>();
+        }
+
+        private sealed class MacroAssertion
+        {
+            internal int Step;
+            internal string Status;
+            internal string Schema;
+            internal string Field;
+            internal string Expected;
+
+            internal MacroAssertion Clone(int stepOffset) => new MacroAssertion
+            {
+                Step = Step + stepOffset,
+                Status = Status,
+                Schema = Schema,
+                Field = Field,
+                Expected = Expected
+            };
+
+            internal string Validate(IList<BridgeResult> results)
+            {
+                if (Step < 0 || Step >= results.Count) return "step did not execute";
+                BridgeResult result = results[Step];
+                if (!string.IsNullOrEmpty(Status) && !string.Equals(result.Status.ToString(), Status,
+                    StringComparison.OrdinalIgnoreCase)) return "expected status " + Status + " got " + result.Status;
+                if (!string.IsNullOrEmpty(Schema) && !string.Equals(result.Schema, Schema,
+                    StringComparison.OrdinalIgnoreCase)) return "expected schema " + Schema + " got " + result.Schema;
+                if (!string.IsNullOrEmpty(Field))
+                {
+                    string actual = result.Data.FirstOrDefault(item => string.Equals(item.Name, Field,
+                        StringComparison.OrdinalIgnoreCase))?.Value;
+                    if (actual == null) return "field missing: " + Field;
+                    if (!string.Equals(actual, Expected ?? string.Empty, StringComparison.OrdinalIgnoreCase))
+                        return "field " + Field + " expected " + Expected + " got " + actual;
+                }
+                if (string.IsNullOrEmpty(Status) && string.IsNullOrEmpty(Schema) && string.IsNullOrEmpty(Field))
+                    return "assertion has no condition";
+                return null;
+            }
         }
     }
 }

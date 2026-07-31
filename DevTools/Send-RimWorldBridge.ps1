@@ -47,6 +47,11 @@ $manifest = Read-KeyFile $manifestPath
 $status = Read-KeyFile $statusPath
 Assert-BridgeCurrent $status $manifest
 
+if ($status.ContainsKey("processId")) {
+    $running = Get-Process -Id ([int]$status["processId"]) -ErrorAction SilentlyContinue
+    if (-not $running) { $status = @{} }
+}
+
 if ($TimeoutMs -lt 50 -or $TimeoutMs -gt 120000) {
     throw "TimeoutMs must be between 50 and 120000."
 }
@@ -63,7 +68,7 @@ if ($status["bridge"] -ne "ON") {
 }
 
 if ($status["bridge"] -ne "ON") {
-    throw "Bridge did not wake. Enable Dev mode, load RimWorld Dev Bridge, and enter a map."
+    throw "Bridge did not wake. Start RimWorld and enable RimWorld Dev Bridge."
 }
 Assert-BridgeCurrent $status $manifest
 
@@ -71,7 +76,14 @@ $client = [Net.Sockets.TcpClient]::new()
 try {
     $client.ReceiveTimeout = $TimeoutMs
     $client.SendTimeout = $TimeoutMs
-    $client.Connect($status["host"], [int]$status["port"])
+    $connect = $client.BeginConnect($status["host"], [int]$status["port"], $null, $null)
+    if (-not $connect.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+        Write-Output "id=unknown"
+        Write-Output "status=TIMEOUT"
+        Write-Output "error=connection_timeout"
+        exit 4
+    }
+    $client.EndConnect($connect)
     $stream = $client.GetStream()
     $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false), 4096, $true)
     $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $false, 4096, $true)
@@ -82,7 +94,21 @@ try {
     $response = $reader.ReadToEnd()
     $response
 }
+catch [IO.IOException] {
+    Write-Output "id=unknown"
+    Write-Output "status=TIMEOUT"
+    Write-Output "error=connection_or_response_timeout"
+    exit 4
+}
+catch [Net.Sockets.SocketException] {
+    Write-Output "id=unknown"
+    Write-Output "status=UNAVAILABLE"
+    Write-Output "error=connection_failed"
+    Write-Output ("detail=" + $_.Exception.Message.Replace("`r", " ").Replace("`n", " "))
+    exit 4
+}
 finally {
+    if ($connect -and $connect.AsyncWaitHandle) { $connect.AsyncWaitHandle.Dispose() }
     if ($writer) { $writer.Dispose() }
     if ($reader) { $reader.Dispose() }
     if ($stream) { $stream.Dispose() }
