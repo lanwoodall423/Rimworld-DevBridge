@@ -45,12 +45,14 @@ internal static class Program
         Run("write lease and idempotency", WriteLeaseAndIdempotency);
         Run("idempotency conflict", IdempotencyConflict);
         Run("pre-execution failure not cached", PreExecutionFailureNotCached);
+        Run("idempotency copy preserves bounds", IdempotencyCopyPreservesBounds);
         Run("manifest adapter lifecycle", ManifestAdapterLifecycle);
         Run("missing feature prerequisite blocked", MissingFeaturePrerequisiteBlocked);
         Run("typed feature assertions", TypedFeatureAssertions);
         Run("batch derives transitive write mode", BatchDerivesWriteMode);
         Run("macro derives transitive write mode", MacroDerivesWriteMode);
         Run("macro cycle quarantined", MacroCycleQuarantined);
+        Run("manifest generation reuse rejected", ManifestGenerationReuseRejected);
         Console.WriteLine("compatibility=" + (failed == 0 ? "PASS" : "FAIL") +
             " passed=" + passed + " failed=" + failed);
         int exitCode = failed == 0 ? 0 : 1;
@@ -151,7 +153,8 @@ internal static class Program
 
     private static void JsonValueTruncationFlagged()
     {
-        BridgeResult result = BridgeResult.Ok().Add("large", new string('x', 20000));
+        BridgeResult result = BridgeResult.Ok().Add("large", "small");
+        result.Data[0].Value = new string('x', 20000);
         string json = BridgeProtocol.Serialize(result, "json");
         Check(result.Truncated, "result truncation flag missing");
         Check(json.Contains("\"truncated\":true"), "JSON truncation flag missing");
@@ -351,6 +354,20 @@ internal static class Program
         Check(!auth.TryGetCompleted(request, out _), "pre-execution failure poisoned idempotency cache");
     }
 
+    private static void IdempotencyCopyPreservesBounds()
+    {
+        BridgeResult source = BridgeResult.Ok();
+        for (int i = 0; i < 513; i++) source.Data.Add(new BridgeField("field" + i, "value"));
+        source.Data[0].Value = new string('x', 20000);
+
+        BridgeResult copy = source.CopyFor("replay");
+
+        Check(source.Truncated, "source truncation was not recorded before caching");
+        Check(copy.Truncated, "cached copy lost truncation evidence");
+        Equal(512, copy.Data.Count, "cached field bound");
+        Check(copy.Data[0].Value.Length <= 16384, "cached field value was not bounded");
+    }
+
     private static void ManifestAdapterLifecycle()
     {
         string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeHarness-" + Guid.NewGuid().ToString("N"));
@@ -400,6 +417,49 @@ internal static class Program
             BridgeResult health = BridgeAdapterCatalog.Health();
             Check(health.Data.Any(item => item.Name == "retainedGenerations" && item.Value == "1"), "retained count");
             Check(health.Warnings.Count > 0, "malformed manifest not reported");
+
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    private static void ManifestGenerationReuseRejected()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeReuse-" + Guid.NewGuid().ToString("N"));
+        string adapters = Path.Combine(root, "DevTools", "HotAdapters");
+        Directory.CreateDirectory(adapters);
+        try
+        {
+            string built = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BridgeFixtureAdapter.dll");
+            if (!File.Exists(built))
+                built = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                    "..", "..", "..", "FixtureAdapter", "bin", "Release", "net472", "BridgeFixtureAdapter.dll"));
+            byte[] bytes = File.ReadAllBytes(built);
+            string identity = AssemblyName.GetAssemblyName(built).FullName;
+            string hash = Sha256(bytes);
+            WriteGeneration(adapters, bytes, identity, hash, "same", "2026-05-01T00:00:00Z", "FIXTURE_ECHO", 1, 10);
+            BridgePaths.Initialize(root);
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(Array.Empty<string>());
+            BridgeRequest initial = Request("fixture-initial", "s");
+            initial.Command = "FIXTURE_ECHO";
+            Check(BridgeAdapterCatalog.Prepare(initial) == null, "initial adapter prepare failed");
+            Equal(BridgeStatus.OK,
+                BridgeAdapterCatalog.Execute(new BridgeExecutionContext(initial, null, () => false)).Status,
+                "initial provider did not execute");
+
+            File.Delete(Path.Combine(adapters, "fixture.same.manifest.json"));
+            WriteGeneration(adapters, bytes, identity, hash, "same", "2026-05-01T00:00:00Z", "FIXTURE_ECHO",
+                1, 10, commandMode: "PersistentMutation");
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(Array.Empty<string>());
+            Check(BridgeAdapterCatalog.Describe("FIXTURE_ECHO") == null,
+                "changed same-generation command contract remained active");
+            BridgeResult health = BridgeAdapterCatalog.Health();
+            Check(health.Warnings.Any(item => item.Contains("publish a new generation")),
+                "changed generation was not reported");
+            Check(health.Lines.Any(item => item.Contains("changed without a new generation")),
+                "loaded generation was not retained in health output");
         }
         finally
         {
@@ -551,7 +611,8 @@ internal static class Program
     }
     private static void WriteGeneration(string directory, byte[] bytes, string identity, string hash,
         string generation, string buildUtc, string command, int protocolMin, int protocolMax,
-        string adapterId = "fixture")
+        string adapterId = "fixture", string providerType = "BridgeFixtureAdapter.FixtureProvider",
+        string commandMode = "PureRead")
     {
         string file = adapterId + "." + generation + ".dll";
         File.WriteAllBytes(Path.Combine(directory, file), bytes);
@@ -567,7 +628,7 @@ internal static class Program
             assemblyIdentity = identity,
             assemblyBytes = bytes.Length,
             contentHash = hash,
-            providerType = "BridgeFixtureAdapter.FixtureProvider",
+            providerType = providerType,
             protocolMin = protocolMin,
             protocolMax = protocolMax,
             commands = new List<AdapterCommandManifest>
@@ -576,7 +637,7 @@ internal static class Program
                 {
                     name = command,
                     description = "fixture",
-                    mode = "PureRead",
+                    mode = commandMode,
                     cost = "Trivial",
                     requiresMap = false,
                     argumentSchema = "string",

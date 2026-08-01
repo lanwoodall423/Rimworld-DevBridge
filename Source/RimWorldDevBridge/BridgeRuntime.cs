@@ -35,8 +35,8 @@ namespace RimWorldDevBridge
         private static int transportGeneration;
         private static int activeClients;
         private static int port;
-        private static string token = string.Empty;
-        private static string sessionId = "menu-" + Guid.NewGuid().ToString("N");
+        private static volatile SessionIdentity identity =
+            new SessionIdentity("menu-" + Guid.NewGuid().ToString("N"), string.Empty);
         private static long lastActivityUtcTicks;
         private static long activationStartTicks;
         private static double harmonyMs;
@@ -47,7 +47,7 @@ namespace RimWorldDevBridge
         private static long bootstrapManagedDeltaBytes;
         private static bool bootstrapped;
 
-        internal static string SessionId => sessionId;
+        internal static string SessionId => identity.SessionId;
         internal static bool Active => active;
         internal static int ActiveClients => Math.Max(0, Volatile.Read(ref activeClients));
         internal static double BootstrapMs => bootstrapMs;
@@ -62,7 +62,7 @@ namespace RimWorldDevBridge
             if (bootstrapped) return;
             bootstrapped = true;
             BridgePaths.Initialize(modRoot);
-            Scheduler.Configure(MainThread, sessionId, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
+            Scheduler.Configure(MainThread, identity.SessionId, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
             long harmonyStart = Stopwatch.GetTimestamp();
             Harmony.Patch(AccessTools.PropertySetter(typeof(Current), nameof(Current.Game)),
                 prefix: new HarmonyMethod(typeof(BridgeRuntime), nameof(OnGameChanging)));
@@ -85,7 +85,7 @@ namespace RimWorldDevBridge
                 TryDelete(BridgePaths.WakePath);
                 StartTransport();
             }
-            BridgeEventJournal.Record("lifecycle", "game finalized session:" + sessionId);
+            BridgeEventJournal.Record("lifecycle", "game finalized session:" + identity.SessionId);
             finalizeInitMs = BridgeTiming.Milliseconds(start);
             WriteStatus(active ? (transportReady ? "ON" : "ACTIVATING") : "DORMANT");
         }
@@ -147,12 +147,14 @@ namespace RimWorldDevBridge
 
         private static void RotateSession(string prefix)
         {
-            string next = prefix + "-" + Guid.NewGuid().ToString("N");
-            sessionId = next;
-            Authorization.RotateSession(next);
-            Scheduler.Configure(MainThread, next, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
-            Scheduler.RotateSession(next);
-            token = active ? Guid.NewGuid().ToString("N") : string.Empty;
+            lock (Gate)
+            {
+                string next = prefix + "-" + Guid.NewGuid().ToString("N");
+                Authorization.RotateSession(next);
+                Scheduler.Configure(MainThread, next, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
+                Scheduler.RotateSession(next);
+                identity = new SessionIdentity(next, active ? Guid.NewGuid().ToString("N") : string.Empty);
+            }
         }
 
         private static void StartDormantWatcher()
@@ -198,7 +200,8 @@ namespace RimWorldDevBridge
                 StopTransport(false);
                 try
                 {
-                    token = Guid.NewGuid().ToString("N");
+                    SessionIdentity currentIdentity = identity;
+                    identity = new SessionIdentity(currentIdentity.SessionId, Guid.NewGuid().ToString("N"));
                     activationStartTicks = Stopwatch.GetTimestamp();
                     listener = new TcpListener(IPAddress.Loopback, 0);
                     listener.Start(Settings.ConnectedClientLimit);
@@ -240,7 +243,8 @@ namespace RimWorldDevBridge
                 try { listener?.Stop(); } catch { }
                 listener = null;
                 port = 0;
-                token = string.Empty;
+                SessionIdentity currentIdentity = identity;
+                identity = new SessionIdentity(currentIdentity.SessionId, string.Empty);
                 RemoveUpdatePatch();
                 if (writeDormant && !shuttingDown) WriteStatus("DORMANT");
             }
@@ -331,14 +335,15 @@ namespace RimWorldDevBridge
                         writer.Write(BridgeProtocol.Serialize(invalid, "line"));
                         return;
                     }
-                    string prefix = token + "|";
+                    SessionIdentity acceptedIdentity = identity;
+                    string prefix = acceptedIdentity.Token + "|";
                     if (string.IsNullOrEmpty(raw) || !raw.StartsWith(prefix, StringComparison.Ordinal))
                     {
                         writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=authentication_failed");
                         return;
                     }
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                    if (!BridgeProtocol.TryParse(raw.Substring(prefix.Length), sessionId, out request,
+                    if (!BridgeProtocol.TryParse(raw.Substring(prefix.Length), acceptedIdentity.SessionId, out request,
                         out BridgeResult parseFailure))
                     {
                         Decorate(parseFailure, request, "core", BridgeProtocol.BridgeVersion);
@@ -411,7 +416,7 @@ namespace RimWorldDevBridge
             BridgeCommandDescriptor descriptor = request.PreparedDescriptor ?? BridgeDispatch.Describe(request);
             if (descriptor == null) return Decorate(BridgeResult.Fail(BridgeStatus.NOT_FOUND,
                 "unknown_command"), request, "core", BridgeProtocol.BridgeVersion);
-            if (request.SessionId != sessionId)
+            if (request.SessionId != identity.SessionId)
                 return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_session"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
             BridgeResult authorization = Authorization.Authorize(request, descriptor, request.AuthToken,
@@ -462,7 +467,7 @@ namespace RimWorldDevBridge
         {
             result = result ?? BridgeResult.Fail(BridgeStatus.ERROR, "empty_result");
             result.RequestId = request?.RequestId ?? result.RequestId ?? "unknown";
-            result.SessionId = request?.SessionId ?? sessionId;
+            result.SessionId = request?.SessionId ?? identity.SessionId;
             result.Command = request?.Command ?? result.Command ?? "unknown";
             result.Provider = provider ?? "core";
             result.ProviderVersion = providerVersion ?? BridgeProtocol.BridgeVersion;
@@ -478,7 +483,7 @@ namespace RimWorldDevBridge
             {
                 string raw = File.ReadAllText(BridgePaths.InputPath).Trim();
                 File.Delete(BridgePaths.InputPath);
-                if (!BridgeProtocol.TryParse(raw, sessionId, out BridgeRequest request, out BridgeResult failure))
+                if (!BridgeProtocol.TryParse(raw, identity.SessionId, out BridgeRequest request, out BridgeResult failure))
                 {
                     AtomicWrite(BridgePaths.OutputPath, BridgeProtocol.Serialize(failure, "line"));
                     return;
@@ -562,6 +567,7 @@ namespace RimWorldDevBridge
             lock (StatusGate)
             {
                 long writeStart = Stopwatch.GetTimestamp();
+                SessionIdentity currentIdentity = identity;
                 List<string> lines = new List<string>
                 {
                     "bridge=" + state,
@@ -571,11 +577,11 @@ namespace RimWorldDevBridge
                     "schema=" + BridgeProtocol.CoreSchema,
                     "processId=" + Process.GetCurrentProcess().Id,
                     "bootId=" + BootId,
-                    "session=" + sessionId,
+                    "session=" + currentIdentity.SessionId,
                     "transport=" + (active ? "tcp+file" : "wake-file"),
                     "host=127.0.0.1",
                     "port=" + port,
-                    "token=" + token,
+                    "token=" + currentIdentity.Token,
                     "clients=" + ActiveClients + "/" + Settings.ConnectedClientLimit,
                     "context=" + Authorization.Context,
                     "bootstrapMs=" + bootstrapMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
@@ -609,6 +615,18 @@ namespace RimWorldDevBridge
         private static void TryDelete(string path)
         {
             try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+
+        private sealed class SessionIdentity
+        {
+            internal readonly string SessionId;
+            internal readonly string Token;
+
+            internal SessionIdentity(string sessionId, string token)
+            {
+                SessionId = sessionId;
+                Token = token;
+            }
         }
     }
 

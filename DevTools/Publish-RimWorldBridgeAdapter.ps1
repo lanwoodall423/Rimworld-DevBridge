@@ -78,6 +78,11 @@ $algorithm = [Security.Cryptography.SHA256]::Create()
 try { $contentHash = [BitConverter]::ToString($algorithm.ComputeHash($bytes)).Replace("-", "") }
 finally { $algorithm.Dispose() }
 $identity = [Reflection.AssemblyName]::GetAssemblyName($publishedAssembly).FullName
+$moduleMvid = $null
+if ($LoadedAssembly) {
+    $reflectionAssembly = [Reflection.Assembly]::ReflectionOnlyLoadFrom($source)
+    $moduleMvid = $reflectionAssembly.ManifestModule.ModuleVersionId.ToString("D")
+}
 
 $commands = @()
 $names = @{}
@@ -117,7 +122,7 @@ foreach ($spec in $CommandSpecs) {
 if ($commands.Count -eq 0) { throw "At least one command is required." }
 
 $manifest = [ordered]@{
-    manifestVersion = 1
+    manifestVersion = 2
     adapterId = $AdapterId
     displayName = $DisplayName
     version = $Version
@@ -137,6 +142,7 @@ $manifest = [ordered]@{
     assemblySource = $(if ($LoadedAssembly) { "loaded" } else { "file" })
     modulePackageId = $(if ($LoadedAssembly) { $LoadedPackageId } else { $null })
     moduleRelativePath = $(if ($LoadedAssembly) { $LoadedModulePath } else { $null })
+    moduleMvid = $moduleMvid
 }
 
 $manifestPath = [IO.Path]::Combine($destinationRoot, "$AdapterId.$Generation.manifest.json")

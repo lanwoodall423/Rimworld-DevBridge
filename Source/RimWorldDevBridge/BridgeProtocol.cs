@@ -108,6 +108,7 @@ namespace RimWorldDevBridge
 
         public static string Serialize(BridgeResult result, string format)
         {
+            result?.EnforceBounds();
             if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
                 return SerializeJson(result);
             return SerializeLines(result);
@@ -115,6 +116,7 @@ namespace RimWorldDevBridge
 
         public static string SerializeLines(BridgeResult result)
         {
+            result?.EnforceBounds();
             List<string> lines = new List<string>
             {
                 "id=" + BridgeText.Clean(result?.RequestId ?? "unknown"),
@@ -148,6 +150,7 @@ namespace RimWorldDevBridge
 
         private static string SerializeJson(BridgeResult result)
         {
+            result?.EnforceBounds();
             JsonResult payload = JsonResult.From(result);
             string value;
             using (MemoryStream stream = new MemoryStream())
@@ -303,9 +306,9 @@ namespace RimWorldDevBridge
                 truncated = result?.Truncated ?? false,
                 cursor = result?.ContinuationCursor,
                 mutation = result?.MutationSummary,
-                data = result?.Data ?? new List<BridgeField>(),
-                lines = result?.Lines ?? new List<string>(),
-                warnings = result?.Warnings ?? new List<string>()
+                data = result?.Data.ToList() ?? new List<BridgeField>(),
+                lines = result?.Lines.ToList() ?? new List<string>(),
+                warnings = result?.Warnings.ToList() ?? new List<string>()
             };
         }
     }

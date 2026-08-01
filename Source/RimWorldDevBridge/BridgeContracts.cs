@@ -62,11 +62,12 @@ namespace RimWorldDevBridge
         }
     }
 
+    [System.Runtime.Serialization.DataContract]
     public sealed class BridgeField
     {
-        public string Name { get; set; }
-        public string Value { get; set; }
-        public string ValueType { get; set; }
+        [System.Runtime.Serialization.DataMember(Order = 1)] public string Name { get; set; }
+        [System.Runtime.Serialization.DataMember(Order = 2)] public string Value { get; set; }
+        [System.Runtime.Serialization.DataMember(Order = 3)] public string ValueType { get; set; }
 
         public BridgeField() { }
         public BridgeField(string name, object value)
@@ -77,6 +78,20 @@ namespace RimWorldDevBridge
                 value is uint || value is long || value is ulong ? "integer" :
                 value is float || value is double || value is decimal ? "number" : "string";
             Value = BridgeText.Bound(value, 16384);
+        }
+
+        internal BridgeField Clone() => new BridgeField(Name, Value) { ValueType = ValueType };
+
+        internal bool EnforceBounds()
+        {
+            string name = BridgeText.Bound(Name ?? "value", 256);
+            string value = BridgeText.Bound(Value, 16384);
+            string valueType = BridgeText.Bound(ValueType ?? "string", 32);
+            bool changed = name != Name || value != Value || valueType != ValueType;
+            Name = name;
+            Value = value;
+            ValueType = valueType;
+            return changed;
         }
     }
 
@@ -144,6 +159,60 @@ namespace RimWorldDevBridge
             if (BridgeText.Invariant(warning).Length > 4096) Truncated = true;
             Warnings.Add(BridgeText.Bound(warning, 4096));
             return this;
+        }
+
+        internal void AddCopiedField(BridgeField field)
+        {
+            if (field != null && Data.Count < MaximumFields) Data.Add(field.Clone());
+        }
+
+        internal void EnforceBounds()
+        {
+            bool changed = false;
+            if (Data.RemoveAll(field => field == null) > 0) changed = true;
+            if (Data.Count > MaximumFields)
+            {
+                Data.RemoveRange(MaximumFields, Data.Count - MaximumFields);
+                changed = true;
+            }
+            foreach (BridgeField field in Data) if (field.EnforceBounds()) changed = true;
+            if (Lines.Count > MaximumLines)
+            {
+                Lines.RemoveRange(MaximumLines, Lines.Count - MaximumLines);
+                changed = true;
+            }
+            for (int i = 0; i < Lines.Count; i++)
+            {
+                string bounded = BridgeText.Bound(Lines[i], 16384);
+                if (bounded != Lines[i]) { Lines[i] = bounded; changed = true; }
+            }
+            if (Warnings.Count > MaximumWarnings)
+            {
+                Warnings.RemoveRange(MaximumWarnings, Warnings.Count - MaximumWarnings);
+                changed = true;
+            }
+            for (int i = Warnings.Count - 1; i >= 0; i--)
+            {
+                if (string.IsNullOrWhiteSpace(Warnings[i])) { Warnings.RemoveAt(i); changed = true; continue; }
+                string bounded = BridgeText.Bound(Warnings[i], 4096);
+                if (bounded != Warnings[i]) { Warnings[i] = bounded; changed = true; }
+            }
+            changed |= BoundProperty(RequestId, 256, out string requestId); RequestId = requestId;
+            changed |= BoundProperty(SessionId, 256, out string sessionId); SessionId = sessionId;
+            changed |= BoundProperty(Command, 128, out string command); Command = command;
+            changed |= BoundProperty(Provider, 256, out string provider); Provider = provider;
+            changed |= BoundProperty(ProviderVersion, 128, out string providerVersion); ProviderVersion = providerVersion;
+            changed |= BoundProperty(Schema, 256, out string schema); Schema = schema;
+            changed |= BoundProperty(ContinuationCursor, 8192, out string cursor); ContinuationCursor = cursor;
+            changed |= BoundProperty(MutationSummary, 4096, out string mutation); MutationSummary = mutation;
+            if (changed) Truncated = true;
+        }
+
+        private static bool BoundProperty(string value, int maximumCharacters, out string bounded)
+        {
+            if (value == null) { bounded = null; return false; }
+            bounded = BridgeText.Bound(value, maximumCharacters);
+            return bounded != value;
         }
 
         public static BridgeResult Ok(string schema = "core.result") =>

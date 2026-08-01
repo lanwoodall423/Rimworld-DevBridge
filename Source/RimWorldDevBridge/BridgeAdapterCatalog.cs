@@ -141,11 +141,18 @@ namespace RimWorldDevBridge
                 string assemblyPath = generation.AssemblyPath;
                 if (string.Equals(generation.Manifest.assemblySource, "loaded", StringComparison.OrdinalIgnoreCase))
                 {
-                    preparedAssembly = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(item =>
-                        string.Equals(item.FullName, generation.Manifest.assemblyIdentity, StringComparison.Ordinal));
-                    if (preparedAssembly == null)
+                    List<Assembly> matches = AppDomain.CurrentDomain.GetAssemblies().Where(item =>
+                        string.Equals(item.FullName, generation.Manifest.assemblyIdentity,
+                            StringComparison.Ordinal)).ToList();
+                    if (matches.Count != 1)
                         return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "loaded_adapter_assembly_missing",
-                            generation.Manifest.assemblyIdentity);
+                            matches.Count == 0 ? generation.Manifest.assemblyIdentity :
+                            "duplicate loaded assembly identity");
+                    preparedAssembly = matches[0];
+                    if (!string.IsNullOrWhiteSpace(generation.Manifest.moduleMvid) &&
+                        (!Guid.TryParse(generation.Manifest.moduleMvid, out Guid expectedMvid) ||
+                        preparedAssembly.ManifestModule.ModuleVersionId != expectedMvid))
+                        return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_mvid_mismatch");
                     if (!loadedPackageRoots.TryGetValue(generation.Manifest.modulePackageId,
                         out string packageRoot))
                         return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "loaded_adapter_package_missing",
@@ -154,6 +161,10 @@ namespace RimWorldDevBridge
                     assemblyPath = Path.GetFullPath(Path.Combine(root, generation.Manifest.moduleRelativePath));
                     if (!assemblyPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(assemblyPath))
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_module_missing");
+                    string loadedOrigin = LoadedAssemblyPath(preparedAssembly);
+                    if (!string.IsNullOrEmpty(loadedOrigin) && !string.Equals(loadedOrigin, assemblyPath,
+                        StringComparison.OrdinalIgnoreCase))
+                        return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_origin_mismatch");
                 }
                 byte[] bytes = null;
                 if (!string.IsNullOrWhiteSpace(assemblyPath))
@@ -360,7 +371,7 @@ namespace RimWorldDevBridge
             }
             lock (Gate)
             {
-                MergeLoadedGenerations(indexed);
+                MergeLoadedGenerations(indexed, errors);
                 All.Clear();
                 All.AddRange(indexed);
                 RebuildCommandIndex(errors);
@@ -387,7 +398,8 @@ namespace RimWorldDevBridge
         private static AdapterGeneration Validate(AdapterManifest manifest, string manifestPath)
         {
             if (manifest == null) throw new InvalidDataException("Manifest is empty.");
-            if (manifest.manifestVersion != 1) throw new InvalidDataException("Unsupported manifestVersion.");
+            if (manifest.manifestVersion != 1 && manifest.manifestVersion != 2)
+                throw new InvalidDataException("Unsupported manifestVersion.");
             RequireName(manifest.adapterId, "adapterId");
             if (string.IsNullOrWhiteSpace(manifest.displayName)) throw new InvalidDataException("displayName is required.");
             if (string.IsNullOrWhiteSpace(manifest.version)) throw new InvalidDataException("version is required.");
@@ -413,6 +425,8 @@ namespace RimWorldDevBridge
                     new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
                     StringSplitOptions.RemoveEmptyEntries).Any(part => part == "..")))
                 throw new InvalidDataException("Loaded adapter module package/path is invalid.");
+            if (loadedAssembly && manifest.manifestVersion >= 2 && !Guid.TryParse(manifest.moduleMvid, out _))
+                throw new InvalidDataException("Loaded adapter moduleMvid is invalid.");
             if (loadedAssembly && !(manifest.requiredPackageIds ?? new List<string>()).Any(package =>
                 string.Equals(package, manifest.modulePackageId, StringComparison.OrdinalIgnoreCase)))
                 throw new InvalidDataException("Loaded adapter module package must be required.");
@@ -494,24 +508,72 @@ namespace RimWorldDevBridge
             }
         }
 
-        private static void MergeLoadedGenerations(List<AdapterGeneration> indexed)
+        private static void MergeLoadedGenerations(List<AdapterGeneration> indexed, List<string> errors)
         {
-            foreach (AdapterGeneration previous in All.Where(item => item.Assembly != null))
+            foreach (AdapterGeneration retained in All.Where(item => item.RetainedOnly)) indexed.Add(retained);
+            foreach (AdapterGeneration previous in All.Where(item => item.Assembly != null && !item.RetainedOnly))
             {
                 AdapterGeneration current = indexed.FirstOrDefault(item =>
                     item.Manifest.adapterId.Equals(previous.Manifest.adapterId, StringComparison.OrdinalIgnoreCase) &&
                     item.Manifest.generation.Equals(previous.Manifest.generation, StringComparison.OrdinalIgnoreCase));
-                if (current != null)
+                if (current != null && SameManifestBinding(current.Manifest, previous.Manifest))
                 {
                     current.CopyRuntime(previous);
                     if (!current.Selected) current.State = "retained-superseded";
                 }
                 else
                 {
+                    previous.Selected = false;
+                    previous.RetainedOnly = true;
                     previous.State = "retained-superseded";
+                    previous.Reason = current == null ? "manifest generation no longer published" :
+                        "published manifest changed without a new generation";
                     indexed.Add(previous);
+                    if (current != null)
+                    {
+                        current.Selected = false;
+                        current.Compatible = false;
+                        current.State = "incompatible";
+                        current.Reason = "generation identity was reused with a changed manifest";
+                        errors.Add(current.Manifest.adapterId + ": generation " + current.Manifest.generation +
+                            " changed after load; publish a new generation");
+                    }
                 }
             }
+        }
+
+        private static bool SameManifestBinding(AdapterManifest current, AdapterManifest previous)
+        {
+            if (!string.Equals(current.version, previous.version, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(current.assemblySource, previous.assemblySource, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(current.assemblyFile, previous.assemblyFile, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(current.assemblyIdentity, previous.assemblyIdentity, StringComparison.Ordinal) ||
+                current.assemblyBytes != previous.assemblyBytes ||
+                !string.Equals(current.contentHash, previous.contentHash, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(current.providerType, previous.providerType, StringComparison.Ordinal) ||
+                !string.Equals(current.modulePackageId, previous.modulePackageId, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(current.moduleRelativePath, previous.moduleRelativePath, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(current.moduleMvid, previous.moduleMvid, StringComparison.OrdinalIgnoreCase)) return false;
+            if ((current.commands?.Count ?? 0) != (previous.commands?.Count ?? 0)) return false;
+            foreach (AdapterCommandManifest command in current.commands ?? new List<AdapterCommandManifest>())
+            {
+                AdapterCommandManifest prior = previous.commands.FirstOrDefault(item =>
+                    string.Equals(item.name, command.name, StringComparison.OrdinalIgnoreCase));
+                if (prior == null || !SameCommandContract(command, prior)) return false;
+            }
+            return true;
+        }
+
+        private static bool SameCommandContract(AdapterCommandManifest current, AdapterCommandManifest previous)
+        {
+            return string.Equals(current.mode, previous.mode, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(current.cost, previous.cost, StringComparison.OrdinalIgnoreCase) &&
+                current.requiresMap == previous.requiresMap &&
+                string.Equals(current.argumentSchema, previous.argumentSchema, StringComparison.Ordinal) &&
+                string.Equals(current.resultSchema, previous.resultSchema, StringComparison.Ordinal) &&
+                current.schemaVersion == previous.schemaVersion &&
+                current.minimumExecutionBudgetMs == previous.minimumExecutionBudgetMs &&
+                string.Equals(current.providerCommand, previous.providerCommand, StringComparison.OrdinalIgnoreCase);
         }
 
         private static void RebuildCommandIndex(List<string> errors)
@@ -677,6 +739,18 @@ namespace RimWorldDevBridge
             }
         }
 
+        private static string LoadedAssemblyPath(Assembly assembly)
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(assembly.Location)) return Path.GetFullPath(assembly.Location);
+                if (!string.IsNullOrWhiteSpace(assembly.CodeBase) && Uri.TryCreate(assembly.CodeBase,
+                    UriKind.Absolute, out Uri uri) && uri.IsFile) return Path.GetFullPath(uri.LocalPath);
+            }
+            catch { }
+            return null;
+        }
+
         private static void RequireName(string value, string label)
         {
             if (string.IsNullOrWhiteSpace(value) || value.Any(character =>
@@ -710,6 +784,7 @@ namespace RimWorldDevBridge
             internal string LastFailure;
             internal string Verification;
             internal DateTime QuarantinedUntilUtc;
+            internal bool RetainedOnly;
 
             internal void CopyRuntime(AdapterGeneration previous)
             {
@@ -756,6 +831,7 @@ namespace RimWorldDevBridge
         [DataMember(Order = 18)] public string assemblySource;
         [DataMember(Order = 19)] public string modulePackageId;
         [DataMember(Order = 20)] public string moduleRelativePath;
+        [DataMember(Order = 21)] public string moduleMvid;
     }
 
     [DataContract]

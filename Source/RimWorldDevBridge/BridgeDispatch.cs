@@ -66,6 +66,8 @@ namespace RimWorldDevBridge
         internal static BridgeResult ExecuteChild(BridgeExecutionContext parent, PreparedCall call)
         {
             parent.ThrowIfCancellationRequested();
+            if (parent.DeadlineUtc < call.Request.DeadlineUtc)
+                call.Request.DeadlineUtc = parent.DeadlineUtc;
             if (call.Descriptor.RequiresMap && parent.Map == null)
                 return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "map_required");
             BridgeExecutionContext context = new BridgeExecutionContext(call.Request, parent.Map,

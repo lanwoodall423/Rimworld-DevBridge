@@ -138,6 +138,7 @@ namespace RimWorldDevBridge
                         return;
                     }
                     queue.Remove(request);
+                    running[request.RequestId] = request;
                 }
                 if (request.Cancelled)
                     CompleteRejected(request, BridgeStatus.CANCELLED, "cancelled_before_execution");
@@ -170,7 +171,6 @@ namespace RimWorldDevBridge
         private void Execute(BridgeRequest request)
         {
             request.Started = true;
-            lock (gate) running[request.RequestId] = request;
             long start = Stopwatch.GetTimestamp();
             BridgeResult result;
             try
@@ -221,8 +221,9 @@ namespace RimWorldDevBridge
             request.Done.Set();
         }
 
-        private static void CompleteRejected(BridgeRequest request, BridgeStatus status, string code)
+        private void CompleteRejected(BridgeRequest request, BridgeStatus status, string code)
         {
+            lock (gate) running.Remove(request.RequestId);
             request.Result = BridgeResult.Fail(status, code);
             request.Done.Set();
         }

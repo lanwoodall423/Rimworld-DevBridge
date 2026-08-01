@@ -183,6 +183,7 @@ namespace RimWorldDevBridge
     {
         internal static BridgeResult CopyFor(this BridgeResult source, string requestId)
         {
+            source.EnforceBounds();
             BridgeResult copy = new BridgeResult
             {
                 RequestId = requestId,
@@ -203,10 +204,9 @@ namespace RimWorldDevBridge
                 ContinuationCursor = source.ContinuationCursor,
                 MutationSummary = source.MutationSummary
             };
-            copy.Data.AddRange(source.Data.Select(field => new BridgeField(field.Name, field.Value)
-                { ValueType = field.ValueType }));
-            copy.Lines.AddRange(source.Lines);
-            copy.Warnings.AddRange(source.Warnings);
+            foreach (BridgeField field in source.Data) copy.AddCopiedField(field);
+            foreach (string line in source.Lines) copy.AddLine(line);
+            foreach (string warning in source.Warnings) copy.Warn(warning);
             return copy;
         }
     }
