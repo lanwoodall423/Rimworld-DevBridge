@@ -163,7 +163,7 @@ namespace RimWorldDevBridge
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_module_missing");
                     string loadedOrigin = LoadedAssemblyPath(preparedAssembly);
                     if (!string.IsNullOrEmpty(loadedOrigin) && !string.Equals(loadedOrigin, assemblyPath,
-                        StringComparison.OrdinalIgnoreCase))
+                        StringComparison.OrdinalIgnoreCase) && !IsPrepatcherShadowPath(loadedOrigin))
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_origin_mismatch");
                 }
                 byte[] bytes = null;
@@ -749,6 +749,18 @@ namespace RimWorldDevBridge
             }
             catch { }
             return null;
+        }
+
+        private static bool IsPrepatcherShadowPath(string path)
+        {
+            try
+            {
+                string fileName = Path.GetFileName(path);
+                string parent = Path.GetFileName(Path.GetDirectoryName(path));
+                return fileName.StartsWith("data-", StringComparison.OrdinalIgnoreCase) &&
+                    parent.Equals("Mods", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         private static void RequireName(string value, string label)
