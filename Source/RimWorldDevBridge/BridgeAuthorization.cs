@@ -82,6 +82,34 @@ namespace RimWorldDevBridge
                 .Warn(normalized == "live-confirmed" ? "Writes are authorized against a live save." : null);
         }
 
+        internal BridgeResult Renew(string leaseToken, bool mutationEnabled)
+        {
+            if (!mutationEnabled)
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
+            lock (gate)
+            {
+                DateTime now = DateTime.UtcNow;
+                RemoveExpired(now);
+                if (string.IsNullOrWhiteSpace(leaseToken) || !leases.TryGetValue(leaseToken, out WriteLease lease) ||
+                    lease.SessionId != sessionId || lease.ExpiresUtc <= now)
+                    return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required");
+                lease.ExpiresUtc = now.AddSeconds(LeaseSeconds);
+                return BridgeResult.Ok("core.writeLeaseRenewed")
+                    .Add("lease", lease.Token).Add("context", lease.Context)
+                    .Add("expiresUtc", lease.ExpiresUtc.ToString("o"));
+            }
+        }
+
+        internal BridgeResult Revoke(string leaseToken)
+        {
+            lock (gate)
+            {
+                if (string.IsNullOrWhiteSpace(leaseToken) || !leases.Remove(leaseToken))
+                    return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required");
+                return BridgeResult.Ok("core.writeLeaseRevoked").Add("lease", leaseToken);
+            }
+        }
+
         internal BridgeResult Authorize(BridgeRequest request, BridgeCommandDescriptor descriptor,
             string leaseToken, bool mutationEnabled)
         {

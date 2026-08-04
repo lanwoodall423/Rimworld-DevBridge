@@ -7,6 +7,7 @@ using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using HarmonyLib;
 using RimWorld;
 using UnityEngine;
@@ -21,6 +22,17 @@ namespace RimWorldDevBridge
         private const int MaximumScannedObjects = BridgeQuerySnapshotStore.DefaultMaximumRows;
         private static DateTime previousPerformanceUtc;
         private static int previousPerformanceTick = -1;
+        private static int lastProjectionMaxItems;
+        private static double lastProjectionMaxStepMs;
+
+        internal static int LastProjectionMaxItemsForTests => Volatile.Read(ref lastProjectionMaxItems);
+        internal static double LastProjectionMaxStepMsForTests => Volatile.Read(ref lastProjectionMaxStepMs);
+
+        internal static void ResetProjectionMetricsForTests()
+        {
+            Interlocked.Exchange(ref lastProjectionMaxItems, 0);
+            Volatile.Write(ref lastProjectionMaxStepMs, 0d);
+        }
         internal delegate void RegisterCommand(string name, string description, BridgeCommandMode mode,
             BridgeCostClass cost, bool requiresMap, string argumentSchema);
 
@@ -139,9 +151,10 @@ namespace RimWorldDevBridge
                 SnapshotProjectionOperation<Pawn>;
             if (pending != null) return pending.Step(context);
             int mapId = context.Map.uniqueID;
-            IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned.ToList() : null;
-            if (all != null && all.Count > BridgeQuerySnapshotStore.MaximumRows)
-                return SnapshotScanLimit(all.Count);
+            IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned : null;
+            int available = all?.Count ?? 0;
+            if (all != null && available > BridgeQuerySnapshotStore.MaximumRows)
+                return SnapshotScanLimit(available);
             if (query.SnapshotId == null && !BridgeQuerySnapshotStore.CanCreate(out failure)) return failure;
             BridgeQuerySnapshot snapshot;
             if (query.SnapshotId != null)
@@ -151,7 +164,11 @@ namespace RimWorldDevBridge
                 return SnapshotPage("core.pawns", context.Request, query, snapshot);
             }
             context.Request.CooperativeState = new SnapshotProjectionOperation<Pawn>(context.Request,
-                query, mapId, all, pawn => string.IsNullOrWhiteSpace(query.Filter) ||
+                query, mapId, available,
+                index => BridgeGameState.CurrentMap.mapPawns.AllPawnsSpawned[index],
+                () => BridgeGameState.CurrentMap?.mapPawns.AllPawnsSpawned.Count ?? 0,
+                pawn => pawn.thingIDNumber,
+                pawn => string.IsNullOrWhiteSpace(query.Filter) ||
                     Matches(query.Filter, pawn.def?.defName, pawn.LabelShortCap),
                 pawn => new BridgeQuerySnapshotRow(pawn.thingIDNumber,
                     PawnLine(pawn, context.SessionId, mapId)), "core.pawns");
@@ -183,9 +200,10 @@ namespace RimWorldDevBridge
                 SnapshotProjectionOperation<Thing>;
             if (pending != null) return pending.Step(context);
             int mapId = context.Map.uniqueID;
-            IReadOnlyList<Thing> all = query.SnapshotId == null ? context.Map.listerThings.AllThings.ToList() : null;
-            if (all != null && all.Count > BridgeQuerySnapshotStore.MaximumRows)
-                return SnapshotScanLimit(all.Count);
+            IReadOnlyList<Thing> all = query.SnapshotId == null ? context.Map.listerThings.AllThings : null;
+            int available = all?.Count ?? 0;
+            if (all != null && available > BridgeQuerySnapshotStore.MaximumRows)
+                return SnapshotScanLimit(available);
             if (query.SnapshotId == null && !BridgeQuerySnapshotStore.CanCreate(out failure)) return failure;
             BridgeQuerySnapshot snapshot;
             if (query.SnapshotId != null)
@@ -195,7 +213,11 @@ namespace RimWorldDevBridge
                 return SnapshotPage("core.things", context.Request, query, snapshot);
             }
             context.Request.CooperativeState = new SnapshotProjectionOperation<Thing>(context.Request,
-                query, mapId, all, thing => string.IsNullOrWhiteSpace(query.Filter) || Matches(query.Filter,
+                query, mapId, available,
+                index => BridgeGameState.CurrentMap.listerThings.AllThings[index],
+                () => BridgeGameState.CurrentMap?.listerThings.AllThings.Count ?? 0,
+                thing => thing.thingIDNumber,
+                thing => string.IsNullOrWhiteSpace(query.Filter) || Matches(query.Filter,
                     thing.def?.defName, thing.LabelShortCap, thing.GetType().FullName),
                 thing => new BridgeQuerySnapshotRow(thing.thingIDNumber,
                     ThingLine(thing, context.SessionId, mapId)), "core.things");
@@ -302,9 +324,10 @@ namespace RimWorldDevBridge
                 SnapshotProjectionOperation<Pawn>;
             if (pending != null) return pending.Step(context);
             int mapId = context.Map.uniqueID;
-            IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned.ToList() : null;
-            if (all != null && all.Count > BridgeQuerySnapshotStore.MaximumRows)
-                return SnapshotScanLimit(all.Count);
+            IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned : null;
+            int available = all?.Count ?? 0;
+            if (all != null && available > BridgeQuerySnapshotStore.MaximumRows)
+                return SnapshotScanLimit(available);
             if (query.SnapshotId == null && !BridgeQuerySnapshotStore.CanCreate(out failure)) return failure;
             BridgeQuerySnapshot snapshot;
             if (query.SnapshotId != null)
@@ -314,7 +337,11 @@ namespace RimWorldDevBridge
                 return SnapshotPage("core.jobs", context.Request, query, snapshot);
             }
             context.Request.CooperativeState = new SnapshotProjectionOperation<Pawn>(context.Request,
-                query, mapId, all, pawn => pawn.CurJob != null && (string.IsNullOrWhiteSpace(query.Filter) ||
+                query, mapId, available,
+                index => BridgeGameState.CurrentMap.mapPawns.AllPawnsSpawned[index],
+                () => BridgeGameState.CurrentMap?.mapPawns.AllPawnsSpawned.Count ?? 0,
+                pawn => pawn.thingIDNumber,
+                pawn => pawn.CurJob != null && (string.IsNullOrWhiteSpace(query.Filter) ||
                     Matches(query.Filter, pawn.CurJobDef?.defName, pawn.LabelShortCap)),
                 pawn => new BridgeQuerySnapshotRow(pawn.thingIDNumber,
                     "job=pawnRef:" + Reference(context.SessionId, mapId, pawn.thingIDNumber) +
@@ -854,22 +881,32 @@ namespace RimWorldDevBridge
             private readonly BridgeRequest request;
             private readonly BridgeQuery query;
             private readonly int mapId;
-            private readonly IReadOnlyList<T> source;
+            private readonly int sourceCount;
+            private readonly Func<int, T> sourceAt;
+            private readonly Func<int> currentCount;
+            private readonly Func<T, int> stableId;
             private readonly Func<T, bool> matches;
             private readonly Func<T, BridgeQuerySnapshotRow> project;
             private readonly string schema;
             private readonly List<BridgeQuerySnapshotRow> rows = new List<BridgeQuerySnapshotRow>();
+            private readonly List<int> sourceIds = new List<int>();
+            private readonly HashSet<int> stableIds = new HashSet<int>();
             private int index;
+            private int validationIndex;
             private long estimatedBytes;
 
             internal SnapshotProjectionOperation(BridgeRequest request, BridgeQuery query, int mapId,
-                IReadOnlyList<T> source, Func<T, bool> matches, Func<T, BridgeQuerySnapshotRow> project,
-                string schema)
+                int sourceCount, Func<int, T> sourceAt, Func<int> currentCount, Func<T, int> stableId,
+                Func<T, bool> matches,
+                Func<T, BridgeQuerySnapshotRow> project, string schema)
             {
                 this.request = request;
                 this.query = query;
                 this.mapId = mapId;
-                this.source = source ?? throw new ArgumentNullException(nameof(source));
+                this.sourceCount = sourceCount;
+                this.sourceAt = sourceAt ?? throw new ArgumentNullException(nameof(sourceAt));
+                this.currentCount = currentCount ?? throw new ArgumentNullException(nameof(currentCount));
+                this.stableId = stableId ?? throw new ArgumentNullException(nameof(stableId));
                 this.matches = matches ?? throw new ArgumentNullException(nameof(matches));
                 this.project = project ?? throw new ArgumentNullException(nameof(project));
                 this.schema = schema;
@@ -882,25 +919,77 @@ namespace RimWorldDevBridge
                 int processed = 0;
                 try
                 {
-                    while (index < source.Count)
+                    if (!StillValid(context) || currentCount() != sourceCount)
+                        return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                    while (index < sourceCount)
                     {
-                        if ((index & 31) == 0) context.ThrowIfCancellationRequested();
-                        T value = source[index++];
-                        if (matches(value)) AddSnapshotRow(rows, project(value), ref estimatedBytes);
+                        context.ThrowIfCancellationRequested();
+                        if (!StillValid(context) || currentCount() != sourceCount)
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        T value;
+                        try
+                        {
+                            value = sourceAt(index++);
+                        }
+                        catch (ArgumentOutOfRangeException)
+                        {
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        }
+                    sourceIds.Add(value == null ? int.MinValue : stableId(value));
+                    if (value != null && matches(value))
+                        {
+                            BridgeQuerySnapshotRow row = project(value);
+                            if (row != null && !stableIds.Add(row.StableId))
+                                return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                            if (row != null) AddSnapshotRow(rows, row, ref estimatedBytes);
+                        }
                         processed++;
-                        if (processed >= 32 && BridgeTiming.Milliseconds(stepStart) >= stepBudget) break;
+                    if (processed >= 32 || BridgeTiming.Milliseconds(stepStart) >= stepBudget) break;
                     }
                     context.ThrowIfCancellationRequested();
-                    if (index < source.Count)
+                    if (index < sourceCount)
                     {
                         request.YieldExecution = true;
                         return null;
                     }
 
+                    while (validationIndex < sourceCount)
+                    {
+                        context.ThrowIfCancellationRequested();
+                        if (!StillValid(context) || currentCount() != sourceCount)
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        T value;
+                        try { value = sourceAt(validationIndex); }
+                        catch (ArgumentOutOfRangeException)
+                        {
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        }
+                        int currentId = value == null ? int.MinValue : stableId(value);
+                        if (currentId != sourceIds[validationIndex])
+                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
+                        validationIndex++;
+                        processed++;
+                        if (processed >= 32 || BridgeTiming.Milliseconds(stepStart) >= stepBudget) break;
+                    }
+                    if (validationIndex < sourceCount)
+                    {
+                        request.YieldExecution = true;
+                        return null;
+                    }
+
+                    CheckSnapshotBudget(stepStart);
                     BridgeQuerySnapshot snapshot;
                     BridgeResult failure;
                     if (!BridgeQuerySnapshotStore.TryCreate(context.SessionId, request.Command,
-                        query.CursorScope, query.Ordering, mapId, source.Count, false, rows,
+                        query.CursorScope, query.Ordering, mapId, sourceCount, false, rows,
                         out snapshot, out failure))
                     {
                         request.CooperativeState = null;
@@ -932,6 +1021,52 @@ namespace RimWorldDevBridge
                     request.CooperativeState = null;
                     throw;
                 }
+                catch (Exception exception)
+                {
+                    request.CooperativeState = null;
+                    return BridgeResult.Fail(BridgeStatus.ERROR, "snapshot_projection_failed",
+                        exception.GetBaseException().Message);
+                }
+                finally
+                {
+                    int previousItems;
+                    do
+                    {
+                        previousItems = Volatile.Read(ref lastProjectionMaxItems);
+                        if (processed <= previousItems) break;
+                    }
+                    while (Interlocked.CompareExchange(ref lastProjectionMaxItems, processed,
+                        previousItems) != previousItems);
+
+                    double elapsed = BridgeTiming.Milliseconds(stepStart);
+                    double previousStep;
+                    do
+                    {
+                        previousStep = Volatile.Read(ref lastProjectionMaxStepMs);
+                        if (elapsed <= previousStep) break;
+                    }
+                    while (Interlocked.CompareExchange(ref lastProjectionMaxStepMs, elapsed,
+                        previousStep) != previousStep);
+                }
+            }
+
+            private bool StillValid(BridgeExecutionContext context)
+            {
+                if (!string.Equals(request.SessionId, BridgeRuntime.SessionId, StringComparison.Ordinal))
+                    return false;
+                if (context.Map == null || context.Map.uniqueID != mapId)
+                    return false;
+                Map currentMap = BridgeGameState.CurrentMap;
+                return currentMap != null && currentMap.uniqueID == mapId;
+            }
+
+            private BridgeResult Abort(BridgeExecutionContext context, string code, BridgeStatus status)
+            {
+                request.CooperativeState = null;
+                BridgeResult result = BridgeResult.Fail(status, code);
+                result.Truncated = true;
+                result.Warn("snapshot construction was discarded before a cursor was issued");
+                return result;
             }
         }
 

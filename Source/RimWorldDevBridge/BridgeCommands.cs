@@ -29,6 +29,10 @@ namespace RimWorldDevBridge
                 BridgeCostClass.Trivial, false, "command:string");
             Register("WRITE_LEASE", "Acquire a short-lived write lease for sandbox or confirmed live use.",
                 BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "context:sandbox|live-confirmed");
+            Register("RENEW_WRITE_LEASE", "Extend an active write lease without changing its context.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "lease:string");
+            Register("REVOKE_WRITE_LEASE", "Revoke an active write lease immediately.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "lease:string");
             Register("SET_SPEED", "Set game speed from 0 through 4.", BridgeCommandMode.Reversible,
                 BridgeCostClass.Trivial, true, "speed:int[0,4]");
             Register("SCHEDULER_METRICS", "Report queue and main-thread timing metrics.",
@@ -88,6 +92,8 @@ namespace RimWorldDevBridge
                 case "HELP": return Help(context.Request.Argument);
                 case "DESCRIBE": return DescribeResult(context.Request.Argument);
                 case "WRITE_LEASE": return BridgeRuntime.AcquireWriteLease(context.Request.Argument);
+                case "RENEW_WRITE_LEASE": return BridgeRuntime.RenewWriteLease(LeaseToken(context.Request));
+                case "REVOKE_WRITE_LEASE": return BridgeRuntime.RevokeWriteLease(LeaseToken(context.Request));
                 case "SET_SPEED": return SetSpeed(context.Request.Argument);
                 case "SCHEDULER_METRICS": return BridgeRuntime.SchedulerMetrics();
                 case "COMMAND_METRICS": return BridgeMetrics.Report();
@@ -115,6 +121,11 @@ namespace RimWorldDevBridge
             return BridgeDiagnostics.Prepare(request);
         }
 
+        private static string LeaseToken(BridgeRequest request)
+        {
+            return string.IsNullOrWhiteSpace(request.AuthToken) ? request.Argument : request.AuthToken;
+        }
+
         private static void Register(string name, string description, BridgeCommandMode mode,
             BridgeCostClass cost, bool requiresMap, string argumentSchema = "none")
         {
@@ -135,35 +146,41 @@ namespace RimWorldDevBridge
 
         private static BridgeResult Status()
         {
+            BridgeRuntime.BridgeRuntimeStateSnapshot state = BridgeRuntime.StateSnapshot;
             BridgeResult result = BridgeResult.Ok("core.status")
                 .Add("bridgeVersion", BridgeProtocol.BridgeVersion)
                 .Add("protocolVersion", BridgeProtocol.ProtocolVersion)
-                .Add("state", BridgeRuntime.Active ? "ON" : "DORMANT")
+                .Add("state", state.TransportActive ? (state.TransportReady ? "ON" : "ACTIVATING") : "DORMANT")
+                .Add("transportGeneration", state.TransportGeneration)
+                .Add("transportReady", state.TransportReady)
                 .Add("gameVersion", VersionControl.CurrentVersionStringWithoutBuild)
                 .Add("devMode", Prefs.DevMode)
                 .Add("map", BridgeGameState.CurrentMap?.uniqueID.ToString() ?? "none")
                 .Add("tick", BridgeGameState.TickManager?.TicksGame ?? -1)
-                .Add("clients", BridgeRuntime.ActiveClients)
+                .Add("clients", state.ConnectedClients)
+                .Add("clientLimit", state.ConnectedClientLimit)
                 .Add("adapterIndex", BridgeAdapterCatalog.State)
                 .Add("bootstrapMs", BridgeRuntime.BootstrapMs)
                 .Add("harmonyMs", BridgeRuntime.HarmonyMs)
                 .Add("finalizeInitMs", BridgeRuntime.FinalizeInitMs)
                 .Add("activationMs", BridgeRuntime.ActivationMs)
                 .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes);
-            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
+            return BridgeRuntime.AddSessionContext(result, state);
         }
 
         private static BridgeResult Session()
         {
+            BridgeRuntime.BridgeRuntimeStateSnapshot state = BridgeRuntime.StateSnapshot;
             BridgeResult result = BridgeResult.Ok("core.session")
                 .Add("gameLoaded", Current.Game != null)
                 .Add("mapLoaded", BridgeGameState.CurrentMap != null)
                 .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? true);
-            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
+            return BridgeRuntime.AddSessionContext(result, state);
         }
 
         private static BridgeResult Sync(string known)
         {
+            BridgeRuntime.BridgeRuntimeStateSnapshot state = BridgeRuntime.StateSnapshot;
             string fingerprint = BridgeAdapterCatalog.Fingerprint;
             bool same = string.Equals((known ?? string.Empty).Trim(), fingerprint,
                 StringComparison.OrdinalIgnoreCase);
@@ -174,7 +191,7 @@ namespace RimWorldDevBridge
                 .Add("protocol", BridgeProtocol.ProtocolVersion)
                 .Add("restart", false)
                 .Add("adapterIndex", BridgeAdapterCatalog.State);
-            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
+            return BridgeRuntime.AddSessionContext(result, state);
         }
 
         private static BridgeResult Capabilities()
@@ -317,12 +334,13 @@ namespace RimWorldDevBridge
 
         private static BridgeResult SaveInfo()
         {
+            BridgeRuntime.BridgeRuntimeStateSnapshot state = BridgeRuntime.StateSnapshot;
             BridgeResult result = BridgeResult.Ok("core.saveInfo")
                 .Add("gameLoaded", Current.Game != null)
                 .Add("programState", Current.ProgramState)
                 .Add("worldSeed", BridgeGameState.World?.info?.seedString ?? "none")
                 .Add("maps", BridgeGameState.Maps?.Count ?? 0);
-            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
+            return BridgeRuntime.AddSessionContext(result, state);
         }
 
         private static BridgeResult Settings()

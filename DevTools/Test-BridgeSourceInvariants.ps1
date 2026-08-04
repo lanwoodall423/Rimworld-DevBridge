@@ -3,6 +3,7 @@ $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $sourceRoot = Join-Path $root "Source\RimWorldDevBridge"
 $runtime = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeRuntime.cs"))
 $gameComponent = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeGameComponent.cs"))
+$diagnostics = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeDiagnostics.cs"))
 $allSource = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeAdapterCatalog.cs")) + $runtime
 
 function Assert-Absent([string]$Text, [string]$Pattern, [string]$Label) {
@@ -17,6 +18,10 @@ $bootstrap = $runtime.Substring($bootstrapStart, $bootstrapEnd - $bootstrapStart
 Assert-Absent $bootstrap "BridgeAdapterCatalog|BridgeOrchestration|BridgeFeatureTests" "dormant bootstrap"
 Assert-Absent $bootstrap "TcpListener|System\.Threading\.Timer|new Timer" "dormant bootstrap"
 Assert-Absent $gameComponent "GameComponentTick|GameComponentUpdate" "game component"
+Assert-Absent $diagnostics "AllPawnsSpawned\.ToList\(\)|AllThings\.ToList\(\)" "paged query capture"
+if ($diagnostics -notmatch "SnapshotProjectionOperation|currentCount") {
+    throw "Cooperative paged query projection is missing."
+}
 Assert-Absent $allSource "\.GetTypes\(\)|PatchAll\(" "bridge source"
 if ([regex]::Matches($allSource, "AppDomain\.CurrentDomain\.GetAssemblies").Count -gt 1) {
     throw "Only one explicit lazy loaded-assembly identity lookup is allowed."

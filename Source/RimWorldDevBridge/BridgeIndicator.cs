@@ -91,10 +91,22 @@ namespace RimWorldDevBridge
         private static BridgeIndicatorWindow window;
 
         internal static BridgeIndicatorState State => state;
+        internal static int RefreshCountForTests => System.Threading.Volatile.Read(ref refreshCount);
+        internal static void ResetRefreshCountForTests() =>
+            System.Threading.Interlocked.Exchange(ref refreshCount, 0);
+
+        internal static void Refresh(BridgeRuntime.BridgeRuntimeStateSnapshot snapshot,
+            bool settingVisible, int corner)
+        {
+            if (snapshot == null) return;
+            Refresh(snapshot.TransportActive, snapshot.ConnectedClients,
+                snapshot.ConnectedClientLimit, snapshot.Context, settingVisible, corner);
+        }
 
         internal static void Refresh(bool transportActive, int connectedClients, int connectedClientLimit,
             BridgeSessionContextSnapshot session, bool settingVisible, int corner)
         {
+            System.Threading.Interlocked.Increment(ref refreshCount);
             BridgeIndicatorState next = BridgeIndicatorState.Create(transportActive, connectedClients,
                 connectedClientLimit, session, settingVisible);
             state = next;
@@ -118,6 +130,8 @@ namespace RimWorldDevBridge
             state = BridgeIndicatorState.Create(false, 0, 0, null, false);
             CloseWindow();
         }
+
+        private static int refreshCount;
 
         private static void CloseWindow()
         {

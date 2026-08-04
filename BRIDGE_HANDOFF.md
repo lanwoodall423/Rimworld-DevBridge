@@ -31,6 +31,10 @@ Sessions start read-only. Every non-read command requires all of:
 - A stable `idempotency=<key>` for safe retry.
 - `allowExpensive=true` for expensive or simulation commands.
 
+Use `RENEW_WRITE_LEASE` with `lease=<token>` to extend an active lease, or
+`REVOKE_WRITE_LEASE` with the same token to remove it immediately. Both operations update the
+status file and runtime indicator.
+
 Dev mode alone never authorizes a write. Potentially destructive commands require a sandbox lease.
 Modes are derived transitively for batches, macros, and feature tests. Mutations produce a summary
 and a bounded audit under RimWorld user data.

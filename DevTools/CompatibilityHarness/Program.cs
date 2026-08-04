@@ -5,7 +5,9 @@ using System.IO;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Globalization;
 using System.Runtime.Serialization.Json;
+using System.Runtime.Serialization;
 using System.Text;
 using System.Threading;
 using RimWorldDevBridge;
@@ -47,6 +49,8 @@ internal static class Program
         Run("scheduler queue capacity", SchedulerQueueCapacity);
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
+        Run("event-driven state publication", EventDrivenStatePublication);
+        Run("production pawn thing job snapshots", ProductionPawnThingJobSnapshots);
         Run("wake signal idempotence", WakeSignalIdempotence);
         Run("main thread dispatch queue", MainThreadDispatchQueue);
         Run("main thread owner assertion", MainThreadOwnerAssertion);
@@ -702,6 +706,295 @@ internal static class Program
         Check(liveState.Visible, "live lease became invisible");
         Check(liveState.Label.Contains("LIVE-CONFIRMED") &&
             liveState.Tooltip(DateTime.UtcNow).Contains("LIVE-CONFIRMED writes"), "live warning missing");
+    }
+
+    private static void EventDrivenStatePublication()
+    {
+        InvokeRotateSession("event-driven");
+        BridgeRuntime.OnRootUpdate();
+        BridgeRuntime.ResetStatePublicationCountersForTests();
+        for (int i = 0; i < 8; i++) BridgeRuntime.OnRootUpdate();
+        Equal(0, BridgeRuntime.StatusWriteCountForTests, "dormant status was recomputed every frame");
+        Equal(0, BridgeRuntime.IndicatorRefreshCountForTests, "dormant indicator was refreshed every frame");
+
+        BridgeResult acquired = BridgeRuntime.AcquireWriteLease("sandbox");
+        Check(acquired.Status == BridgeStatus.OK, "lease acquisition failed");
+        int writesAfterAcquire = BridgeRuntime.StatusWriteCountForTests;
+        Check(writesAfterAcquire > 0, "lease acquisition did not publish status");
+        Check(BridgeRuntime.IndicatorRefreshCountForTests > 0, "lease acquisition did not refresh indicator");
+        string leaseToken = FieldValue(acquired, "lease");
+        BridgeResult renewed = BridgeRuntime.RenewWriteLease(leaseToken);
+        Check(renewed.Status == BridgeStatus.OK, "lease renewal failed");
+        Check(BridgeRuntime.StatusWriteCountForTests > writesAfterAcquire,
+            "lease renewal did not publish status");
+
+        FieldInfo authorizationField = typeof(BridgeRuntime).GetField("Authorization",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        ExpireAllLeases((BridgeAuthorization)authorizationField.GetValue(null));
+        FieldInfo expiryField = typeof(BridgeRuntime).GetField("leaseExpiryTicks",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        expiryField.SetValue(null, DateTime.UtcNow.AddSeconds(-1).Ticks);
+        BridgeRuntime.OnRootUpdate();
+        Check(!BridgeRuntime.SessionContext.WriteLeaseActive, "expired lease remained active");
+        Check(BridgeRuntime.StatusWriteCountForTests > writesAfterAcquire,
+            "lease expiration did not publish status");
+        int writesAfterExpiry = BridgeRuntime.StatusWriteCountForTests;
+        BridgeRuntime.OnRootUpdate();
+        Equal(writesAfterExpiry, BridgeRuntime.StatusWriteCountForTests,
+            "post-expiry dormant status kept publishing");
+        BridgeResult reacquired = BridgeRuntime.AcquireWriteLease("sandbox");
+        BridgeResult revoked = BridgeRuntime.RevokeWriteLease(FieldValue(reacquired, "lease"));
+        Check(revoked.Status == BridgeStatus.OK && !BridgeRuntime.SessionContext.WriteLeaseActive,
+            "lease revocation did not invalidate authority");
+        InvokeRotateSession("event-driven-cleanup");
+    }
+
+    private static void ProductionPawnThingJobSnapshots()
+    {
+        InvokeRotateSession("production-query");
+        FieldInfo currentGameField = typeof(Verse.Current).GetField("gameInt",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        object previousGame = currentGameField.GetValue(null);
+        TestMapFixture fixture = null;
+        try
+        {
+            fixture = BuildTestMapFixture(1200);
+            currentGameField.SetValue(null, fixture.Game);
+            BridgeRuntime.OnRootUpdate();
+            Check(fixture.Map.mapPawns.AllPawnsSpawned.Count == 1200,
+                "pawn fixture count=" + fixture.Map.mapPawns.AllPawnsSpawned.Count);
+            Check(fixture.Map.listerThings.AllThings.Count == 1200,
+                "thing fixture count=" + fixture.Map.listerThings.AllThings.Count);
+            Verse.Pawn removedPawn = fixture.Pawns[0];
+            int mutationPawnFrames = RunProductionQuery(fixture.Map, "PAWNS",
+                out BridgeResult mutationPawn, out BridgeRequest mutationPawnRequest,
+                () => fixture.Pawns.RemoveAt(0));
+            Check(mutationPawnFrames > 1 && mutationPawn.Status == BridgeStatus.PARTIAL &&
+                mutationPawn.ContinuationCursor == null && mutationPawnRequest.CooperativeState == null,
+                "pawn mutation during capture was not discarded");
+            fixture.Pawns.Insert(0, removedPawn);
+
+            Verse.Thing removedThing = fixture.Things[0];
+            int mutationThingFrames = RunProductionQuery(fixture.Map, "THINGS",
+                out BridgeResult mutationThing, out BridgeRequest mutationThingRequest,
+                () => fixture.Things.RemoveAt(0));
+            Check(mutationThingFrames > 1 && mutationThing.Status == BridgeStatus.PARTIAL &&
+                mutationThing.ContinuationCursor == null && mutationThingRequest.CooperativeState == null,
+                "thing mutation during capture was not discarded");
+            fixture.Things.Insert(0, removedThing);
+
+            Verse.Pawn removedJobPawn = fixture.Pawns[0];
+            int mutationJobFrames = RunProductionQuery(fixture.Map, "JOBS",
+                out BridgeResult mutationJob, out BridgeRequest mutationJobRequest,
+                () => fixture.Pawns.RemoveAt(0));
+            Check(mutationJobFrames > 1 && mutationJob.Status == BridgeStatus.PARTIAL &&
+                mutationJob.ContinuationCursor == null && mutationJobRequest.CooperativeState == null,
+                "job mutation during capture was not discarded");
+            fixture.Pawns.Insert(0, removedJobPawn);
+
+            BridgeDiagnostics.ResetProjectionMetricsForTests();
+            int pawnFrames = RunProductionQuery(fixture.Map, "PAWNS", out BridgeResult pawnFirst,
+                out BridgeRequest pawnRequest);
+            int thingFrames = RunProductionQuery(fixture.Map, "THINGS", out BridgeResult thingFirst,
+                out BridgeRequest thingRequest);
+            int jobFrames = RunProductionQuery(fixture.Map, "JOBS", out BridgeResult jobFirst,
+                out BridgeRequest jobRequest);
+            Check(pawnFrames > 1 && thingFrames > 1 && jobFrames > 1,
+                "production queries did not yield across frames pawn=" + pawnFrames +
+                " thing=" + thingFrames + " job=" + jobFrames + " statuses=" +
+                pawnFirst.Status + "/" + thingFirst.Status + "/" + jobFirst.Status + " errors=" +
+                ResultDetails(pawnFirst) + "/" + ResultDetails(thingFirst) + "/" + ResultDetails(jobFirst));
+            Check(pawnFrames < 200 && thingFrames < 200 && jobFrames < 200,
+                "production query frame bounds were unbounded");
+            int maxItems = BridgeDiagnostics.LastProjectionMaxItemsForTests;
+            double maxStepMs = BridgeDiagnostics.LastProjectionMaxStepMsForTests;
+            Console.WriteLine("productionSnapshotMetrics pawnFrames=" + pawnFrames +
+                " thingFrames=" + thingFrames + " jobFrames=" + jobFrames +
+                " mutationFrames=" + mutationPawnFrames + "/" + mutationThingFrames +
+                "/" + mutationJobFrames + " maxItemsPerStep=" + maxItems +
+                " maxStepMs=" + maxStepMs.ToString("F2", CultureInfo.InvariantCulture) +
+                " budgetMs=" + BridgeRuntime.EffectiveMainThreadBudgetMs);
+            Check(maxItems <= 32, "production snapshot step exceeded item bound: " + maxItems);
+            Check(maxStepMs <= BridgeRuntime.EffectiveMainThreadBudgetMs + 20d,
+                "production snapshot step exceeded timer tolerance: " + maxStepMs);
+            Check(pawnFirst != null && thingFirst != null && jobFirst != null,
+                "production query did not complete");
+            Check(pawnFirst.ContinuationCursor != null && thingFirst.ContinuationCursor != null &&
+                jobFirst.ContinuationCursor != null, "production query issued no stable cursor");
+
+            fixture.Pawns.RemoveAt(0);
+            fixture.Things.RemoveAt(0);
+            BridgeResult pawnPage = RunCursorQuery(fixture.Map, "PAWNS", pawnFirst.ContinuationCursor);
+            BridgeResult thingPage = RunCursorQuery(fixture.Map, "THINGS", thingFirst.ContinuationCursor);
+            BridgeResult jobPage = RunCursorQuery(fixture.Map, "JOBS", jobFirst.ContinuationCursor);
+            Check(pawnPage.Status == BridgeStatus.OK && thingPage.Status == BridgeStatus.OK &&
+                jobPage.Status == BridgeStatus.OK, "immutable cursor page failed after live mutation");
+            Check(pawnPage.Lines.Count > 0 && thingPage.Lines.Count > 0 && jobPage.Lines.Count > 0,
+                "immutable cursor page omitted captured rows");
+            Check(pawnPage.Lines[0].Contains(":26 "),
+                "pawn snapshot ordering changed");
+            Check(thingPage.Lines[0].Contains(":26 "),
+                "thing snapshot ordering changed");
+            Check(jobPage.Lines[0].Contains(":26 "),
+                "job snapshot ordering changed");
+            Check(pawnRequest.CooperativeState == null && thingRequest.CooperativeState == null &&
+                jobRequest.CooperativeState == null, "partial production snapshot was retained");
+        }
+        finally
+        {
+            currentGameField.SetValue(null, previousGame);
+            BridgeQuerySnapshotStore.RotateSession();
+            InvokeRotateSession("production-query-cleanup");
+        }
+    }
+
+    private static int RunProductionQuery(Verse.Map map, string command, out BridgeResult result,
+        out BridgeRequest request, Action afterFirstYield = null)
+    {
+        BridgeRequest localRequest = Request("production-" + command, BridgeRuntime.SessionId);
+        localRequest.Command = command;
+        localRequest.Argument = "limit=25";
+        BridgeExecutionContext context = new BridgeExecutionContext(localRequest, map, () => localRequest.Cancelled);
+        int frames = 0;
+        while (true)
+        {
+            frames++;
+            result = BridgeDiagnostics.Execute(context);
+            if (!localRequest.YieldExecution)
+            {
+                request = localRequest;
+                return frames;
+            }
+            localRequest.YieldExecution = false;
+            if (frames == 1) afterFirstYield?.Invoke();
+            Check(frames < 200, command + " projection did not remain bounded");
+        }
+    }
+
+    private static BridgeResult RunCursorQuery(Verse.Map map, string command, string cursor)
+    {
+        BridgeRequest request = Request("cursor-" + command, BridgeRuntime.SessionId);
+        request.Command = command;
+        request.Argument = "cursor=" + cursor;
+        return BridgeDiagnostics.Execute(new BridgeExecutionContext(request, map, () => request.Cancelled));
+    }
+
+    private sealed class TestMapFixture
+    {
+        internal Verse.Game Game;
+        internal Verse.Map Map;
+        internal List<Verse.Pawn> Pawns;
+        internal List<Verse.Thing> Things;
+        internal int[] PawnIds;
+        internal int[] ThingIds;
+    }
+
+    private sealed class HarnessPawn : Verse.Pawn
+    {
+        public override string LabelShortCap => "test pawn";
+    }
+
+    private sealed class HarnessThing : Verse.Thing
+    {
+        public override string LabelShortCap => "test thing";
+    }
+
+    private static TestMapFixture BuildTestMapFixture(int count)
+    {
+        Verse.Map map = new Verse.Map();
+        SetField(map, "uniqueID", 7001);
+        Verse.MapPawns mapPawns = new Verse.MapPawns(map);
+        List<Verse.Pawn> pawns = new List<Verse.Pawn>();
+        int[] pawnIds = new int[count];
+        Verse.PawnKindDef kind = (Verse.PawnKindDef)FormatterServices.GetUninitializedObject(
+            typeof(Verse.PawnKindDef));
+        SetField(kind, "defName", "TestPawnKind");
+        SetField(kind, "label", "test pawn");
+        Verse.ThingDef pawnDef = (Verse.ThingDef)FormatterServices.GetUninitializedObject(
+            typeof(Verse.ThingDef));
+        SetField(pawnDef, "defName", "TestPawn");
+        SetField(pawnDef, "label", "test pawn");
+        Verse.JobDef jobDef = (Verse.JobDef)FormatterServices.GetUninitializedObject(
+            typeof(Verse.JobDef));
+        SetField(jobDef, "defName", "TestJob");
+        SetField(jobDef, "label", "test job");
+        for (int index = 0; index < count; index++)
+        {
+            int id = count - index;
+            Verse.Pawn pawn = new HarnessPawn();
+            SetField(pawn, "thingIDNumber", id);
+            SetField(pawn, "mapIndexOrState", (sbyte)0);
+            SetField(pawn, "def", pawnDef);
+            SetField(pawn, "kindDef", kind);
+            SetField(pawn, "health", FormatterServices.GetUninitializedObject(
+                typeof(Verse.Pawn_HealthTracker)));
+            Verse.AI.Pawn_JobTracker jobs = new Verse.AI.Pawn_JobTracker(pawn);
+            Verse.AI.Job job = (Verse.AI.Job)FormatterServices.GetUninitializedObject(typeof(Verse.AI.Job));
+            SetField(job, "def", jobDef);
+            SetField(jobs, "curJob", job);
+            SetField(pawn, "jobs", jobs);
+            pawns.Add(pawn);
+            pawnIds[index] = id;
+        }
+        SetField(mapPawns, "pawnsSpawned", pawns);
+        SetField(mapPawns, "allPawnsResult", pawns);
+        SetField(map, "mapPawns", mapPawns);
+
+        Verse.ThingDef thingDef = (Verse.ThingDef)FormatterServices.GetUninitializedObject(
+            typeof(Verse.ThingDef));
+        SetField(thingDef, "defName", "TestThing");
+        SetField(thingDef, "label", "test thing");
+        List<Verse.Thing> things = new List<Verse.Thing>();
+        int[] thingIds = new int[count];
+        for (int index = 0; index < count; index++)
+        {
+            int id = count - index;
+            Verse.Thing thing = new HarnessThing();
+            SetField(thing, "thingIDNumber", id);
+            SetField(thing, "mapIndexOrState", (sbyte)0);
+            SetField(thing, "def", thingDef);
+            SetField(thing, "stackCount", 1);
+            things.Add(thing);
+            thingIds[index] = id;
+        }
+        Verse.ListerThings lister = new Verse.ListerThings(Verse.ListerThingsUse.Global,
+            new Verse.ThingListChangedCallbacks());
+        var listsByDef = new Dictionary<Verse.ThingDef, List<Verse.Thing>>
+        {
+            [thingDef] = things
+        };
+        SetField(lister, "listsByDef", listsByDef);
+        List<Verse.Thing>[] listsByGroup = new List<Verse.Thing>[128];
+        for (int index = 0; index < listsByGroup.Length; index++) listsByGroup[index] = things;
+        SetField(lister, "listsByGroup", listsByGroup);
+        SetField(map, "listerThings", lister);
+
+        Verse.Game game = (Verse.Game)FormatterServices.GetUninitializedObject(typeof(Verse.Game));
+        SetField(game, "maps", new List<Verse.Map> { map });
+        SetField(game, "currentMapIndex", (sbyte)0);
+        return new TestMapFixture
+        {
+            Game = game,
+            Map = map,
+            Pawns = pawns,
+            Things = things,
+            PawnIds = pawnIds,
+            ThingIds = thingIds
+        };
+    }
+
+    private static void SetField(object target, string name, object value)
+    {
+        Type type = target.GetType();
+        FieldInfo field = null;
+        while (type != null && field == null)
+        {
+            field = type.GetField(name, BindingFlags.Instance | BindingFlags.Static |
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly);
+            type = type.BaseType;
+        }
+        Check(field != null, "missing fixture field " + target.GetType().Name + "." + name);
+        field.SetValue(target, value);
     }
 
     private static void CooperativeSchedulerYielding()
@@ -1372,6 +1665,11 @@ internal static class Program
     private static string FieldValue(BridgeResult result, string name)
     {
         return result.Data.Single(field => field.Name == name).Value;
+    }
+
+    private static string ResultDetails(BridgeResult result)
+    {
+        return string.Join(",", result.Data.Select(field => field.Name + "=" + field.Value));
     }
 
     private static BridgeRequest Request(string id, string session) => new BridgeRequest

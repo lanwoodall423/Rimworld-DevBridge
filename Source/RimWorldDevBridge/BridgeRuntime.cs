@@ -20,6 +20,7 @@ namespace RimWorldDevBridge
         private const int IdleSeconds = 180;
         private static readonly object Gate = new object();
         private static readonly object StatusGate = new object();
+        private static readonly object LeaseTimerGate = new object();
         private static readonly BridgeAuthorization Authorization = new BridgeAuthorization();
         private static readonly BridgeScheduler Scheduler = new BridgeScheduler(ExecuteScheduled, CompleteScheduled);
         private static readonly string BootId = Guid.NewGuid().ToString("N");
@@ -40,6 +41,8 @@ namespace RimWorldDevBridge
         private static int transportGeneration;
         private static long gameTransitionSequence;
         private static long publishedGameTransitionSequence;
+        private static long stateVersion;
+        private static int stateDirty = 1;
         private static int publishedGameTransitionThreadId;
         private static int port;
         private static volatile string statusPath;
@@ -52,8 +55,12 @@ namespace RimWorldDevBridge
         private static double finalizeInitMs;
         private static double activationMs;
         private static double statusWriteMs;
+        private static int statusWriteCount;
         private static long bootstrapManagedDeltaBytes;
         private static bool bootstrapped;
+        private static Timer leaseExpiryTimer;
+        private static long leaseExpiryTicks;
+        private static string leaseExpirySession;
 
         internal static bool Active => active;
         internal static int ActiveClients
@@ -70,18 +77,15 @@ namespace RimWorldDevBridge
         internal static double ActivationMs => activationMs;
         internal static long BootstrapManagedDeltaBytes => bootstrapManagedDeltaBytes;
         internal static string SessionId => identity.SessionId;
-        internal static BridgeSessionContextSnapshot SessionContext
+        internal static BridgeRuntimeStateSnapshot StateSnapshot => CaptureStateSnapshot();
+        internal static BridgeSessionContextSnapshot SessionContext => StateSnapshot.Context;
+        internal static int StatusWriteCountForTests => Volatile.Read(ref statusWriteCount);
+        internal static int IndicatorRefreshCountForTests => BridgeIndicator.RefreshCountForTests;
+        internal static long StateVersionForTests => Interlocked.Read(ref stateVersion);
+        internal static void ResetStatePublicationCountersForTests()
         {
-            get
-            {
-                lock (Gate)
-                {
-                    BridgeSessionContextSnapshot authorization = Authorization.Snapshot();
-                    return new BridgeSessionContextSnapshot(identity.SessionId, authorization.WriteContext,
-                        authorization.RepresentativePlayerBehavior, authorization.WriteLeaseActive,
-                        authorization.LeaseState, authorization.LeaseExpiresUtc);
-                }
-            }
+            Interlocked.Exchange(ref statusWriteCount, 0);
+            BridgeIndicator.ResetRefreshCountForTests();
         }
         internal static string WriteContext => SessionContext.WriteContext;
         internal static int EffectiveQueueCapacity => Scheduler.QueueCapacity;
@@ -116,7 +120,50 @@ namespace RimWorldDevBridge
                 .Add("writeContext", snapshot.WriteContext)
                 .Add("representativePlayerBehavior", snapshot.RepresentativePlayerBehavior)
                 .Add("writeLeaseActive", snapshot.WriteLeaseActive)
-                .Add("leaseState", snapshot.LeaseState);
+                .Add("leaseState", snapshot.LeaseState)
+                .Add("leaseExpiresUtc", snapshot.LeaseExpiresUtc?.ToString("o",
+                    System.Globalization.CultureInfo.InvariantCulture) ?? "none");
+        }
+
+        internal static BridgeResult AddSessionContext(BridgeResult result, BridgeRuntimeStateSnapshot snapshot) =>
+            AddSessionContext(result, snapshot.Context);
+
+        private static BridgeRuntimeStateSnapshot CaptureStateSnapshot()
+        {
+            lock (Gate)
+            {
+                BridgeSessionContextSnapshot context = Authorization.Snapshot();
+                TransportState current = Volatile.Read(ref transportState);
+                return new BridgeRuntimeStateSnapshot(
+                    Interlocked.Read(ref stateVersion),
+                    current != null && active,
+                    current != null && active && transportReady,
+                    current == null ? 0 : current.Generation,
+                    current == null ? 0 : Math.Max(0, Volatile.Read(ref current.ActiveClients)),
+                    Settings.ConnectedClientLimit,
+                    Volatile.Read(ref port),
+                    current?.Token ?? string.Empty,
+                    context);
+            }
+        }
+
+        private static void MarkStateDirty()
+        {
+            Interlocked.Increment(ref stateVersion);
+            Interlocked.Exchange(ref stateDirty, 1);
+        }
+
+        private static void PublishStateIfDirty(bool force = false, string extra = null)
+        {
+            AssertMainThread("bridge state publication");
+            if (!force && Interlocked.Exchange(ref stateDirty, 0) == 0) return;
+            Interlocked.Exchange(ref stateDirty, 0);
+            BridgeRuntimeStateSnapshot snapshot = CaptureStateSnapshot();
+            ScheduleLeaseExpiry(snapshot);
+            BridgeIndicator.Refresh(snapshot, Settings.ShowBridgeIndicator, Settings.BridgeIndicatorCorner);
+            string state = snapshot.TransportActive ?
+                (snapshot.TransportReady ? "ON" : "ACTIVATING") : "DORMANT";
+            if (!WriteStatus(snapshot, state, extra)) Interlocked.Exchange(ref stateDirty, 1);
         }
 
         internal static void Bootstrap(string modRoot, long constructionStart, long managedBefore)
@@ -136,7 +183,8 @@ namespace RimWorldDevBridge
             UnityEngine.Application.quitting += Shutdown;
             StartDormantWatcher();
             bootstrapMs = BridgeTiming.Milliseconds(constructionStart);
-            WriteStatus("DORMANT");
+            MarkStateDirty();
+            PublishStateIfDirty(true);
             bootstrapMs = BridgeTiming.Milliseconds(constructionStart);
             bootstrapManagedDeltaBytes = GC.GetTotalMemory(false) - managedBefore;
         }
@@ -155,7 +203,8 @@ namespace RimWorldDevBridge
             if (File.Exists(BridgePaths.InputPath)) InputSignal.Signal();
             BridgeEventJournal.Record("lifecycle", "game finalized session:" + identity.SessionId);
             finalizeInitMs = BridgeTiming.Milliseconds(start);
-            WriteStatus(active ? (transportReady ? "ON" : "ACTIVATING") : "DORMANT");
+            MarkStateDirty();
+            PublishStateIfDirty(true);
         }
 
         public static void OnRootUpdate()
@@ -163,7 +212,10 @@ namespace RimWorldDevBridge
             MainThread.AdoptOwnerThread();
             AssertMainThread("root update");
             ProcessPendingFileSignals();
-            RefreshIndicator();
+            long scheduledLeaseExpiry = Interlocked.Read(ref leaseExpiryTicks);
+            if (scheduledLeaseExpiry != 0 && scheduledLeaseExpiry <= DateTime.UtcNow.Ticks)
+                MarkStateDirty();
+            PublishStateIfDirty();
             if (!active)
             {
                 // Lifecycle publication must still run while transport is inactive. Keep this
@@ -188,7 +240,8 @@ namespace RimWorldDevBridge
                 }
                 transportReady = true;
                 activationMs = activationStartTicks == 0 ? 0d : BridgeTiming.Milliseconds(activationStartTicks);
-                WriteStatus("ON");
+                MarkStateDirty();
+                PublishStateIfDirty(true);
             }
             if (legacyInputPending)
             {
@@ -222,6 +275,7 @@ namespace RimWorldDevBridge
                 Authorization.RotateSession(nextSession);
                 BridgeQuerySnapshotStore.RotateSession();
                 Scheduler.RotateSession(nextSession);
+                MarkStateDirty();
             }
             // Serialize removal with any in-flight status write. If a new generation was already
             // activated, its status publication owns the path and must not be deleted by this stale
@@ -234,6 +288,7 @@ namespace RimWorldDevBridge
             // generation. Close only the detached resources, outside Gate, to keep the worker prefix
             // from holding lifecycle locks while sockets/timers are being disposed.
             CloseTransportResources(staleTransport);
+            CancelLeaseExpiryTimer();
 
             // The Game object is intentionally not captured. The callback is sequence/session bound
             // so an older transition cannot publish state after a newer transition or finalization.
@@ -260,9 +315,9 @@ namespace RimWorldDevBridge
                 Interlocked.Exchange(ref publishedGameTransitionSequence, sequence);
                 BridgeEventJournal.Record("lifecycle", (enteringMenu ? "main menu" : "game changing") +
                     " sequence:" + sequence);
-                RefreshIndicator();
-                WriteStatus("DORMANT");
+                MarkStateDirty();
             }
+            PublishStateIfDirty(true);
         }
 
         internal static int DrainMainThreadForTests()
@@ -293,21 +348,48 @@ namespace RimWorldDevBridge
         internal static BridgeResult AcquireWriteLease(string context)
         {
             BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled);
-            RefreshIndicator();
+            if (result.IsSuccess)
+            {
+                MarkStateDirty();
+                PublishStateIfDirty(true);
+            }
+            return result;
+        }
+
+        internal static BridgeResult RenewWriteLease(string leaseToken)
+        {
+            BridgeResult result = Authorization.Renew(leaseToken, Settings.RemoteMutationEnabled);
+            if (result.IsSuccess)
+            {
+                MarkStateDirty();
+                PublishStateIfDirty(true);
+            }
+            return result;
+        }
+
+        internal static BridgeResult RevokeWriteLease(string leaseToken)
+        {
+            BridgeResult result = Authorization.Revoke(leaseToken);
+            if (result.IsSuccess)
+            {
+                MarkStateDirty();
+                PublishStateIfDirty(true);
+            }
             return result;
         }
 
         internal static void RefreshIndicator()
         {
             AssertMainThread("bridge indicator refresh");
-            BridgeIndicator.Refresh(active, ActiveClients, Settings.ConnectedClientLimit,
-                SessionContext, Settings.ShowBridgeIndicator, Settings.BridgeIndicatorCorner);
+            MarkStateDirty();
+            PublishStateIfDirty(true);
         }
 
         internal static void RefreshStatus()
         {
             AssertMainThread("status refresh");
-            WriteStatus(active ? (transportReady ? "ON" : "ACTIVATING") : "DORMANT");
+            MarkStateDirty();
+            PublishStateIfDirty(true);
         }
 
         internal static void ApplySchedulerSettings()
@@ -331,6 +413,79 @@ namespace RimWorldDevBridge
 
         private static BridgeSettings Settings => RimWorldDevBridgeMod.Settings ?? new BridgeSettings();
 
+        private static void ScheduleLeaseExpiry(BridgeRuntimeStateSnapshot snapshot)
+        {
+            BridgeSessionContextSnapshot context = snapshot.Context;
+            if (!context.WriteLeaseActive || !context.LeaseExpiresUtc.HasValue)
+            {
+                CancelLeaseExpiryTimer();
+                return;
+            }
+            long expiry = context.LeaseExpiresUtc.Value.Ticks;
+            lock (LeaseTimerGate)
+            {
+                if (leaseExpiryTimer != null && leaseExpiryTicks == expiry &&
+                    string.Equals(leaseExpirySession, context.SessionId, StringComparison.Ordinal)) return;
+                Timer previous = leaseExpiryTimer;
+                leaseExpiryTimer = null;
+                leaseExpiryTicks = expiry;
+                leaseExpirySession = context.SessionId;
+                previous?.Dispose();
+                long remainingTicks = expiry - DateTime.UtcNow.Ticks;
+                int dueMs = remainingTicks <= 0 ? 1 :
+                    (int)Math.Min(int.MaxValue, Math.Max(1d,
+                        TimeSpan.FromTicks(remainingTicks).TotalMilliseconds));
+                string session = context.SessionId;
+                long version = snapshot.Version;
+                int generation = snapshot.TransportGeneration;
+                leaseExpiryTimer = new Timer(_ => OnLeaseExpiry(session, expiry, version, generation), null, dueMs,
+                    Timeout.Infinite);
+            }
+        }
+
+        private static void OnLeaseExpiry(string session, long expiryTicks, long version, int generation)
+        {
+            if (shuttingDown) return;
+            try
+            {
+                MainThread.Post(_ =>
+                {
+                    if (shuttingDown) return;
+                    BridgeRuntimeStateSnapshot snapshot = CaptureStateSnapshot();
+                    if (snapshot.Version != version || snapshot.TransportGeneration != generation)
+                    {
+                        ScheduleLeaseExpiry(snapshot);
+                        return;
+                    }
+                    BridgeSessionContextSnapshot context = snapshot.Context;
+                    if (context.WriteLeaseActive && context.LeaseExpiresUtc.HasValue &&
+                        string.Equals(context.SessionId, session, StringComparison.Ordinal) &&
+                        context.LeaseExpiresUtc.Value.Ticks == expiryTicks &&
+                        context.LeaseExpiresUtc.Value > DateTime.UtcNow)
+                    {
+                        ScheduleLeaseExpiry(snapshot);
+                        return;
+                    }
+                    MarkStateDirty();
+                    PublishStateIfDirty(true);
+                }, null);
+            }
+            catch { }
+        }
+
+        private static void CancelLeaseExpiryTimer()
+        {
+            Timer previous;
+            lock (LeaseTimerGate)
+            {
+                previous = leaseExpiryTimer;
+                leaseExpiryTimer = null;
+                leaseExpiryTicks = 0;
+                leaseExpirySession = null;
+            }
+            try { previous?.Dispose(); } catch { }
+        }
+
         private static void RotateSession(string prefix)
         {
             AssertMainThread("session rotation");
@@ -344,9 +499,11 @@ namespace RimWorldDevBridge
                 Scheduler.Configure(MainThread, next, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
                 Scheduler.RotateSession(next);
                 identity = new SessionIdentity(next, string.Empty);
+                MarkStateDirty();
             }
             CloseTransportResources(stale);
-            RefreshIndicator();
+            CancelLeaseExpiryTimer();
+            PublishStateIfDirty(true);
         }
 
         private static void StartDormantWatcher()
@@ -387,6 +544,10 @@ namespace RimWorldDevBridge
         private static void StartTransport()
         {
             AssertMainThread("transport activation");
+            TransportState stale = null;
+            TransportState failedToClose = null;
+            string activationError = null;
+            bool started = false;
             lock (Gate)
             {
                 if (shuttingDown) return;
@@ -396,8 +557,7 @@ namespace RimWorldDevBridge
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
                     return;
                 }
-                TransportState stale = DetachTransportLocked();
-                CloseTransportResources(stale);
+                stale = DetachTransportLocked();
                 try
                 {
                     SessionIdentity currentIdentity = identity;
@@ -422,16 +582,19 @@ namespace RimWorldDevBridge
                     };
                     listenerThread.Start();
                     next.IdleTimer = new Timer(_ => CheckIdle(next), null, 10000, 10000);
-                    RefreshIndicator();
-                    WriteStatus("ACTIVATING");
+                    MarkStateDirty();
+                    started = true;
                 }
                 catch (Exception exception)
                 {
-                    TransportState failed = DetachTransportLocked();
-                    CloseTransportResources(failed);
-                    WriteStatus("DORMANT", "activationError=" + BridgeText.Clean(exception.GetBaseException().Message));
+                    failedToClose = DetachTransportLocked();
+                    activationError = "activationError=" + BridgeText.Clean(exception.GetBaseException().Message);
+                    MarkStateDirty();
                 }
             }
+            CloseTransportResources(stale);
+            CloseTransportResources(failedToClose);
+            if (started || activationError != null) PublishStateIfDirty(true, activationError);
         }
 
         private static void StopTransport(bool writeDormant, TransportState expectedState = null)
@@ -446,13 +609,15 @@ namespace RimWorldDevBridge
                 detachedGeneration = Volatile.Read(ref transportGeneration);
             }
             CloseTransportResources(stale);
+            bool publish = false;
             lock (Gate)
             {
                 if (detachedGeneration != Volatile.Read(ref transportGeneration) ||
                     transportState != null || active) return;
-                RefreshIndicator();
-                if (writeDormant && !shuttingDown) WriteStatus("DORMANT");
+                MarkStateDirty();
+                publish = true;
             }
+            if (publish) PublishStateIfDirty(true);
         }
 
         private static void EnsureUpdatePatch()
@@ -656,7 +821,11 @@ namespace RimWorldDevBridge
             {
                 MainThread.Post(_ =>
                 {
-                    if (!shuttingDown && IsCurrentTransport(state)) RefreshIndicator();
+                    if (!shuttingDown && IsCurrentTransport(state))
+                    {
+                        MarkStateDirty();
+                        PublishStateIfDirty();
+                    }
                 }, null);
             }
             catch { }
@@ -880,6 +1049,7 @@ namespace RimWorldDevBridge
             Interlocked.Increment(ref transportGeneration);
             SessionIdentity current = identity;
             identity = new SessionIdentity(current.SessionId, string.Empty);
+            MarkStateDirty();
             return stale;
         }
 
@@ -901,7 +1071,10 @@ namespace RimWorldDevBridge
         {
             if (state == null || client == null) return;
             if (state.Clients.TryRemove(client, out _))
+            {
                 Interlocked.Decrement(ref state.ActiveClients);
+                if (ReferenceEquals(Volatile.Read(ref transportState), state)) MarkStateDirty();
+            }
             try { client.Close(); } catch { }
         }
 
@@ -990,13 +1163,14 @@ namespace RimWorldDevBridge
             catch { try { client?.Close(); } catch { } }
         }
 
-        private static void WriteStatus(string state, string extra = null)
+        private static bool WriteStatus(BridgeRuntimeStateSnapshot snapshot, string state, string extra = null)
         {
             AssertMainThread("status write");
             lock (StatusGate)
             {
+                if (snapshot.Version != Interlocked.Read(ref stateVersion)) return false;
                 long writeStart = Stopwatch.GetTimestamp();
-                BridgeSessionContextSnapshot context = SessionContext;
+                BridgeSessionContextSnapshot context = snapshot.Context;
                 List<string> lines = new List<string>
                 {
                     "bridge=" + state,
@@ -1006,17 +1180,20 @@ namespace RimWorldDevBridge
                     "schema=" + BridgeProtocol.CoreSchema,
                     "processId=" + Process.GetCurrentProcess().Id,
                     "bootId=" + BootId,
-                    "session=" + context.SessionId,
-                    "transport=" + (active ? "tcp+file" : "wake-file"),
+                    "session=" + snapshot.Context.SessionId,
+                    "transport=" + (snapshot.TransportActive ? "tcp+file" : "wake-file"),
                     "host=127.0.0.1",
-                    "port=" + port,
-                    "token=" + identity.Token,
-                    "clients=" + ActiveClients + "/" + Settings.ConnectedClientLimit,
+                    "port=" + snapshot.Port,
+                    "token=" + snapshot.TransportToken,
+                    "clients=" + snapshot.ConnectedClients + "/" + snapshot.ConnectedClientLimit,
                     "context=" + context.WriteContext,
                     "writeContext=" + context.WriteContext,
                     "representativePlayerBehavior=" + context.RepresentativePlayerBehavior,
                     "writeLeaseActive=" + context.WriteLeaseActive,
                     "leaseState=" + context.LeaseState,
+                    "leaseExpiresUtc=" + (context.LeaseExpiresUtc?.ToString("o",
+                        System.Globalization.CultureInfo.InvariantCulture) ?? "none"),
+                    "transportGeneration=" + snapshot.TransportGeneration,
                     "bootstrapMs=" + bootstrapMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                     "harmonyMs=" + harmonyMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                     "finalizeInitMs=" + finalizeInitMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
@@ -1028,21 +1205,29 @@ namespace RimWorldDevBridge
                     "output=" + BridgePaths.OutputPath
                 };
                 if (!string.IsNullOrEmpty(extra)) lines.Add(extra);
-                AtomicWrite(BridgePaths.StatusPath, string.Join("\n", lines));
+                if (!AtomicWrite(BridgePaths.StatusPath, string.Join("\n", lines))) return false;
                 statusWriteMs = BridgeTiming.Milliseconds(writeStart);
+                Interlocked.Increment(ref statusWriteCount);
+                return true;
             }
         }
 
-        private static void AtomicWrite(string path, string content)
+        private static bool AtomicWrite(string path, string content)
         {
+            string temp = null;
             try
             {
-                string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(temp, content, new UTF8Encoding(false));
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(temp, path);
+                if (File.Exists(path)) File.Replace(temp, path, null, true);
+                else File.Move(temp, path);
+                return true;
             }
-            catch { }
+            catch
+            {
+                try { if (!string.IsNullOrEmpty(temp) && File.Exists(temp)) File.Delete(temp); } catch { }
+                return false;
+            }
         }
 
         private static void TryDelete(string path)
@@ -1053,6 +1238,34 @@ namespace RimWorldDevBridge
         private static void AssertMainThread(string operation)
         {
             MainThread.AssertOwnerThread(operation);
+        }
+
+        internal sealed class BridgeRuntimeStateSnapshot
+        {
+            internal readonly long Version;
+            internal readonly bool TransportActive;
+            internal readonly bool TransportReady;
+            internal readonly int TransportGeneration;
+            internal readonly int ConnectedClients;
+            internal readonly int ConnectedClientLimit;
+            internal readonly int Port;
+            internal readonly string TransportToken;
+            internal readonly BridgeSessionContextSnapshot Context;
+
+            internal BridgeRuntimeStateSnapshot(long version, bool transportActive, bool transportReady,
+                int transportGeneration, int connectedClients, int connectedClientLimit, int port,
+                string transportToken, BridgeSessionContextSnapshot context)
+            {
+                Version = version;
+                TransportActive = transportActive;
+                TransportReady = transportReady;
+                TransportGeneration = transportGeneration;
+                ConnectedClients = connectedClients;
+                ConnectedClientLimit = connectedClientLimit;
+                Port = port;
+                TransportToken = transportToken ?? string.Empty;
+                Context = context;
+            }
         }
 
         private sealed class TransportState
