@@ -39,7 +39,10 @@ and a bounded audit under RimWorld user data.
 
 1. Run `SYNC`.
 2. Start with `STATUS`, `MAP_SUMMARY`, `CODEX`, `AQUACULTURE`, or another adapter summary.
-3. Use paged narrow reads such as `THINGS "filter=...&limit=50"`; follow the returned cursor.
+3. Use paged narrow reads such as `THINGS "filter=...&limit=50"`; follow the returned cursor. `PAWNS`,
+   `THINGS`, and `JOBS` cursors are versioned immutable snapshots bound to the session, map, filter,
+   fields, and stable `thingId` ordering. They expire after bounded retention and reject old offset
+   cursors with `snapshot_cursor_required`; other paged commands retain the legacy cursor behavior.
 4. Use `BATCH "STATUS;SELECTED;UI_STATE"` to reduce round trips.
 5. Run `RELOAD_HOT_ADAPTERS` after publishing a new adapter generation.
 6. Use `ADAPTER_HEALTH`, `SCHEDULER_METRICS`, `COMMAND_METRICS`, and `PERFORMANCE` for evidence.
@@ -47,6 +50,14 @@ and a bounded audit under RimWorld user data.
 Multiple clients have isolated request IDs and responses. RimWorld/Unity access is serialized on
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit
 override. A timed-out or disconnected queued request is cancelled before execution.
+
+The game shows a small runtime-only bridge indicator whenever transport is active or a write lease
+exists. Read-only, sandbox, and live-confirmed states are distinct; live-confirmed write access is
+forced visible even if the optional idle read-only display is disabled. The indicator includes client
+count and lease context/expiry in its details and tooltip. `PAWNS`, `THINGS`, and `JOBS` use
+cooperative bounded steps; legacy synchronous adapters remain compatible but are measured as
+non-cooperative and can be quarantined after a serious overrun. Adapter authors can opt into the
+versioned `cooperative-v1` provider contract without changing existing synchronous adapters.
 
 ## Launch And Test
 
@@ -78,6 +89,17 @@ dotnet build "DevTools\CompatibilityHarness\CompatibilityHarness.csproj" -c Rele
 & "DevTools\Test-RimWorldLauncher.ps1"
 ```
 
+Create and verify the distributable package with:
+
+```powershell
+& "DevTools\Package-RimWorldDevBridge.ps1" -Build -OutputDirectory "Release"
+& "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.1.0.zip"
+```
+
+Packaging stages only files RimWorld loads: `About`, `LoadFolders.xml`, `BRIDGE_MANIFEST.txt`,
+the 1.6 core assembly, and validated current file adapters. It excludes harness/build output,
+game/Unity/Harmony reference assemblies, development scripts, and loaded-only adapter manifests.
+
 ## Feature Tests
 
 Queue a compact typed suite for the next game or current session:
@@ -104,9 +126,10 @@ Activation indexes only `*.manifest.json` sidecars off-thread. It never loads a 
 metadata and never scans all AppDomain types. The newest compatible generation per stable adapter ID
 becomes active; its exact provider type loads only when one of its commands is requested.
 
-Current stable adapters are `AquacultureFishing`, `Flockmaster`, `HorticultureNovelSeeds`, and
-`Wildlife`. Wildlife uses an explicit loaded-assembly manifest; its colliding legacy `PERFORMANCE`
-command is exposed as `WILDLIFE_PERFORMANCE`.
+Current distributable file adapters are `AquacultureFishing`, `Flockmaster`,
+`HorticultureNovelSeeds`, `KnowledgeFramework`, and `lan.deferredreality.framework`. `Wildlife`
+remains a loaded-assembly integration and is intentionally not redistributed; its colliding legacy
+`PERFORMANCE` command is exposed as `WILDLIFE_PERFORMANCE` when its external package is loaded.
 
 Publish adapters with `DevTools\Publish-RimWorldBridgeAdapter.ps1`. Publication writes a uniquely
 named DLL first and atomically publishes its manifest last, so partial generations are ignored.

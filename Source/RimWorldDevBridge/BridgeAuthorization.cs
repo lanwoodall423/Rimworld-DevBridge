@@ -17,16 +17,34 @@ namespace RimWorldDevBridge
         private readonly Dictionary<string, CachedWrite> completed = new Dictionary<string, CachedWrite>(StringComparer.Ordinal);
         private readonly Queue<string> completionOrder = new Queue<string>();
         private string sessionId;
-        private string context = "unknown";
 
-        internal string Context { get { lock (gate) return context; } }
+        internal string Context => Snapshot().WriteContext;
+
+        internal BridgeSessionContextSnapshot Snapshot()
+        {
+            lock (gate)
+            {
+                DateTime now = DateTime.UtcNow;
+                RemoveExpired(now);
+                WriteLease effective = leases.Values.Where(item => item.ExpiresUtc > now &&
+                    item.Context == "live-confirmed").OrderByDescending(item => item.AcquiredUtc).FirstOrDefault();
+                if (effective == null)
+                    effective = leases.Values.Where(item => item.ExpiresUtc > now && item.Context == "sandbox")
+                        .OrderByDescending(item => item.AcquiredUtc).FirstOrDefault();
+                if (effective == null)
+                    return new BridgeSessionContextSnapshot(sessionId ?? "unknown", "none", false, false,
+                        "none", null);
+                bool representative = effective.Context == "live-confirmed";
+                return new BridgeSessionContextSnapshot(effective.SessionId, effective.Context, representative,
+                    true, effective.Context, effective.ExpiresUtc);
+            }
+        }
 
         internal void RotateSession(string newSessionId)
         {
             lock (gate)
             {
                 sessionId = newSessionId;
-                context = "unknown";
                 leases.Clear();
                 completed.Clear();
                 completionOrder.Clear();
@@ -45,16 +63,17 @@ namespace RimWorldDevBridge
             WriteLease lease;
             lock (gate)
             {
+                DateTime now = DateTime.UtcNow;
                 lease = new WriteLease
                 {
                     Token = Guid.NewGuid().ToString("N"),
                     SessionId = sessionId,
                     Context = normalized,
-                    ExpiresUtc = DateTime.UtcNow.AddSeconds(LeaseSeconds)
+                    AcquiredUtc = now,
+                    ExpiresUtc = now.AddSeconds(LeaseSeconds)
                 };
-                context = normalized;
                 leases[lease.Token] = lease;
-                RemoveExpired();
+                RemoveExpired(now);
             }
             return BridgeResult.Ok("core.writeLease")
                 .Add("lease", lease.Token)
@@ -126,24 +145,26 @@ namespace RimWorldDevBridge
         internal void Audit(BridgeRequest request, BridgeResult result)
         {
             if (request?.Mode == BridgeCommandMode.PureRead) return;
+            string userRoot = BridgePaths.UserRoot;
+            string auditPath = BridgePaths.AuditPath;
             string line = DateTime.UtcNow.ToString("o") + "|session=" + BridgeText.Clean(request.SessionId) +
                 "|request=" + BridgeText.Clean(request.RequestId) + "|command=" +
                 BridgeText.Clean(request.Command) + "|mode=" + request.Mode + "|status=" +
                 (result?.Status.ToString() ?? "ERROR") + "|idempotency=" +
                 BridgeText.Clean(request.IdempotencyKey) + "|mutation=" +
                 BridgeText.Clean(result?.MutationSummary);
-            ThreadPool.QueueUserWorkItem(_ => WriteAudit(line));
+            ThreadPool.QueueUserWorkItem(_ => WriteAudit(line, userRoot, auditPath));
         }
 
-        private void WriteAudit(string line)
+        private void WriteAudit(string line, string userRoot, string auditPath)
         {
             try
             {
                 lock (auditGate)
                 {
-                    Directory.CreateDirectory(BridgePaths.UserRoot);
-                    RotateAuditIfNeeded();
-                    File.AppendAllLines(BridgePaths.AuditPath, new[] { line });
+                    Directory.CreateDirectory(userRoot);
+                    RotateAuditIfNeeded(auditPath);
+                    File.AppendAllLines(auditPath, new[] { line });
                 }
             }
             catch { }
@@ -151,16 +172,21 @@ namespace RimWorldDevBridge
 
         private void RemoveExpired()
         {
-            foreach (string key in leases.Where(pair => pair.Value.ExpiresUtc <= DateTime.UtcNow)
+            RemoveExpired(DateTime.UtcNow);
+        }
+
+        private void RemoveExpired(DateTime now)
+        {
+            foreach (string key in leases.Where(pair => pair.Value.ExpiresUtc <= now)
                 .Select(pair => pair.Key).ToList()) leases.Remove(key);
         }
 
-        private static void RotateAuditIfNeeded()
+        private static void RotateAuditIfNeeded(string auditPath)
         {
-            if (!File.Exists(BridgePaths.AuditPath) || new FileInfo(BridgePaths.AuditPath).Length < AuditLimitBytes) return;
-            string previous = BridgePaths.AuditPath + ".previous";
+            if (!File.Exists(auditPath) || new FileInfo(auditPath).Length < AuditLimitBytes) return;
+            string previous = auditPath + ".previous";
             if (File.Exists(previous)) File.Delete(previous);
-            File.Move(BridgePaths.AuditPath, previous);
+            File.Move(auditPath, previous);
         }
 
         private sealed class WriteLease
@@ -168,6 +194,7 @@ namespace RimWorldDevBridge
             internal string Token;
             internal string SessionId;
             internal string Context;
+            internal DateTime AcquiredUtc;
             internal DateTime ExpiresUtc;
         }
 
@@ -176,6 +203,28 @@ namespace RimWorldDevBridge
             internal string Command;
             internal string Argument;
             internal BridgeResult Result;
+        }
+    }
+
+    internal sealed class BridgeSessionContextSnapshot
+    {
+        internal readonly string SessionId;
+        internal readonly string WriteContext;
+        internal readonly bool RepresentativePlayerBehavior;
+        internal readonly bool WriteLeaseActive;
+        internal readonly string LeaseState;
+        internal readonly DateTime? LeaseExpiresUtc;
+
+        internal BridgeSessionContextSnapshot(string sessionId, string writeContext,
+            bool representativePlayerBehavior, bool writeLeaseActive, string leaseState,
+            DateTime? leaseExpiresUtc)
+        {
+            SessionId = sessionId;
+            WriteContext = writeContext;
+            RepresentativePlayerBehavior = representativePlayerBehavior;
+            WriteLeaseActive = writeLeaseActive;
+            LeaseState = leaseState;
+            LeaseExpiresUtc = leaseExpiresUtc;
         }
     }
 
@@ -198,6 +247,11 @@ namespace RimWorldDevBridge
                 QueueDelayMs = source.QueueDelayMs,
                 PreparationMs = source.PreparationMs,
                 ExecutionMs = source.ExecutionMs,
+                MainThreadBudgetMs = source.MainThreadBudgetMs,
+                MainThreadOverrun = source.MainThreadOverrun,
+                MaxMainThreadStepMs = source.MaxMainThreadStepMs,
+                CooperativeSteps = source.CooperativeSteps,
+                NonCooperativeExecution = source.NonCooperativeExecution,
                 TickBefore = source.TickBefore,
                 TickAfter = source.TickAfter,
                 Truncated = source.Truncated,

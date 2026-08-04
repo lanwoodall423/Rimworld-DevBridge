@@ -16,6 +16,7 @@ namespace RimWorldDevBridge
     internal static class BridgeAdapterCatalog
     {
         private const int CircuitBreakFailures = 3;
+        private const double LegacySeriousOverrunMs = 250d;
         private static readonly object Gate = new object();
         private static readonly Dictionary<string, AdapterGeneration> Active =
             new Dictionary<string, AdapterGeneration>(StringComparer.OrdinalIgnoreCase);
@@ -218,7 +219,30 @@ namespace RimWorldDevBridge
                 EnsureLoaded(generation);
                 long start = Stopwatch.GetTimestamp();
                 BridgeResult result;
-                if (generation.TypedProvider != null)
+                bool cooperative = generation.TypedProvider is IBridgeCooperativeAdapterProvider &&
+                    string.Equals(generation.Manifest.executionContract, "cooperative-v1",
+                        StringComparison.OrdinalIgnoreCase);
+                if (cooperative)
+                {
+                    IBridgeCooperativeAdapterExecution execution = context.Request.CooperativeState as
+                        IBridgeCooperativeAdapterExecution;
+                    if (execution == null)
+                    {
+                        execution = ((IBridgeCooperativeAdapterProvider)generation.TypedProvider)
+                            .BeginCooperativeExecution(context);
+                        if (execution == null) throw new InvalidOperationException(
+                            "Cooperative adapter returned no execution state.");
+                        context.Request.CooperativeState = execution;
+                    }
+                    result = execution.Step(context);
+                    if (!execution.IsComplete)
+                    {
+                        context.Request.YieldExecution = true;
+                        return null;
+                    }
+                    context.Request.CooperativeState = null;
+                }
+                else if (generation.TypedProvider != null)
                 {
                     result = generation.TypedProvider.Execute(context);
                 }
@@ -233,19 +257,32 @@ namespace RimWorldDevBridge
                     if (context.Request.Mode != BridgeCommandMode.PureRead &&
                         string.Equals(result.MutationSummary, "none", StringComparison.Ordinal))
                         result.MutationSummary = "legacy adapter command completed; no detailed mutation summary supplied";
+                    result.NonCooperativeExecution = true;
                 }
                 double elapsed = BridgeTiming.Milliseconds(start);
+                double totalElapsed = context.Request.CooperativeExecutionMs + elapsed;
+                result.ExecutionMs = totalElapsed;
                 lock (Gate)
                 {
                     generation.InvocationCount++;
-                    generation.TotalExecutionMs += elapsed;
-                    generation.LastExecutionMs = elapsed;
+                    generation.TotalExecutionMs += totalElapsed;
+                    generation.LastExecutionMs = totalElapsed;
                     generation.LastStatus = result.Status;
+                    if (result.NonCooperativeExecution && totalElapsed >= LegacySeriousOverrunMs)
+                    {
+                        generation.SeriousOverruns++;
+                        generation.State = "quarantined";
+                        generation.QuarantinedUntilUtc = DateTime.UtcNow.AddMinutes(2);
+                        generation.LastFailure = "non-cooperative overrun";
+                    }
                     if (result.IsSuccess)
                     {
-                        generation.ConsecutiveFailures = 0;
-                        generation.LastFailure = null;
-                        generation.State = "loaded";
+                        if (generation.QuarantinedUntilUtc <= DateTime.UtcNow)
+                        {
+                            generation.ConsecutiveFailures = 0;
+                            generation.LastFailure = null;
+                            generation.State = "loaded";
+                        }
                     }
                     else
                     {
@@ -258,6 +295,12 @@ namespace RimWorldDevBridge
                             generation.QuarantinedUntilUtc = DateTime.UtcNow.AddMinutes(2);
                         }
                     }
+                }
+                if (result.NonCooperativeExecution)
+                {
+                    result.Warn("legacy adapter execution is synchronous and non-cooperative");
+                    if (totalElapsed >= LegacySeriousOverrunMs)
+                        result.Warn("legacy adapter circuit opened after serious overrun");
                 }
                 if (elapsed >= 50d) result.Warn("slow adapter command: " + elapsed.ToString("0.###") + " ms");
                 return result;
@@ -314,7 +357,10 @@ namespace RimWorldDevBridge
                         item.FailureCount + " lastMs:" + item.LastExecutionMs.ToString("0.###") + " reason:" +
                         BridgeText.Clean(item.Reason ?? item.LastFailure ?? "none") + " loadMs:" +
                         item.LoadMs.ToString("0.###") + " verification:" +
-                        BridgeText.Clean(item.Verification ?? "manifest-only"));
+                        BridgeText.Clean(item.Verification ?? "manifest-only") + " contract:" +
+                        (string.Equals(item.Manifest.executionContract, "cooperative-v1", StringComparison.OrdinalIgnoreCase)
+                            ? "cooperative-v1" : "legacy-sync-non-cooperative") + " seriousOverruns:" +
+                        item.SeriousOverruns);
                 }
                 foreach (string error in IndexErrors.Take(20)) result.Warn(error);
                 int threshold = RimWorldDevBridgeMod.Settings?.RetainedAdapterRestartThreshold ?? 8;
@@ -383,7 +429,7 @@ namespace RimWorldDevBridge
                 state = errors.Count > 0 ? "ready-with-errors" : "ready";
                 indexing = false;
             }
-            if (refreshStatus) BridgeRuntime.RefreshStatus();
+            if (refreshStatus) BridgeRuntime.PostToMainThread(BridgeRuntime.RefreshStatus);
         }
 
         private static AdapterManifest ReadManifest(string path)
@@ -662,7 +708,11 @@ namespace RimWorldDevBridge
                 ArgumentSchema = command.argumentSchema ?? "legacy:string",
                 ResultSchema = command.resultSchema ?? "legacy:lines",
                 SchemaVersion = command.schemaVersion <= 0 ? 1 : command.schemaVersion,
-                MinimumExecutionBudgetMs = command.minimumExecutionBudgetMs <= 0 ? 25 : command.minimumExecutionBudgetMs
+                MinimumExecutionBudgetMs = command.minimumExecutionBudgetMs <= 0 ? 25 : command.minimumExecutionBudgetMs,
+                Cooperative = string.Equals(generation.Manifest.executionContract, "cooperative-v1",
+                    StringComparison.OrdinalIgnoreCase),
+                NonCooperative = !string.Equals(generation.Manifest.executionContract, "cooperative-v1",
+                    StringComparison.OrdinalIgnoreCase)
             };
         }
 
@@ -680,6 +730,15 @@ namespace RimWorldDevBridge
             if (!string.Equals(metadata.Id, generation.Manifest.adapterId, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(metadata.Version, generation.Manifest.version, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("Typed adapter metadata does not match its manifest.");
+            if (string.Equals(generation.Manifest.executionContract, "cooperative-v1",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                IBridgeCooperativeAdapterProvider cooperative = generation.TypedProvider as
+                    IBridgeCooperativeAdapterProvider;
+                if (cooperative == null || !string.Equals(cooperative.ExecutionContract, "cooperative-v1",
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Manifest requests cooperative-v1 but provider does not implement it.");
+            }
             Dictionary<string, BridgeCommandDescriptor> declared = (generation.TypedProvider.Commands ??
                 Enumerable.Empty<BridgeCommandDescriptor>()).Where(item => item != null)
                 .ToDictionary(item => BridgeText.NormalizeCommand(item.Name), StringComparer.OrdinalIgnoreCase);
@@ -797,6 +856,7 @@ namespace RimWorldDevBridge
             internal string Verification;
             internal DateTime QuarantinedUntilUtc;
             internal bool RetainedOnly;
+            internal long SeriousOverruns;
 
             internal void CopyRuntime(AdapterGeneration previous)
             {
@@ -815,6 +875,7 @@ namespace RimWorldDevBridge
                 LastFailure = previous.LastFailure;
                 Verification = previous.Verification;
                 QuarantinedUntilUtc = previous.QuarantinedUntilUtc;
+                SeriousOverruns = previous.SeriousOverruns;
                 if (Assembly != null) State = "loaded";
             }
         }
@@ -844,6 +905,7 @@ namespace RimWorldDevBridge
         [DataMember(Order = 19)] public string modulePackageId;
         [DataMember(Order = 20)] public string moduleRelativePath;
         [DataMember(Order = 21)] public string moduleMvid;
+        [DataMember(Order = 22)] public string executionContract;
     }
 
     [DataContract]

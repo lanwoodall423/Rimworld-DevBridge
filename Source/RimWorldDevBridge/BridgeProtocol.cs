@@ -319,13 +319,31 @@ namespace RimWorldDevBridge
         internal int Limit = BridgeProtocol.DefaultPageSize;
         internal int Offset;
         internal string Fields;
+        internal string SnapshotId;
+        internal long SnapshotExpiryTicks;
+        internal string Ordering;
         internal string CursorScope => Filter + "\nfields=" + (Fields ?? string.Empty);
+        internal bool UsesSnapshot => !string.IsNullOrEmpty(Ordering);
+
+        internal static string StableOrdering(string command)
+        {
+            switch (BridgeText.NormalizeCommand(command))
+            {
+                case "PAWNS":
+                case "THINGS":
+                case "JOBS":
+                    return "thingId:asc";
+                default:
+                    return string.Empty;
+            }
+        }
 
         internal static BridgeQuery Parse(string argument, string sessionId, string command,
             out BridgeResult failure)
         {
             failure = null;
             BridgeQuery query = new BridgeQuery();
+            query.Ordering = StableOrdering(command);
             string value = argument ?? string.Empty;
             if (value.IndexOf('=') < 0)
             {
@@ -338,11 +356,24 @@ namespace RimWorldDevBridge
             query.Limit = BridgeProtocol.ParseBoundedInt(BridgeProtocol.Value(options, "limit"),
                 BridgeProtocol.DefaultPageSize, 1, BridgeProtocol.MaxPageSize);
             string cursor = BridgeProtocol.Value(options, "cursor");
-            if (!string.IsNullOrEmpty(cursor) && !BridgeCursor.TryDecode(cursor, sessionId, command,
-                query.CursorScope, out query.Offset))
+            if (!string.IsNullOrEmpty(cursor))
             {
-                failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_cursor");
-                return null;
+                string error;
+                if (query.UsesSnapshot)
+                {
+                    if (!BridgeCursor.TryDecodeSnapshot(cursor, sessionId, command, query.CursorScope,
+                        query.Ordering, out query.SnapshotId, out query.SnapshotExpiryTicks, out query.Offset,
+                        out error))
+                    {
+                        failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, error);
+                        return null;
+                    }
+                }
+                else if (!BridgeCursor.TryDecode(cursor, sessionId, command, query.CursorScope, out query.Offset))
+                {
+                    failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_cursor");
+                    return null;
+                }
             }
             return query;
         }
@@ -353,6 +384,17 @@ namespace RimWorldDevBridge
         internal static string Encode(string session, string command, string filter, int offset)
         {
             string raw = string.Join("\n", EncodePart(session), EncodePart(command), EncodePart(filter),
+                offset.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+
+        internal static string EncodeSnapshot(string session, string command, string scope, string ordering,
+            string snapshotId, long expiryTicks, int offset)
+        {
+            string raw = string.Join("\n", EncodePart("2"), EncodePart(session),
+                EncodePart(BridgeText.NormalizeCommand(command)),
+                EncodePart(scope), EncodePart(ordering), EncodePart(snapshotId),
+                expiryTicks.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 offset.ToString(System.Globalization.CultureInfo.InvariantCulture));
             return Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
         }
@@ -368,6 +410,67 @@ namespace RimWorldDevBridge
                 return parts.Length == 4 && DecodePart(parts[0]) == (session ?? "") &&
                     DecodePart(parts[1]) == (command ?? "") && DecodePart(parts[2]) == (filter ?? "") &&
                     int.TryParse(parts[3], out offset) && offset >= 0;
+            }
+            catch { return false; }
+        }
+
+        internal static bool TryDecodeSnapshot(string cursor, string session, string command, string scope,
+            string ordering, out string snapshotId, out long expiryTicks, out int offset, out string error)
+        {
+            snapshotId = null;
+            expiryTicks = 0;
+            offset = 0;
+            error = "invalid_cursor";
+            try
+            {
+                string value = cursor.Replace('-', '+').Replace('_', '/');
+                value = value.PadRight((value.Length + 3) / 4 * 4, '=');
+                string[] parts = Encoding.UTF8.GetString(Convert.FromBase64String(value)).Split('\n');
+                if (parts.Length == 4)
+                {
+                    error = "snapshot_cursor_required";
+                    return false;
+                }
+                if (parts.Length != 8 || DecodePart(parts[0]) != "2") return false;
+                string cursorSession = DecodePart(parts[1]);
+                if (!string.Equals(cursorSession, session ?? string.Empty, StringComparison.Ordinal))
+                {
+                    error = "cursor_session_mismatch";
+                    return false;
+                }
+                if (!string.Equals(DecodePart(parts[2]), BridgeText.NormalizeCommand(command), StringComparison.Ordinal))
+                {
+                    error = "cursor_query_mismatch";
+                    return false;
+                }
+                if (!string.Equals(DecodePart(parts[3]), scope ?? string.Empty, StringComparison.Ordinal))
+                {
+                    error = "cursor_filter_mismatch";
+                    return false;
+                }
+                if (!string.Equals(DecodePart(parts[4]), ordering ?? string.Empty, StringComparison.Ordinal))
+                {
+                    error = "cursor_order_mismatch";
+                    return false;
+                }
+                snapshotId = DecodePart(parts[5]);
+                if (!Guid.TryParseExact(snapshotId, "N", out _))
+                {
+                    error = "invalid_cursor";
+                    return false;
+                }
+                if (!long.TryParse(parts[6], System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out expiryTicks) || expiryTicks <= 0)
+                    return false;
+                if (new DateTime(expiryTicks, DateTimeKind.Utc) <= DateTime.UtcNow)
+                {
+                    error = "cursor_expired";
+                    return false;
+                }
+                if (!int.TryParse(parts[7], System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out offset) || offset < 0)
+                    return false;
+                return true;
             }
             catch { return false; }
         }

@@ -8,6 +8,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using HarmonyLib;
 using Verse;
 
@@ -22,17 +23,25 @@ namespace RimWorldDevBridge
         private static readonly BridgeScheduler Scheduler = new BridgeScheduler(ExecuteScheduled, CompleteScheduled);
         private static readonly string BootId = Guid.NewGuid().ToString("N");
         private static readonly BridgeMainThreadContext MainThread = new BridgeMainThreadContext();
+        private static readonly BridgeWakeSignal WakeSignal = new BridgeWakeSignal();
+        private static readonly BridgeWakeSignal InputSignal = new BridgeWakeSignal();
         private static readonly Harmony Harmony = new Harmony("lan.rimworld.devbridge.v2");
+        private const string WakeFileName = BridgePaths.Prefix + "Wake.request";
+        private const string InputFileName = BridgePaths.Prefix + "In.txt";
         private static FileSystemWatcher watcher;
         private static TcpListener listener;
         private static Thread listenerThread;
         private static Timer idleTimer;
         private static volatile bool active;
         private static volatile bool transportReady;
-        private static bool activationIndexStarted;
+        private static volatile bool activationIndexStarted;
+        private static volatile bool legacyInputPending;
         private static volatile bool shuttingDown;
         private static bool updatePatched;
         private static int transportGeneration;
+        private static long gameTransitionSequence;
+        private static long publishedGameTransitionSequence;
+        private static int publishedGameTransitionThreadId;
         private static int activeClients;
         private static int port;
         private static volatile SessionIdentity identity =
@@ -47,7 +56,6 @@ namespace RimWorldDevBridge
         private static long bootstrapManagedDeltaBytes;
         private static bool bootstrapped;
 
-        internal static string SessionId => identity.SessionId;
         internal static bool Active => active;
         internal static int ActiveClients => Math.Max(0, Volatile.Read(ref activeClients));
         internal static double BootstrapMs => bootstrapMs;
@@ -55,17 +63,54 @@ namespace RimWorldDevBridge
         internal static double FinalizeInitMs => finalizeInitMs;
         internal static double ActivationMs => activationMs;
         internal static long BootstrapManagedDeltaBytes => bootstrapManagedDeltaBytes;
-        internal static string WriteContext => Authorization.Context;
+        internal static string SessionId => identity.SessionId;
+        internal static BridgeSessionContextSnapshot SessionContext
+        {
+            get
+            {
+                lock (Gate)
+                {
+                    BridgeSessionContextSnapshot authorization = Authorization.Snapshot();
+                    return new BridgeSessionContextSnapshot(identity.SessionId, authorization.WriteContext,
+                        authorization.RepresentativePlayerBehavior, authorization.WriteLeaseActive,
+                        authorization.LeaseState, authorization.LeaseExpiresUtc);
+                }
+            }
+        }
+        internal static string WriteContext => SessionContext.WriteContext;
+        internal static int EffectiveQueueCapacity => Scheduler.QueueCapacity;
+        internal static int EffectiveMainThreadBudgetMs => Scheduler.MainThreadBudgetMs;
+        internal static bool QueueCapacityPending => Settings.QueueCapacity != EffectiveQueueCapacity;
+        internal static bool MainThreadBudgetPending => Settings.MainThreadBudgetMs != EffectiveMainThreadBudgetMs;
+        internal static bool SchedulerSettingsPending => QueueCapacityPending || MainThreadBudgetPending;
+        internal static long LifecycleSequenceForTests => Interlocked.Read(ref gameTransitionSequence);
+        internal static long PublishedLifecycleSequenceForTests =>
+            Interlocked.Read(ref publishedGameTransitionSequence);
+        internal static int PublishedLifecycleThreadIdForTests =>
+            Volatile.Read(ref publishedGameTransitionThreadId);
+
+        internal static BridgeResult AddSessionContext(BridgeResult result, BridgeSessionContextSnapshot snapshot)
+        {
+            return result.Add("session", snapshot.SessionId)
+                .Add("context", snapshot.WriteContext)
+                .Add("writeContext", snapshot.WriteContext)
+                .Add("representativePlayerBehavior", snapshot.RepresentativePlayerBehavior)
+                .Add("writeLeaseActive", snapshot.WriteLeaseActive)
+                .Add("leaseState", snapshot.LeaseState);
+        }
 
         internal static void Bootstrap(string modRoot, long constructionStart, long managedBefore)
         {
+            AssertMainThread("bootstrap");
             if (bootstrapped) return;
             bootstrapped = true;
             BridgePaths.Initialize(modRoot);
+            Authorization.RotateSession(identity.SessionId);
             Scheduler.Configure(MainThread, identity.SessionId, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
             long harmonyStart = Stopwatch.GetTimestamp();
             Harmony.Patch(AccessTools.PropertySetter(typeof(Current), nameof(Current.Game)),
                 prefix: new HarmonyMethod(typeof(BridgeRuntime), nameof(OnGameChanging)));
+            EnsureUpdatePatch();
             harmonyMs = BridgeTiming.Milliseconds(harmonyStart);
             UnityEngine.Application.quitting += Shutdown;
             StartDormantWatcher();
@@ -77,6 +122,7 @@ namespace RimWorldDevBridge
 
         public static void OnFinalizeInit()
         {
+            AssertMainThread("finalize initialization");
             long start = Stopwatch.GetTimestamp();
             RotateSession("game");
             bool wakePending = File.Exists(BridgePaths.WakePath);
@@ -85,6 +131,7 @@ namespace RimWorldDevBridge
                 TryDelete(BridgePaths.WakePath);
                 StartTransport();
             }
+            if (File.Exists(BridgePaths.InputPath)) InputSignal.Signal();
             BridgeEventJournal.Record("lifecycle", "game finalized session:" + identity.SessionId);
             finalizeInitMs = BridgeTiming.Milliseconds(start);
             WriteStatus(active ? (transportReady ? "ON" : "ACTIVATING") : "DORMANT");
@@ -92,7 +139,14 @@ namespace RimWorldDevBridge
 
         public static void OnRootUpdate()
         {
+            MainThread.AdoptOwnerThread();
+            AssertMainThread("root update");
+            ProcessPendingFileSignals();
+            RefreshIndicator();
             if (!active) return;
+            if (BridgeQuerySnapshotStore.ActiveCount > 0)
+                BridgeQuerySnapshotStore.CleanupStaleMaps((BridgeGameState.Maps ?? new List<Map>())
+                    .Select(map => map.uniqueID));
             if (!transportReady)
             {
                 if (!activationIndexStarted)
@@ -100,30 +154,86 @@ namespace RimWorldDevBridge
                     activationIndexStarted = true;
                     BridgeAdapterCatalog.ActivateIndexing();
                 }
-                if (BridgeAdapterCatalog.Indexing) return;
+                if (BridgeAdapterCatalog.Indexing)
+                {
+                    DrainMainThread();
+                    return;
+                }
                 transportReady = true;
                 activationMs = activationStartTicks == 0 ? 0d : BridgeTiming.Milliseconds(activationStartTicks);
                 WriteStatus("ON");
             }
-            MainThread.Drain(16, 4, exception =>
-                Log.Error("[RimWorld Dev Bridge] Main-thread callback failed: " + exception));
+            if (legacyInputPending)
+            {
+                legacyInputPending = false;
+                ProcessLegacyFile();
+            }
+            DrainMainThread();
         }
 
         public static void OnGameChanging(Game value)
         {
-            if (ReferenceEquals(value, Current.Game)) return;
-            RotateSession(value == null ? "menu" : "loading");
-            BridgeEventJournal.Record("lifecycle", value == null ? "main menu" : "game changing");
-            WriteStatus(active ? (transportReady ? "ON" : "ACTIVATING") : "DORMANT");
+            // Verse can invoke this prefix from LongEventHandler worker threads. Keep the prefix
+            // limited to managed, thread-safe invalidation; never touch Current.Game or UI state.
+            try { BeginGameTransition(value == null); }
+            catch { /* A prefix must never prevent Verse from assigning Current.Game. */ }
+        }
+
+        private static void BeginGameTransition(bool enteringMenu)
+        {
+            long sequence = Interlocked.Increment(ref gameTransitionSequence);
+            string nextSession = (enteringMenu ? "menu" : "loading") + "-" + Guid.NewGuid().ToString("N");
+            lock (Gate)
+            {
+                identity = new SessionIdentity(nextSession, string.Empty);
+                active = false;
+                transportReady = false;
+                activationIndexStarted = false;
+                legacyInputPending = false;
+                Interlocked.Increment(ref transportGeneration);
+                Authorization.RotateSession(nextSession);
+                BridgeQuerySnapshotStore.RotateSession();
+                Scheduler.RotateSession(nextSession);
+            }
+
+            // The Game object is intentionally not captured. The callback is sequence/session bound
+            // so an older transition cannot publish state after a newer transition or finalization.
+            MainThread.Post(_ => ApplyGameTransition(sequence, nextSession, enteringMenu), null);
+        }
+
+        private static void ApplyGameTransition(long sequence, string expectedSession, bool enteringMenu)
+        {
+            if (shuttingDown || sequence != Interlocked.Read(ref gameTransitionSequence) ||
+                !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
+            AssertMainThread("game transition publication");
+            if (sequence != Interlocked.Read(ref gameTransitionSequence) ||
+                !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
+            Volatile.Write(ref publishedGameTransitionThreadId, Thread.CurrentThread.ManagedThreadId);
+            Interlocked.Exchange(ref publishedGameTransitionSequence, sequence);
+            StopTransport(false);
+            if (sequence != Interlocked.Read(ref gameTransitionSequence) ||
+                !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
+            BridgeEventJournal.Record("lifecycle", (enteringMenu ? "main menu" : "game changing") +
+                " sequence:" + sequence);
+            WriteStatus("DORMANT");
+        }
+
+        internal static int DrainMainThreadForTests()
+        {
+            AssertMainThread("test main-thread drain");
+            return MainThread.Drain(64, 1000);
         }
 
         public static void Shutdown()
         {
+            AssertMainThread("shutdown");
             shuttingDown = true;
             UnityEngine.Application.quitting -= Shutdown;
             BridgeEventJournal.Record("lifecycle", "shutdown");
             RotateSession("shutdown");
             StopTransport(false);
+            BridgeIndicator.Close();
+            RemoveUpdatePatch();
             try { watcher?.Dispose(); } catch { }
             watcher = null;
             TryDelete(BridgePaths.WakePath);
@@ -135,30 +245,63 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult AcquireWriteLease(string context)
         {
-            return Authorization.Acquire(context, Settings.RemoteMutationEnabled);
+            BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled);
+            RefreshIndicator();
+            return result;
+        }
+
+        internal static void RefreshIndicator()
+        {
+            AssertMainThread("bridge indicator refresh");
+            BridgeIndicator.Refresh(active, ActiveClients, Settings.ConnectedClientLimit,
+                SessionContext, Settings.ShowBridgeIndicator, Settings.BridgeIndicatorCorner);
         }
 
         internal static void RefreshStatus()
         {
+            AssertMainThread("status refresh");
             WriteStatus(active ? (transportReady ? "ON" : "ACTIVATING") : "DORMANT");
+        }
+
+        internal static void ApplySchedulerSettings()
+        {
+            AssertMainThread("scheduler reconfiguration");
+            if (!bootstrapped) return;
+            Scheduler.Reconfigure(Settings.QueueCapacity, Settings.MainThreadBudgetMs);
+        }
+
+        internal static void PostToMainThread(Action callback)
+        {
+            if (callback == null) throw new ArgumentNullException(nameof(callback));
+            MainThread.Post(_ => callback(), null);
+        }
+
+        private static void DrainMainThread()
+        {
+            MainThread.Drain(16, Scheduler.MainThreadBudgetMs, exception =>
+                Log.Error("[RimWorld Dev Bridge] Main-thread callback failed: " + exception));
         }
 
         private static BridgeSettings Settings => RimWorldDevBridgeMod.Settings ?? new BridgeSettings();
 
         private static void RotateSession(string prefix)
         {
+            AssertMainThread("session rotation");
             lock (Gate)
             {
                 string next = prefix + "-" + Guid.NewGuid().ToString("N");
                 Authorization.RotateSession(next);
+                BridgeQuerySnapshotStore.RotateSession();
                 Scheduler.Configure(MainThread, next, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
                 Scheduler.RotateSession(next);
                 identity = new SessionIdentity(next, active ? Guid.NewGuid().ToString("N") : string.Empty);
             }
+            RefreshIndicator();
         }
 
         private static void StartDormantWatcher()
         {
+            AssertMainThread("watcher initialization");
             string saveFolder = GenFilePaths.SaveDataFolderPath;
             watcher = new FileSystemWatcher(saveFolder, BridgePaths.Prefix + "*")
             {
@@ -175,20 +318,25 @@ namespace RimWorldDevBridge
         {
             if (shuttingDown) return;
             string name = Path.GetFileName(args.FullPath);
-            if (name.Equals(Path.GetFileName(BridgePaths.WakePath), StringComparison.OrdinalIgnoreCase))
+            if (name.Equals(WakeFileName, StringComparison.OrdinalIgnoreCase)) WakeSignal.Signal();
+            else if (name.Equals(InputFileName, StringComparison.OrdinalIgnoreCase)) InputSignal.Signal();
+        }
+
+        private static void ProcessPendingFileSignals()
+        {
+            AssertMainThread("file activation");
+            if (WakeSignal.Consume())
             {
                 TryDelete(BridgePaths.WakePath);
                 StartTransport();
             }
-            else if (name.Equals(Path.GetFileName(BridgePaths.InputPath), StringComparison.OrdinalIgnoreCase))
-            {
-                StartTransport();
-                ThreadPool.QueueUserWorkItem(_ => ProcessLegacyFile());
-            }
+            if (InputSignal.Consume()) legacyInputPending = true;
+            if (legacyInputPending && !active) StartTransport();
         }
 
         private static void StartTransport()
         {
+            AssertMainThread("transport activation");
             lock (Gate)
             {
                 if (shuttingDown) return;
@@ -209,7 +357,6 @@ namespace RimWorldDevBridge
                     active = true;
                     transportReady = false;
                     activationIndexStarted = false;
-                    EnsureUpdatePatch();
                     int generation = Interlocked.Increment(ref transportGeneration);
                     TcpListener current = listener;
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
@@ -220,6 +367,7 @@ namespace RimWorldDevBridge
                     };
                     listenerThread.Start();
                     idleTimer = new Timer(_ => CheckIdle(generation), null, 10000, 10000);
+                    RefreshIndicator();
                     WriteStatus("ACTIVATING");
                 }
                 catch (Exception exception)
@@ -232,6 +380,7 @@ namespace RimWorldDevBridge
 
         private static void StopTransport(bool writeDormant)
         {
+            AssertMainThread("transport stop");
             lock (Gate)
             {
                 active = false;
@@ -245,13 +394,14 @@ namespace RimWorldDevBridge
                 port = 0;
                 SessionIdentity currentIdentity = identity;
                 identity = new SessionIdentity(currentIdentity.SessionId, string.Empty);
-                RemoveUpdatePatch();
+                RefreshIndicator();
                 if (writeDormant && !shuttingDown) WriteStatus("DORMANT");
             }
         }
 
         private static void EnsureUpdatePatch()
         {
+            AssertMainThread("update patch");
             if (updatePatched) return;
             Harmony.Patch(AccessTools.Method(typeof(Root), "Update"),
                 postfix: new HarmonyMethod(typeof(BridgeRuntime), nameof(OnRootUpdate)));
@@ -260,6 +410,7 @@ namespace RimWorldDevBridge
 
         private static void RemoveUpdatePatch()
         {
+            AssertMainThread("update unpatch");
             if (!updatePatched) return;
             try
             {
@@ -303,6 +454,11 @@ namespace RimWorldDevBridge
                     {
                         accepted.Close();
                         Interlocked.Decrement(ref activeClients);
+                        RequestIndicatorRefresh();
+                    }
+                    else
+                    {
+                        RequestIndicatorRefresh();
                     }
                 }
                 catch (SocketException) { if (!active || generation != transportGeneration) return; }
@@ -359,22 +515,17 @@ namespace RimWorldDevBridge
                         return;
                     }
                     long prepareStart = Stopwatch.GetTimestamp();
-                    BridgeCommandDescriptor descriptor = BridgeDispatch.Describe(request);
+                    BridgeResult prepareFailure = PrepareRequestOnMainThread(request, out BridgeCommandDescriptor descriptor);
+                    request.PreparationMs = BridgeTiming.Milliseconds(prepareStart);
                     if (descriptor == null)
                     {
-                        request.PreparationMs = BridgeTiming.Milliseconds(prepareStart);
-                        BridgeResult unavailable = BridgeAdapterCatalog.Indexing
+                        BridgeResult unavailable = prepareFailure ?? (BridgeAdapterCatalog.Indexing
                             ? BridgeResult.Fail(BridgeStatus.BUSY, "adapter_indexing")
-                            : BridgeResult.Fail(BridgeStatus.NOT_FOUND, "unknown_command");
+                            : BridgeResult.Fail(BridgeStatus.NOT_FOUND, "unknown_command"));
                         Decorate(unavailable, request, "core", BridgeProtocol.BridgeVersion);
                         writer.Write(BridgeProtocol.Serialize(unavailable, request.OutputFormat));
                         return;
                     }
-                    request.Mode = descriptor.Mode;
-                    request.Cost = descriptor.Cost;
-                    request.PreparedDescriptor = descriptor.Clone();
-                    BridgeResult prepareFailure = BridgeDispatch.Prepare(request);
-                    request.PreparationMs = BridgeTiming.Milliseconds(prepareStart);
                     if (prepareFailure != null)
                     {
                         Decorate(prepareFailure, request, descriptor.Provider, descriptor.ProviderVersion);
@@ -408,7 +559,87 @@ namespace RimWorldDevBridge
                 }
             }
             catch { if (request != null && !request.Started) request.ClientDisconnected = true; }
-            finally { Interlocked.Decrement(ref activeClients); }
+            finally
+            {
+                Interlocked.Decrement(ref activeClients);
+                RequestIndicatorRefresh();
+            }
+        }
+
+        private static void RequestIndicatorRefresh()
+        {
+            try
+            {
+                MainThread.Post(_ =>
+                {
+                    if (!shuttingDown) RefreshIndicator();
+                }, null);
+            }
+            catch { }
+        }
+
+        private static BridgeResult PrepareRequestOnMainThread(BridgeRequest request,
+            out BridgeCommandDescriptor descriptor)
+        {
+            descriptor = null;
+            if (MainThread.IsOwnerThread) return PrepareRequest(request, out descriptor);
+
+            TaskCompletionSource<PreparationResult> completion =
+                new TaskCompletionSource<PreparationResult>();
+            try
+            {
+                MainThread.Post(_ =>
+                {
+                    BridgeCommandDescriptor preparedDescriptor = null;
+                    BridgeResult failure;
+                    try
+                    {
+                    failure = request.SessionId != SessionId
+                        ? BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_session")
+                        : request.Expired || request.Cancelled
+                            ? BridgeResult.Fail(request.Expired ? BridgeStatus.TIMEOUT : BridgeStatus.CANCELLED,
+                                request.Expired ? "deadline_expired" : "cancelled_before_prepare")
+                        : PrepareRequest(request, out preparedDescriptor);
+                    }
+                    catch (Exception exception)
+                    {
+                        failure = BridgeResult.Fail(BridgeStatus.ERROR, "main_thread_prepare_failed",
+                            exception.GetBaseException().Message);
+                    }
+                    completion.TrySetResult(new PreparationResult(preparedDescriptor, failure));
+                }, null);
+            }
+            catch (Exception exception)
+            {
+                return BridgeResult.Fail(BridgeStatus.ERROR, "main_thread_prepare_failed",
+                    exception.GetBaseException().Message);
+            }
+
+            int waitMs = Math.Max(1, Math.Min(int.MaxValue,
+                (int)Math.Ceiling(Math.Max(1d, request.Remaining.TotalMilliseconds))));
+            if (!completion.Task.Wait(waitMs))
+            {
+                request.Cancelled = true;
+                return BridgeResult.Fail(BridgeStatus.TIMEOUT, "main_thread_prepare_timeout");
+            }
+            PreparationResult result = completion.Task.Result;
+            descriptor = result.Descriptor;
+            return result.Failure;
+        }
+
+        private static BridgeResult PrepareRequest(BridgeRequest request, out BridgeCommandDescriptor descriptor)
+        {
+            if (request.Expired)
+            {
+                descriptor = null;
+                return BridgeResult.Fail(BridgeStatus.TIMEOUT, "deadline_expired");
+            }
+            descriptor = BridgeDispatch.Describe(request);
+            if (descriptor == null) return null;
+            request.Mode = descriptor.Mode;
+            request.Cost = descriptor.Cost;
+            request.PreparedDescriptor = descriptor.Clone();
+            return BridgeDispatch.Prepare(request);
         }
 
         private static BridgeResult ExecuteScheduled(BridgeRequest request)
@@ -441,6 +672,16 @@ namespace RimWorldDevBridge
                 () => request.Cancelled || request.ClientDisconnected);
             request.ExecutionReached = true;
             BridgeResult result = BridgeDispatch.Execute(context);
+            if (request.Cancelled || request.ClientDisconnected || request.Expired ||
+                request.SessionId != SessionId)
+            {
+                return Decorate(BridgeResult.Fail(request.Expired ? BridgeStatus.TIMEOUT :
+                    request.SessionId != SessionId ? BridgeStatus.INCOMPATIBLE : BridgeStatus.CANCELLED,
+                    request.Expired ? "execution_deadline_expired" :
+                        request.SessionId != SessionId ? "stale_session" : "execution_cancelled"), request,
+                    descriptor.Provider, descriptor.ProviderVersion);
+            }
+            if (result == null && request.YieldExecution) return null;
             if (result == null) result = BridgeResult.Fail(BridgeStatus.ERROR, "empty_result");
             result.TickBefore = tickBefore;
             result.TickAfter = BridgeGameState.TickManager?.TicksGame ?? -1;
@@ -452,14 +693,16 @@ namespace RimWorldDevBridge
         {
             BridgeCommandDescriptor descriptor = request.PreparedDescriptor ?? BridgeDispatch.Describe(request);
             if (descriptor == null) return;
-            if (!request.IdempotentReplay)
+            bool currentSession = string.Equals(request.SessionId, SessionId, StringComparison.Ordinal);
+            if (!request.IdempotentReplay && currentSession)
             {
                 if (request.ExecutionReached) Authorization.Remember(request, result);
                 Authorization.Audit(request, result);
             }
             BridgeMetrics.Record(descriptor, result);
-            BridgeEventJournal.Record("command", request.Command + " status:" + result.Status +
-                " provider:" + descriptor.Provider + " executionMs:" + result.ExecutionMs.ToString("0.###"));
+            if (currentSession)
+                BridgeEventJournal.Record("command", request.Command + " status:" + result.Status +
+                    " provider:" + descriptor.Provider + " executionMs:" + result.ExecutionMs.ToString("0.###"));
         }
 
         private static BridgeResult Decorate(BridgeResult result, BridgeRequest request, string provider,
@@ -478,35 +721,34 @@ namespace RimWorldDevBridge
 
         private static void ProcessLegacyFile()
         {
-            if (!File.Exists(BridgePaths.InputPath)) return;
+            AssertMainThread("legacy file processing");
+            string inputPath = BridgePaths.InputPath;
+            string outputPath = BridgePaths.OutputPath;
+            if (!File.Exists(inputPath)) return;
             try
             {
-                string raw = File.ReadAllText(BridgePaths.InputPath).Trim();
-                File.Delete(BridgePaths.InputPath);
+                string raw = File.ReadAllText(inputPath).Trim();
+                File.Delete(inputPath);
                 if (!BridgeProtocol.TryParse(raw, identity.SessionId, out BridgeRequest request, out BridgeResult failure))
                 {
-                    AtomicWrite(BridgePaths.OutputPath, BridgeProtocol.Serialize(failure, "line"));
+                    AtomicWrite(outputPath, BridgeProtocol.Serialize(failure, "line"));
                     return;
                 }
                 long prepareStart = Stopwatch.GetTimestamp();
-                BridgeCommandDescriptor descriptor = BridgeDispatch.Describe(request);
+                BridgeResult prepare = PrepareRequest(request, out BridgeCommandDescriptor descriptor);
                 if (descriptor == null)
                 {
                     request.PreparationMs = BridgeTiming.Milliseconds(prepareStart);
-                    failure = BridgeResult.Fail(BridgeStatus.NOT_FOUND, "unknown_command");
+                    failure = prepare ?? BridgeResult.Fail(BridgeStatus.NOT_FOUND, "unknown_command");
                     Decorate(failure, request, "core", BridgeProtocol.BridgeVersion);
-                    AtomicWrite(BridgePaths.OutputPath, BridgeProtocol.Serialize(failure, "line"));
+                    AtomicWrite(outputPath, BridgeProtocol.Serialize(failure, "line"));
                     return;
                 }
-                request.Mode = descriptor.Mode;
-                request.Cost = descriptor.Cost;
-                request.PreparedDescriptor = descriptor.Clone();
-                BridgeResult prepare = BridgeDispatch.Prepare(request);
                 request.PreparationMs = BridgeTiming.Milliseconds(prepareStart);
                 if (prepare != null)
                 {
                     Decorate(prepare, request, descriptor.Provider, descriptor.ProviderVersion);
-                    AtomicWrite(BridgePaths.OutputPath, BridgeProtocol.Serialize(prepare, "line"));
+                    AtomicWrite(outputPath, BridgeProtocol.Serialize(prepare, "line"));
                     return;
                 }
                 request.EnqueuedUtc = DateTime.UtcNow;
@@ -514,7 +756,7 @@ namespace RimWorldDevBridge
                 if (enqueue != null)
                 {
                     Decorate(enqueue, request, descriptor.Provider, descriptor.ProviderVersion);
-                    AtomicWrite(BridgePaths.OutputPath, BridgeProtocol.Serialize(enqueue, "line"));
+                    AtomicWrite(outputPath, BridgeProtocol.Serialize(enqueue, "line"));
                     return;
                 }
                 ThreadPool.QueueUserWorkItem(_ =>
@@ -522,7 +764,7 @@ namespace RimWorldDevBridge
                     request.Done.Wait(Math.Max(50, (int)request.Remaining.TotalMilliseconds));
                     BridgeResult result = request.Result ?? BridgeResult.Fail(BridgeStatus.TIMEOUT, "file_request_timeout");
                     Decorate(result, request, descriptor.Provider, descriptor.ProviderVersion);
-                    AtomicWrite(BridgePaths.OutputPath, BridgeProtocol.Serialize(result, "line"));
+                    AtomicWrite(outputPath, BridgeProtocol.Serialize(result, "line"));
                 });
             }
             catch { }
@@ -564,10 +806,11 @@ namespace RimWorldDevBridge
 
         private static void WriteStatus(string state, string extra = null)
         {
+            AssertMainThread("status write");
             lock (StatusGate)
             {
                 long writeStart = Stopwatch.GetTimestamp();
-                SessionIdentity currentIdentity = identity;
+                BridgeSessionContextSnapshot context = SessionContext;
                 List<string> lines = new List<string>
                 {
                     "bridge=" + state,
@@ -577,13 +820,17 @@ namespace RimWorldDevBridge
                     "schema=" + BridgeProtocol.CoreSchema,
                     "processId=" + Process.GetCurrentProcess().Id,
                     "bootId=" + BootId,
-                    "session=" + currentIdentity.SessionId,
+                    "session=" + context.SessionId,
                     "transport=" + (active ? "tcp+file" : "wake-file"),
                     "host=127.0.0.1",
                     "port=" + port,
-                    "token=" + currentIdentity.Token,
+                    "token=" + identity.Token,
                     "clients=" + ActiveClients + "/" + Settings.ConnectedClientLimit,
-                    "context=" + Authorization.Context,
+                    "context=" + context.WriteContext,
+                    "writeContext=" + context.WriteContext,
+                    "representativePlayerBehavior=" + context.RepresentativePlayerBehavior,
+                    "writeLeaseActive=" + context.WriteLeaseActive,
+                    "leaseState=" + context.LeaseState,
                     "bootstrapMs=" + bootstrapMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                     "harmonyMs=" + harmonyMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                     "finalizeInitMs=" + finalizeInitMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
@@ -617,6 +864,11 @@ namespace RimWorldDevBridge
             try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
 
+        private static void AssertMainThread(string operation)
+        {
+            MainThread.AssertOwnerThread(operation);
+        }
+
         private sealed class SessionIdentity
         {
             internal readonly string SessionId;
@@ -626,6 +878,18 @@ namespace RimWorldDevBridge
             {
                 SessionId = sessionId;
                 Token = token;
+            }
+        }
+
+        private sealed class PreparationResult
+        {
+            internal readonly BridgeCommandDescriptor Descriptor;
+            internal readonly BridgeResult Failure;
+
+            internal PreparationResult(BridgeCommandDescriptor descriptor, BridgeResult failure)
+            {
+                Descriptor = descriptor;
+                Failure = failure;
             }
         }
     }
@@ -645,6 +909,11 @@ namespace RimWorldDevBridge
                 metric.Count++;
                 metric.TotalMs += result.ExecutionMs;
                 metric.MaxMs = Math.Max(metric.MaxMs, result.ExecutionMs);
+                metric.MaxStepMs = Math.Max(metric.MaxStepMs, result.MaxMainThreadStepMs);
+                if (result.MainThreadOverrun) metric.Overruns++;
+                metric.CooperativeSteps += result.CooperativeSteps;
+                if (descriptor.NonCooperative || result.NonCooperativeExecution) metric.NonCooperative = true;
+                if (descriptor.Cooperative) metric.Cooperative = true;
                 metric.LastStatus = result.Status;
                 if (!result.IsSuccess) metric.Failures++;
             }
@@ -660,6 +929,10 @@ namespace RimWorldDevBridge
                         pair.Value.Failures + " meanMs:" + (pair.Value.Count > 0 ? pair.Value.TotalMs / pair.Value.Count : 0d)
                             .ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + " maxMs:" +
                         pair.Value.MaxMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
+                        " maxStepMs:" + pair.Value.MaxStepMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
+                        " overruns:" + pair.Value.Overruns + " cooperativeSteps:" + pair.Value.CooperativeSteps +
+                        " contract:" + (pair.Value.NonCooperative ? "legacy-sync-non-cooperative" :
+                            pair.Value.Cooperative ? "cooperative-v1" : "sync") +
                         " last:" + pair.Value.LastStatus);
             }
             return result;
@@ -671,6 +944,11 @@ namespace RimWorldDevBridge
             internal long Failures;
             internal double TotalMs;
             internal double MaxMs;
+            internal double MaxStepMs;
+            internal long Overruns;
+            internal long CooperativeSteps;
+            internal bool NonCooperative;
+            internal bool Cooperative;
             internal BridgeStatus LastStatus;
         }
     }

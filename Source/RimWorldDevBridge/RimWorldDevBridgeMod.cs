@@ -19,19 +19,46 @@ namespace RimWorldDevBridge
 
         public override string SettingsCategory() => "RimWorld Dev Bridge";
 
+        public override void WriteSettings()
+        {
+            Settings.Normalize();
+            base.WriteSettings();
+            BridgeRuntime.ApplySchedulerSettings();
+            BridgeRuntime.RefreshIndicator();
+        }
+
         public override void DoSettingsWindowContents(Rect inRect)
         {
             Listing_Standard listing = new Listing_Standard();
             listing.Begin(inRect);
             listing.CheckboxLabeled("Allow explicitly leased remote mutations", ref Settings.RemoteMutationEnabled,
                 "Dev mode alone never authorizes a write. Disable this to force every remote command read-only.");
-            listing.Label("Operation queue capacity: " + Settings.QueueCapacity);
+            listing.Label("Operation queue capacity: requested " + Settings.QueueCapacity +
+                ", effective " + BridgeRuntime.EffectiveQueueCapacity);
             Settings.QueueCapacity = (int)listing.Slider(Settings.QueueCapacity, 8, 256);
             listing.Label("Connected client limit: " + Settings.ConnectedClientLimit);
             Settings.ConnectedClientLimit = (int)listing.Slider(Settings.ConnectedClientLimit, 2, 32);
-            listing.Label("Main-thread budget per drain: " + Settings.MainThreadBudgetMs + " ms");
+            listing.Label("Main-thread budget per drain: requested " + Settings.MainThreadBudgetMs +
+                ", effective " + BridgeRuntime.EffectiveMainThreadBudgetMs + " ms");
             Settings.MainThreadBudgetMs = (int)listing.Slider(Settings.MainThreadBudgetMs, 1, 12);
+            listing.CheckboxLabeled("Show the read-only indicator while the bridge is idle", ref Settings.ShowBridgeIndicator,
+                "Active transport and every write lease remain visible, including live-confirmed access.");
+            listing.Label("Indicator position: " + BridgeIndicatorPosition(Settings.BridgeIndicatorCorner));
+            Settings.BridgeIndicatorCorner = (int)listing.Slider(Settings.BridgeIndicatorCorner, 0, 3);
+            if (BridgeRuntime.SchedulerSettingsPending)
+                listing.Label("Scheduler changes apply when settings are applied; queued and running requests are preserved.");
             listing.End();
+        }
+
+        private static string BridgeIndicatorPosition(int corner)
+        {
+            switch (corner)
+            {
+                case 1: return "top-left";
+                case 2: return "bottom-right";
+                case 3: return "bottom-left";
+                default: return "top-right";
+            }
         }
     }
 }

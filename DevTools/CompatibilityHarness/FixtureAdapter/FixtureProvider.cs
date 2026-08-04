@@ -5,6 +5,15 @@ using RimWorldDevBridge;
 
 namespace BridgeFixtureAdapter
 {
+    public static class LegacySlowProvider
+    {
+        public static IEnumerable<string> ExecuteBridgeCommand(string command, string argument, Verse.Map map)
+        {
+            Thread.Sleep(300);
+            return new[] { "legacy=ok" };
+        }
+    }
+
     public sealed class FixtureProvider : IBridgeAdapterProvider
     {
         private static int state;

@@ -55,6 +55,8 @@ namespace RimWorldDevBridge
         public string ResultSchema { get; set; }
         public int SchemaVersion { get; set; } = 1;
         public int MinimumExecutionBudgetMs { get; set; } = 25;
+        public bool Cooperative { get; set; }
+        public bool NonCooperative { get; set; }
 
         public BridgeCommandDescriptor Clone()
         {
@@ -112,6 +114,11 @@ namespace RimWorldDevBridge
         public double QueueDelayMs { get; set; }
         public double PreparationMs { get; set; }
         public double ExecutionMs { get; set; }
+        internal int MainThreadBudgetMs { get; set; }
+        internal bool MainThreadOverrun { get; set; }
+        internal double MaxMainThreadStepMs { get; set; }
+        internal int CooperativeSteps { get; set; }
+        internal bool NonCooperativeExecution { get; set; }
         public int TickBefore { get; set; } = -1;
         public int TickAfter { get; set; } = -1;
         public bool Truncated { get; set; }
@@ -298,6 +305,12 @@ namespace RimWorldDevBridge
         internal bool IdempotentReplay;
         internal bool ExecutionReached;
         internal double PreparationMs;
+        internal object CooperativeState;
+        internal bool YieldExecution;
+        internal double CooperativeExecutionMs;
+        internal int CooperativeSteps;
+        internal double CooperativeMaxStepMs;
+        internal bool CooperativeMainThreadOverrun;
         internal readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
         internal BridgeResult Result;
 
@@ -347,6 +360,19 @@ namespace RimWorldDevBridge
         BridgeAdapterMetadata Metadata { get; }
         IEnumerable<BridgeCommandDescriptor> Commands { get; }
         BridgeResult Execute(BridgeExecutionContext context);
+    }
+
+    // Opt-in contract for adapters that can perform bounded work and yield between frames.
+    public interface IBridgeCooperativeAdapterProvider : IBridgeAdapterProvider
+    {
+        string ExecutionContract { get; }
+        IBridgeCooperativeAdapterExecution BeginCooperativeExecution(BridgeExecutionContext context);
+    }
+
+    public interface IBridgeCooperativeAdapterExecution
+    {
+        bool IsComplete { get; }
+        BridgeResult Step(BridgeExecutionContext context);
     }
 
     internal static class BridgeText

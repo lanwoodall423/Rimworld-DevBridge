@@ -59,13 +59,15 @@ and invokes the normal authenticated client. It only stops a process it launched
 ## Selected architecture
 
 1. **Bootstrap and lifecycle**
-   - The mod constructor records paths, installs one explicit game-change patch,
-     creates one save-data wake watcher, registers process shutdown, and writes a
-     fixed dormant status. `GameComponent.FinalizeInit` supplies game readiness.
-   - Dormant mode performs no tick/update callback, provider scan, adapter load,
-     macro/test parse, fingerprint, map scan, timer, or TCP work.
-   - The `Root.Update` drain patch is installed dynamically during activation and
-     removed when the TCP session returns to dormant mode.
+   - The mod constructor records paths, installs one explicit game-change patch and
+     one lightweight `Root.Update` signal/drain hook, creates one save-data wake
+     watcher, registers process shutdown, and writes a fixed dormant status.
+     `GameComponent.FinalizeInit` supplies game readiness.
+   - Dormant mode performs no provider scan, adapter load, macro/test parse,
+     fingerprint, map scan, timer, or TCP work; the permanent update hook only
+     checks coalesced file signals and returns.
+   - The `Root.Update` hook is installed during safe bootstrap, activates transport
+     and main-thread draining only after a signal, and is removed at shutdown.
    - Every loaded game receives a random session ID. Game replacement/unload
      rotates authorization, cancels queued requests, and invalidates references.
 
@@ -83,10 +85,12 @@ and invokes the normal authenticated client. It only stops a process it launched
    - Drain work has a per-frame time/operation budget. Expired, cancelled,
      disconnected, stale-session, unauthorized, or invalid requests are rejected
      before command execution.
-   - Cost classes, operation/time drain budgets, bounded core scans, and one
-     expensive operation per drain limit bridge-owned stalls. Deliberately
-     expensive operations require an override. Arbitrary adapter code remains
-     cooperative and is reported when slow; it cannot be safely preempted.
+    - Cost classes, operation/time drain budgets, bounded core scans, and one
+      expensive operation per drain limit bridge-owned stalls. Deliberately
+      expensive operations require an override. Built-in large scans use
+      cooperative resumable steps. Adapters are cooperative only when they
+      explicitly opt into the versioned contract; legacy synchronous code is
+      measured, reported as non-cooperative, and cannot be safely preempted.
 
 4. **Authorization and idempotency**
    - Sessions start read-only. Writes require an explicit short-lived lease bound
@@ -98,8 +102,12 @@ and invokes the normal authenticated client. It only stops a process it launched
      the original result. A bounded audit records every accepted mutation.
 
 5. **Commands and inspection**
-   - Core commands use typed handlers and meaningful statuses. Lists use stable
-     ordering, requested fields, byte/scan budgets, `limit`, and opaque cursors.
+    - Core commands use typed handlers and meaningful statuses. Lists use stable
+      ordering, requested fields, byte/scan budgets, `limit`, and opaque cursors.
+      `PAWNS`, `THINGS`, and `JOBS` establish bounded immutable DTO snapshots on
+      page one and use versioned snapshot cursors on later pages; old offset
+      cursors are rejected for those commands while other paged commands remain
+      wire-compatible.
    - Object references carry session, map, and object IDs. No live object is cached
      across requests or sessions.
    - Generic inspection reads fields and an explicit safe-property allowlist only;
@@ -114,11 +122,21 @@ and invokes the normal authenticated client. It only stops a process it launched
    - Live replacements switch command ownership atomically. Mono-retained old
      generations are reported honestly and trigger a restart recommendation at a
      configurable threshold.
-   - Legacy convention providers require an explicit manifest with an exact
-     loaded assembly identity and provider type. They are resolved only on first
-     command and never trigger assembly/type discovery scans.
+    - Legacy convention providers require an explicit manifest with an exact
+      loaded assembly identity and provider type. They are resolved only on first
+      command and never trigger assembly/type discovery scans.
+    - A cooperative-v1 provider must implement the explicit step contract and
+      may yield between main-thread frames. Existing synchronous providers remain
+      compatible, but serious non-cooperative overruns open the adapter circuit.
 
-7. **Macros, feature tests, captures, and reports**
+7. **In-game safety indicator**
+   - A runtime-only nonblocking corner indicator is visible whenever transport is
+     active or a write lease exists. Read-only, sandbox, and live-confirmed states
+     have distinct labels/colors; live-confirmed access is forced visible even
+     when the optional idle read-only display is disabled. Client count and lease
+     context/expiry are shown in the compact details and tooltip.
+
+8. **Macros, feature tests, captures, and reports**
    - Macros are declarative, cycle-checked, bounded, typed, and mode-derived.
    - Feature tests use phased execution and typed assertions, support `BLOCKED`,
      always attempt cleanup, and store queues/history under RimWorld user data.
@@ -149,7 +167,8 @@ Only after all six pass may the superseded host path be deleted or disconnected.
 ## Completion gates
 
 - Source verifier proves dormant bootstrap does not call provider, macro, test,
-  hash, adapter, TCP timer, or map paths and has no tick patch.
+  hash, adapter, TCP timer, or map paths and has only the lightweight bootstrap
+  update hook.
 - Cold game measurement reports bootstrap, Harmony, and `Game.FinalizeInit`
   contributions; target is approximately 5 ms or less after assembly loading.
 - Live probes cover activation, first/repeated command latency, bounded concurrent
@@ -162,8 +181,8 @@ Only after all six pass may the superseded host path be deleted or disconnected.
 
 - The offline compatibility harness covers 28 protocol, bound, cursor, scheduler,
   cancellation, idempotency, manifest, feature-test, batch, and macro cases.
-- A source invariant check confirms no dormant update hook, AppDomain-wide
-  provider scan, eager adapter load, macro parse, or feature-test parse.
+- A source invariant check confirms no dormant update work, AppDomain-wide provider
+  scan, eager adapter load, macro parse, or feature-test parse.
 - Final cold launches measured 16.329-21.568 ms construction/bootstrap including
   status publication, 1.022-1.474 ms in the single permanent Harmony patch, and
   0.094-0.122 ms in `FinalizeInit`. This is an honest miss of the approximately

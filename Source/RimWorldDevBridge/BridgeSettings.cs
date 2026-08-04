@@ -10,6 +10,17 @@ namespace RimWorldDevBridge
         public int ConnectedClientLimit = 16;
         public int MainThreadBudgetMs = 3;
         public int RetainedAdapterRestartThreshold = 8;
+        public bool ShowBridgeIndicator;
+        public int BridgeIndicatorCorner;
+
+        internal void Normalize()
+        {
+            QueueCapacity = Mathf.Clamp(QueueCapacity, 8, 256);
+            ConnectedClientLimit = Mathf.Clamp(ConnectedClientLimit, 2, 32);
+            MainThreadBudgetMs = Mathf.Clamp(MainThreadBudgetMs, 1, 12);
+            RetainedAdapterRestartThreshold = Mathf.Clamp(RetainedAdapterRestartThreshold, 2, 32);
+            BridgeIndicatorCorner = Mathf.Clamp(BridgeIndicatorCorner, 0, 3);
+        }
 
         public override void ExposeData()
         {
@@ -18,10 +29,9 @@ namespace RimWorldDevBridge
             Scribe_Values.Look(ref ConnectedClientLimit, "connectedClientLimit", 16);
             Scribe_Values.Look(ref MainThreadBudgetMs, "mainThreadBudgetMs", 3);
             Scribe_Values.Look(ref RetainedAdapterRestartThreshold, "retainedAdapterRestartThreshold", 8);
-            QueueCapacity = Mathf.Clamp(QueueCapacity, 8, 256);
-            ConnectedClientLimit = Mathf.Clamp(ConnectedClientLimit, 2, 32);
-            MainThreadBudgetMs = Mathf.Clamp(MainThreadBudgetMs, 1, 12);
-            RetainedAdapterRestartThreshold = Mathf.Clamp(RetainedAdapterRestartThreshold, 2, 32);
+            Scribe_Values.Look(ref ShowBridgeIndicator, "showBridgeIndicator", false);
+            Scribe_Values.Look(ref BridgeIndicatorCorner, "bridgeIndicatorCorner", 0);
+            Normalize();
         }
     }
 }

@@ -18,7 +18,7 @@ namespace RimWorldDevBridge
     internal static class BridgeDiagnostics
     {
         private static readonly object PerformanceGate = new object();
-        private const int MaximumScannedObjects = 20000;
+        private const int MaximumScannedObjects = BridgeQuerySnapshotStore.DefaultMaximumRows;
         private static DateTime previousPerformanceUtc;
         private static int previousPerformanceTick = -1;
         internal delegate void RegisterCommand(string name, string description, BridgeCommandMode mode,
@@ -135,19 +135,27 @@ namespace RimWorldDevBridge
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            IReadOnlyList<Pawn> all = context.Map.mapPawns.AllPawnsSpawned;
-            bool scanTruncated = all.Count > MaximumScannedObjects;
-            List<Pawn> values = all.Take(MaximumScannedObjects)
-                .Where(pawn => string.IsNullOrWhiteSpace(query.Filter) ||
-                    Matches(query.Filter, pawn.def?.defName, pawn.LabelShortCap))
-                .ToList();
-            BridgeResult result = Paged("core.pawns", context.Request, query, values.Count)
-                .Add("scanned", Math.Min(all.Count, MaximumScannedObjects)).Add("available", all.Count);
-            foreach (Pawn pawn in values.Skip(query.Offset).Take(query.Limit))
-                result.AddLine(PawnLine(pawn, context.SessionId, context.Map.uniqueID));
-            FinishPage(result, context.Request, query, values.Count);
-            ApplyScanLimit(result, scanTruncated);
-            return result;
+            SnapshotProjectionOperation<Pawn> pending = context.Request.CooperativeState as
+                SnapshotProjectionOperation<Pawn>;
+            if (pending != null) return pending.Step(context);
+            int mapId = context.Map.uniqueID;
+            IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned.ToList() : null;
+            if (all != null && all.Count > BridgeQuerySnapshotStore.MaximumRows)
+                return SnapshotScanLimit(all.Count);
+            if (query.SnapshotId == null && !BridgeQuerySnapshotStore.CanCreate(out failure)) return failure;
+            BridgeQuerySnapshot snapshot;
+            if (query.SnapshotId != null)
+            {
+                if (!ResolveSnapshot(context, query, mapId, 0, Stopwatch.GetTimestamp(), null,
+                    out snapshot, out failure)) return failure;
+                return SnapshotPage("core.pawns", context.Request, query, snapshot);
+            }
+            context.Request.CooperativeState = new SnapshotProjectionOperation<Pawn>(context.Request,
+                query, mapId, all, pawn => string.IsNullOrWhiteSpace(query.Filter) ||
+                    Matches(query.Filter, pawn.def?.defName, pawn.LabelShortCap),
+                pawn => new BridgeQuerySnapshotRow(pawn.thingIDNumber,
+                    PawnLine(pawn, context.SessionId, mapId)), "core.pawns");
+            return ((SnapshotProjectionOperation<Pawn>)context.Request.CooperativeState).Step(context);
         }
 
         private static BridgeResult Pawn(BridgeExecutionContext context)
@@ -171,31 +179,27 @@ namespace RimWorldDevBridge
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            List<Thing> all = context.Map.listerThings.AllThings;
-            bool scanTruncated = all.Count > MaximumScannedObjects;
-            int scannedCount = Math.Min(all.Count, MaximumScannedObjects);
-            List<Thing> filtered = null;
-            int total;
-            IEnumerable<Thing> page;
-            if (string.IsNullOrWhiteSpace(query.Filter))
+            SnapshotProjectionOperation<Thing> pending = context.Request.CooperativeState as
+                SnapshotProjectionOperation<Thing>;
+            if (pending != null) return pending.Step(context);
+            int mapId = context.Map.uniqueID;
+            IReadOnlyList<Thing> all = query.SnapshotId == null ? context.Map.listerThings.AllThings.ToList() : null;
+            if (all != null && all.Count > BridgeQuerySnapshotStore.MaximumRows)
+                return SnapshotScanLimit(all.Count);
+            if (query.SnapshotId == null && !BridgeQuerySnapshotStore.CanCreate(out failure)) return failure;
+            BridgeQuerySnapshot snapshot;
+            if (query.SnapshotId != null)
             {
-                total = scannedCount;
-                page = all.Take(scannedCount).Skip(query.Offset).Take(query.Limit);
+                if (!ResolveSnapshot(context, query, mapId, 0, Stopwatch.GetTimestamp(), null,
+                    out snapshot, out failure)) return failure;
+                return SnapshotPage("core.things", context.Request, query, snapshot);
             }
-            else
-            {
-                filtered = all.Take(MaximumScannedObjects).Where(thing => Matches(query.Filter,
-                    thing.def?.defName, thing.LabelShortCap, thing.GetType().FullName)).ToList();
-                total = filtered.Count;
-                page = filtered.Skip(query.Offset).Take(query.Limit);
-            }
-            BridgeResult result = Paged("core.things", context.Request, query, total)
-                .Add("scanned", scannedCount).Add("available", all.Count);
-            foreach (Thing thing in page)
-                result.AddLine(ThingLine(thing, context.SessionId, context.Map.uniqueID));
-            FinishPage(result, context.Request, query, total);
-            ApplyScanLimit(result, scanTruncated);
-            return result;
+            context.Request.CooperativeState = new SnapshotProjectionOperation<Thing>(context.Request,
+                query, mapId, all, thing => string.IsNullOrWhiteSpace(query.Filter) || Matches(query.Filter,
+                    thing.def?.defName, thing.LabelShortCap, thing.GetType().FullName),
+                thing => new BridgeQuerySnapshotRow(thing.thingIDNumber,
+                    ThingLine(thing, context.SessionId, mapId)), "core.things");
+            return ((SnapshotProjectionOperation<Thing>)context.Request.CooperativeState).Step(context);
         }
 
         private static BridgeResult Thing(BridgeExecutionContext context)
@@ -294,21 +298,31 @@ namespace RimWorldDevBridge
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            IReadOnlyList<Pawn> all = context.Map.mapPawns.AllPawnsSpawned;
-            bool scanTruncated = all.Count > MaximumScannedObjects;
-            List<Pawn> values = all.Take(MaximumScannedObjects).Where(pawn => pawn.CurJob != null)
-                .Where(pawn => string.IsNullOrWhiteSpace(query.Filter) ||
-                    Matches(query.Filter, pawn.CurJobDef?.defName, pawn.LabelShortCap))
-                .ToList();
-            BridgeResult result = Paged("core.jobs", context.Request, query, values.Count);
-            foreach (Pawn pawn in values.Skip(query.Offset).Take(query.Limit))
-                result.AddLine("job=pawnRef:" + Reference(context.SessionId, context.Map.uniqueID, pawn.thingIDNumber) +
-                    " pawn:" + BridgeText.Clean(pawn.LabelShortCap) + " def:" + BridgeText.Clean(pawn.CurJobDef?.defName) +
+            SnapshotProjectionOperation<Pawn> pending = context.Request.CooperativeState as
+                SnapshotProjectionOperation<Pawn>;
+            if (pending != null) return pending.Step(context);
+            int mapId = context.Map.uniqueID;
+            IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned.ToList() : null;
+            if (all != null && all.Count > BridgeQuerySnapshotStore.MaximumRows)
+                return SnapshotScanLimit(all.Count);
+            if (query.SnapshotId == null && !BridgeQuerySnapshotStore.CanCreate(out failure)) return failure;
+            BridgeQuerySnapshot snapshot;
+            if (query.SnapshotId != null)
+            {
+                if (!ResolveSnapshot(context, query, mapId, 0, Stopwatch.GetTimestamp(), null,
+                    out snapshot, out failure)) return failure;
+                return SnapshotPage("core.jobs", context.Request, query, snapshot);
+            }
+            context.Request.CooperativeState = new SnapshotProjectionOperation<Pawn>(context.Request,
+                query, mapId, all, pawn => pawn.CurJob != null && (string.IsNullOrWhiteSpace(query.Filter) ||
+                    Matches(query.Filter, pawn.CurJobDef?.defName, pawn.LabelShortCap)),
+                pawn => new BridgeQuerySnapshotRow(pawn.thingIDNumber,
+                    "job=pawnRef:" + Reference(context.SessionId, mapId, pawn.thingIDNumber) +
+                    " pawn:" + BridgeText.Clean(pawn.LabelShortCap) +
+                    " def:" + BridgeText.Clean(pawn.CurJobDef?.defName) +
                     " targetA:" + Target(pawn.CurJob.targetA) + " startTick:" + pawn.CurJob.startTick +
-                    " playerForced:" + pawn.CurJob.playerForced);
-            FinishPage(result, context.Request, query, values.Count);
-            ApplyScanLimit(result, scanTruncated);
-            return result;
+                    " playerForced:" + pawn.CurJob.playerForced), "core.jobs");
+            return ((SnapshotProjectionOperation<Pawn>)context.Request.CooperativeState).Step(context);
         }
 
         private static BridgeResult Designations(BridgeExecutionContext context)
@@ -746,6 +760,211 @@ namespace RimWorldDevBridge
                 return false;
             }
             return true;
+        }
+
+        private static bool ResolveSnapshot(BridgeExecutionContext context, BridgeQuery query, int mapId,
+            int scanned, long snapshotStart, Func<List<BridgeQuerySnapshotRow>> project,
+            out BridgeQuerySnapshot snapshot,
+            out BridgeResult failure)
+        {
+            snapshot = null;
+            failure = null;
+            if (query.SnapshotId != null)
+                return BridgeQuerySnapshotStore.TryGet(context.SessionId, context.Request.Command,
+                    query.CursorScope, query.Ordering, mapId, query.SnapshotId, query.SnapshotExpiryTicks,
+                    out snapshot, out failure);
+
+            List<BridgeQuerySnapshotRow> rows;
+            try
+            {
+                context.ThrowIfCancellationRequested();
+                rows = project();
+                context.ThrowIfCancellationRequested();
+                CheckSnapshotBudget(snapshotStart);
+            }
+            catch (SnapshotBudgetExceededException)
+            {
+                failure = SnapshotTimeLimit();
+                return false;
+            }
+            catch (SnapshotMemoryExceededException)
+            {
+                failure = SnapshotMemoryLimit();
+                return false;
+            }
+            if (!BridgeQuerySnapshotStore.TryCreate(context.SessionId, context.Request.Command,
+                query.CursorScope, query.Ordering, mapId, scanned, false, rows, out snapshot, out failure))
+                return false;
+            try { CheckSnapshotBudget(snapshotStart); }
+            catch (SnapshotBudgetExceededException)
+            {
+                BridgeQuerySnapshotStore.Remove(snapshot.Id);
+                snapshot = null;
+                failure = SnapshotTimeLimit();
+                return false;
+            }
+            query.SnapshotId = snapshot.Id;
+            query.SnapshotExpiryTicks = snapshot.ExpiresUtc.Ticks;
+            return true;
+        }
+
+        private static BridgeResult SnapshotScanLimit(int available)
+        {
+            BridgeResult result = BridgeResult.Fail(BridgeStatus.PARTIAL, "snapshot_scan_limit",
+                "The live collection has " + available + " entries; narrow the filter before paging.")
+                .Add("available", available).Add("maximumRows", BridgeQuerySnapshotStore.MaximumRows);
+            result.Truncated = true;
+            return result.Warn("query snapshot was not created because the bounded scan limit was reached");
+        }
+
+        private static BridgeResult SnapshotTimeLimit()
+        {
+            BridgeResult result = BridgeResult.Fail(BridgeStatus.PARTIAL, "snapshot_time_limit",
+                "The query snapshot exceeded the effective main-thread budget; narrow the filter.");
+            result.Truncated = true;
+            return result.Warn("query snapshot was not created within the main-thread budget");
+        }
+
+        private static BridgeResult SnapshotMemoryLimit()
+        {
+            BridgeResult result = BridgeResult.Fail(BridgeStatus.BUSY, "snapshot_memory_limit",
+                "The query snapshot exceeded the configured memory bound; narrow the filter.");
+            result.Truncated = true;
+            return result.Warn("query snapshot was not created within the memory bound");
+        }
+
+        private static void AddSnapshotRow(List<BridgeQuerySnapshotRow> rows, BridgeQuerySnapshotRow row,
+            ref long estimatedBytes)
+        {
+            estimatedBytes += row.EstimatedBytes;
+            if (estimatedBytes > BridgeQuerySnapshotStore.AvailableBytes)
+                throw new SnapshotMemoryExceededException();
+            rows.Add(row);
+        }
+
+        private static void CheckSnapshotBudget(long start)
+        {
+            int budgetMs = BridgeRuntime.EffectiveMainThreadBudgetMs;
+            if (budgetMs > 0 && BridgeTiming.Milliseconds(start) > budgetMs)
+                throw new SnapshotBudgetExceededException();
+        }
+
+        private sealed class SnapshotProjectionOperation<T>
+        {
+            private readonly BridgeRequest request;
+            private readonly BridgeQuery query;
+            private readonly int mapId;
+            private readonly IReadOnlyList<T> source;
+            private readonly Func<T, bool> matches;
+            private readonly Func<T, BridgeQuerySnapshotRow> project;
+            private readonly string schema;
+            private readonly List<BridgeQuerySnapshotRow> rows = new List<BridgeQuerySnapshotRow>();
+            private int index;
+            private long estimatedBytes;
+
+            internal SnapshotProjectionOperation(BridgeRequest request, BridgeQuery query, int mapId,
+                IReadOnlyList<T> source, Func<T, bool> matches, Func<T, BridgeQuerySnapshotRow> project,
+                string schema)
+            {
+                this.request = request;
+                this.query = query;
+                this.mapId = mapId;
+                this.source = source ?? throw new ArgumentNullException(nameof(source));
+                this.matches = matches ?? throw new ArgumentNullException(nameof(matches));
+                this.project = project ?? throw new ArgumentNullException(nameof(project));
+                this.schema = schema;
+            }
+
+            internal BridgeResult Step(BridgeExecutionContext context)
+            {
+                long stepStart = Stopwatch.GetTimestamp();
+                int stepBudget = Math.Max(1, Math.Min(2, BridgeRuntime.EffectiveMainThreadBudgetMs));
+                int processed = 0;
+                try
+                {
+                    while (index < source.Count)
+                    {
+                        if ((index & 31) == 0) context.ThrowIfCancellationRequested();
+                        T value = source[index++];
+                        if (matches(value)) AddSnapshotRow(rows, project(value), ref estimatedBytes);
+                        processed++;
+                        if (processed >= 32 && BridgeTiming.Milliseconds(stepStart) >= stepBudget) break;
+                    }
+                    context.ThrowIfCancellationRequested();
+                    if (index < source.Count)
+                    {
+                        request.YieldExecution = true;
+                        return null;
+                    }
+
+                    BridgeQuerySnapshot snapshot;
+                    BridgeResult failure;
+                    if (!BridgeQuerySnapshotStore.TryCreate(context.SessionId, request.Command,
+                        query.CursorScope, query.Ordering, mapId, source.Count, false, rows,
+                        out snapshot, out failure))
+                    {
+                        request.CooperativeState = null;
+                        return failure;
+                    }
+                    if (BridgeTiming.Milliseconds(stepStart) > BridgeRuntime.EffectiveMainThreadBudgetMs)
+                    {
+                        BridgeQuerySnapshotStore.Remove(snapshot.Id);
+                        request.CooperativeState = null;
+                        return SnapshotTimeLimit();
+                    }
+                    query.SnapshotId = snapshot.Id;
+                    query.SnapshotExpiryTicks = snapshot.ExpiresUtc.Ticks;
+                    request.CooperativeState = null;
+                    return SnapshotPage(schema, request, query, snapshot);
+                }
+                catch (SnapshotMemoryExceededException)
+                {
+                    request.CooperativeState = null;
+                    return SnapshotMemoryLimit();
+                }
+                catch (SnapshotBudgetExceededException)
+                {
+                    request.CooperativeState = null;
+                    return SnapshotTimeLimit();
+                }
+                catch (OperationCanceledException)
+                {
+                    request.CooperativeState = null;
+                    throw;
+                }
+            }
+        }
+
+        private sealed class SnapshotBudgetExceededException : Exception { }
+        private sealed class SnapshotMemoryExceededException : Exception { }
+
+        private static BridgeResult SnapshotPage(string schema, BridgeRequest request, BridgeQuery query,
+            BridgeQuerySnapshot snapshot)
+        {
+            int total = snapshot.Rows.Count;
+            if (query.Offset > total)
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "cursor_offset_invalid");
+            BridgeResult result = Paged(schema, request, query, total)
+                .Add("scanned", snapshot.Scanned).Add("available", snapshot.Available);
+            int end = Math.Min(total, query.Offset + query.Limit);
+            for (int index = query.Offset; index < end; index++) result.AddLine(snapshot.Rows[index].Line);
+            FinishSnapshotPage(result, request, query, snapshot, total);
+            return result;
+        }
+
+        private static void FinishSnapshotPage(BridgeResult result, BridgeRequest request, BridgeQuery query,
+            BridgeQuerySnapshot snapshot, int total)
+        {
+            int next = query.Offset + query.Limit;
+            bool more = next < total;
+            result.Add("hasMore", more);
+            if (more)
+            {
+                result.Truncated = true;
+                result.ContinuationCursor = BridgeCursor.EncodeSnapshot(request.SessionId, request.Command,
+                    query.CursorScope, query.Ordering, snapshot.Id, snapshot.ExpiresUtc.Ticks, next);
+            }
+            else BridgeQuerySnapshotStore.Remove(snapshot.Id);
         }
 
         private static BridgeQuery Query(BridgeRequest request, out BridgeResult failure) =>

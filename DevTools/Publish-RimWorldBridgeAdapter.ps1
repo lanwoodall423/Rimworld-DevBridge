@@ -18,6 +18,7 @@ param(
     [string[]]$SimulationCommands = @(),
     [hashtable]$ProviderCommandAliases = @{},
     [string]$ChangeSummary = "",
+    [ValidateSet("", "cooperative-v1")][string]$ExecutionContract = "",
     [datetime]$BuildUtc = [DateTime]::UtcNow,
     [ValidateRange(1,2147483647)][int]$ProtocolMin = 10,
     [ValidateRange(1,2147483647)][int]$ProtocolMax = 10,
@@ -143,6 +144,7 @@ $manifest = [ordered]@{
     modulePackageId = $(if ($LoadedAssembly) { $LoadedPackageId } else { $null })
     moduleRelativePath = $(if ($LoadedAssembly) { $LoadedModulePath } else { $null })
     moduleMvid = $moduleMvid
+    executionContract = $(if ([string]::IsNullOrWhiteSpace($ExecutionContract)) { $null } else { $ExecutionContract })
 }
 
 $manifestPath = [IO.Path]::Combine($destinationRoot, "$AdapterId.$Generation.manifest.json")

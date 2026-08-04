@@ -62,6 +62,9 @@ namespace RimWorldDevBridge
             Register("RESEARCH", "Current research and completed project count.", BridgeCommandMode.PureRead,
                 BridgeCostClass.Normal, false);
             BridgeDiagnostics.Register(Register);
+            Commands["PAWNS"].Cooperative = true;
+            Commands["THINGS"].Cooperative = true;
+            Commands["JOBS"].Cooperative = true;
         }
 
         internal static IEnumerable<BridgeCommandDescriptor> All => Commands.Values.OrderBy(value => value.Name);
@@ -138,7 +141,6 @@ namespace RimWorldDevBridge
                 .Add("state", BridgeRuntime.Active ? "ON" : "DORMANT")
                 .Add("gameVersion", VersionControl.CurrentVersionStringWithoutBuild)
                 .Add("devMode", Prefs.DevMode)
-                .Add("session", BridgeRuntime.SessionId)
                 .Add("map", BridgeGameState.CurrentMap?.uniqueID.ToString() ?? "none")
                 .Add("tick", BridgeGameState.TickManager?.TicksGame ?? -1)
                 .Add("clients", BridgeRuntime.ActiveClients)
@@ -147,20 +149,17 @@ namespace RimWorldDevBridge
                 .Add("harmonyMs", BridgeRuntime.HarmonyMs)
                 .Add("finalizeInitMs", BridgeRuntime.FinalizeInitMs)
                 .Add("activationMs", BridgeRuntime.ActivationMs)
-                .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes)
-                .Add("context", "test-save")
-                .Add("representativePlayerBehavior", false);
-            return result;
+                .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes);
+            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
         }
 
         private static BridgeResult Session()
         {
-            return BridgeResult.Ok("core.session")
-                .Add("session", BridgeRuntime.SessionId)
+            BridgeResult result = BridgeResult.Ok("core.session")
                 .Add("gameLoaded", Current.Game != null)
                 .Add("mapLoaded", BridgeGameState.CurrentMap != null)
-                .Add("writeContext", BridgeRuntime.WriteContext)
                 .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? true);
+            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
         }
 
         private static BridgeResult Sync(string known)
@@ -168,14 +167,14 @@ namespace RimWorldDevBridge
             string fingerprint = BridgeAdapterCatalog.Fingerprint;
             bool same = string.Equals((known ?? string.Empty).Trim(), fingerprint,
                 StringComparison.OrdinalIgnoreCase);
-            return BridgeResult.Ok("core.sync")
+            BridgeResult result = BridgeResult.Ok("core.sync")
                 .Add("sync", same ? "same" : "changed")
                 .Add("fingerprint", fingerprint)
                 .Add("bridge", BridgeProtocol.BridgeVersion)
                 .Add("protocol", BridgeProtocol.ProtocolVersion)
                 .Add("restart", false)
-                .Add("adapterIndex", BridgeAdapterCatalog.State)
-                .Add("context", "test-save representativePlayerBehavior:false livePlay:only-when-user-directed");
+                .Add("adapterIndex", BridgeAdapterCatalog.State);
+            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
         }
 
         private static BridgeResult Capabilities()
@@ -244,7 +243,9 @@ namespace RimWorldDevBridge
                 .Add("requiresMap", descriptor.RequiresMap)
                 .Add("argumentSchema", descriptor.ArgumentSchema)
                 .Add("resultSchema", descriptor.ResultSchema)
-                .Add("schemaVersion", descriptor.SchemaVersion);
+                .Add("schemaVersion", descriptor.SchemaVersion)
+                .Add("executionContract", descriptor.Cooperative ? "cooperative-v1" :
+                    descriptor.NonCooperative ? "legacy-sync-non-cooperative" : "sync");
         }
 
         private static BridgeResult SetSpeed(string argument)
@@ -316,13 +317,12 @@ namespace RimWorldDevBridge
 
         private static BridgeResult SaveInfo()
         {
-            return BridgeResult.Ok("core.saveInfo")
+            BridgeResult result = BridgeResult.Ok("core.saveInfo")
                 .Add("gameLoaded", Current.Game != null)
                 .Add("programState", Current.ProgramState)
                 .Add("worldSeed", BridgeGameState.World?.info?.seedString ?? "none")
-                .Add("maps", BridgeGameState.Maps?.Count ?? 0)
-                .Add("session", BridgeRuntime.SessionId)
-                .Add("context", BridgeRuntime.WriteContext);
+                .Add("maps", BridgeGameState.Maps?.Count ?? 0);
+            return BridgeRuntime.AddSessionContext(result, BridgeRuntime.SessionContext);
         }
 
         private static BridgeResult Settings()
@@ -331,8 +331,13 @@ namespace RimWorldDevBridge
             return BridgeResult.Ok("core.settings")
                 .Add("remoteMutationEnabled", settings.RemoteMutationEnabled)
                 .Add("queueCapacity", settings.QueueCapacity)
+                .Add("queueCapacityEffective", BridgeRuntime.EffectiveQueueCapacity)
+                .Add("queueCapacityPending", BridgeRuntime.QueueCapacityPending)
                 .Add("connectedClientLimit", settings.ConnectedClientLimit)
                 .Add("mainThreadBudgetMs", settings.MainThreadBudgetMs)
+                .Add("mainThreadBudgetMsEffective", BridgeRuntime.EffectiveMainThreadBudgetMs)
+                .Add("mainThreadBudgetPending", BridgeRuntime.MainThreadBudgetPending)
+                .Add("schedulerReconfiguration", "immediate_on_apply")
                 .Add("retainedAdapterRestartThreshold", settings.RetainedAdapterRestartThreshold);
         }
 
@@ -352,7 +357,9 @@ namespace RimWorldDevBridge
         private static string CommandLine(BridgeCommandDescriptor descriptor) =>
             "cmd=" + descriptor.Name + " mode:" + descriptor.Mode + " cost:" + descriptor.Cost +
             " adapter:" + BridgeText.Clean(descriptor.Provider) + " version:" +
-            BridgeText.Clean(descriptor.ProviderVersion) + " desc:" + BridgeText.Clean(descriptor.Description);
+            BridgeText.Clean(descriptor.ProviderVersion) + " contract:" +
+            (descriptor.Cooperative ? "cooperative-v1" : descriptor.NonCooperative ?
+                "legacy-sync-non-cooperative" : "sync") + " desc:" + BridgeText.Clean(descriptor.Description);
 
         private static void ApplyPage(BridgeResult result, BridgeRequest request, BridgeQuery query, int total)
         {

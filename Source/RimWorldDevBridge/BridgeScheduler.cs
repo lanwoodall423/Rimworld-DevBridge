@@ -45,6 +45,28 @@ namespace RimWorldDevBridge
             }
         }
 
+        internal int QueueCapacity
+        {
+            get { lock (gate) return capacity; }
+        }
+
+        internal int MainThreadBudgetMs
+        {
+            get { lock (gate) return budgetMs; }
+        }
+
+        internal void Reconfigure(int queueCapacity, int mainThreadBudgetMs)
+        {
+            lock (gate)
+            {
+                // Reconfiguration changes admission and drain limits only. Existing queued and running
+                // requests retain their session, cancellation, and execution state.
+                capacity = Math.Max(8, Math.Min(256, queueCapacity));
+                budgetMs = Math.Max(1, Math.Min(12, mainThreadBudgetMs));
+                if (queue.Count > 0) PostDrainLocked();
+            }
+        }
+
         internal BridgeResult Enqueue(BridgeRequest request)
         {
             lock (gate)
@@ -117,16 +139,24 @@ namespace RimWorldDevBridge
 
         private void PostDrainLocked()
         {
+            PostDrainLocked(false);
+        }
+
+        private void PostDrainLocked(bool nextFrame)
+        {
             if (drainPosted) return;
             drainPosted = true;
-            mainContext.Post(_ => Drain(), null);
+            BridgeMainThreadContext bridgeContext = mainContext as BridgeMainThreadContext;
+            if (nextFrame && bridgeContext != null) bridgeContext.PostNextFrame(_ => Drain(), null);
+            else mainContext.Post(_ => Drain(), null);
         }
 
         private void Drain()
         {
             long frameStart = Stopwatch.GetTimestamp();
             int operations = 0;
-            while (operations < 4 && BridgeTiming.Milliseconds(frameStart) < budgetMs)
+            bool yielded = false;
+            while (operations < 4 && BridgeTiming.Milliseconds(frameStart) < MainThreadBudgetMs)
             {
                 BridgeRequest request;
                 lock (gate)
@@ -144,21 +174,22 @@ namespace RimWorldDevBridge
                     CompleteRejected(request, BridgeStatus.CANCELLED, "cancelled_before_execution");
                 else if (request.ClientDisconnected)
                     CompleteRejected(request, BridgeStatus.CANCELLED, "client_disconnected");
-                else if (request.SessionId != sessionId)
+                else if (IsStaleSession(request))
                     CompleteRejected(request, BridgeStatus.INCOMPATIBLE, "stale_session");
                 else if (request.Expired)
                     CompleteRejected(request, BridgeStatus.TIMEOUT, "queue_deadline_expired");
                 else if (request.Cost >= BridgeCostClass.Expensive && !request.AllowExpensive)
                     CompleteRejected(request, BridgeStatus.FORBIDDEN, "expensive_override_required");
                 else
-                    Execute(request);
+                    yielded = Execute(request);
                 operations++;
+                if (yielded) break;
                 if (request.Cost >= BridgeCostClass.Expensive) break;
             }
             lock (gate)
             {
                 drainPosted = false;
-                if (queue.Count > 0) PostDrainLocked();
+                if (queue.Count > 0) PostDrainLocked(yielded);
             }
         }
 
@@ -168,14 +199,23 @@ namespace RimWorldDevBridge
                 .ThenBy(item => item.EnqueuedUtc).FirstOrDefault();
         }
 
-        private void Execute(BridgeRequest request)
+        private bool Execute(BridgeRequest request)
         {
+            if (request.Cancelled || request.ClientDisconnected || request.Expired || IsStaleSession(request))
+            {
+                CompleteRejected(request, request.Expired ? BridgeStatus.TIMEOUT :
+                    IsStaleSession(request) ? BridgeStatus.INCOMPATIBLE : BridgeStatus.CANCELLED,
+                    request.Expired ? "queue_deadline_expired" :
+                        IsStaleSession(request) ? "stale_session" : "cancelled_before_execution");
+                return false;
+            }
             request.Started = true;
+            request.YieldExecution = false;
             long start = Stopwatch.GetTimestamp();
             BridgeResult result;
             try
             {
-                result = executor(request) ?? BridgeResult.Fail(BridgeStatus.ERROR, "empty_result");
+                result = executor(request);
             }
             catch (OperationCanceledException)
             {
@@ -187,8 +227,49 @@ namespace RimWorldDevBridge
                 result = BridgeResult.Fail(BridgeStatus.ERROR, exception.GetType().Name,
                     exception.GetBaseException().Message);
             }
-            double executionMs = BridgeTiming.Milliseconds(start);
+            double stepMs = BridgeTiming.Milliseconds(start);
+            bool yielded = request.YieldExecution && result == null;
+            request.YieldExecution = false;
+            if (request.Cancelled || request.ClientDisconnected || request.Expired || IsStaleSession(request))
+            {
+                CompleteRejected(request, request.Expired ? BridgeStatus.TIMEOUT :
+                    IsStaleSession(request) ? BridgeStatus.INCOMPATIBLE : BridgeStatus.CANCELLED,
+                    request.Expired ? "execution_deadline_expired" :
+                        IsStaleSession(request) ? "stale_session" : "execution_cancelled");
+                return false;
+            }
+            if (yielded)
+            {
+                request.CooperativeExecutionMs += stepMs;
+                request.CooperativeSteps++;
+                if (stepMs > request.CooperativeMaxStepMs) request.CooperativeMaxStepMs = stepMs;
+                if (stepMs > MainThreadBudgetMs) request.CooperativeMainThreadOverrun = true;
+                lock (gate)
+                {
+                    bool stale = request.Cancelled || request.ClientDisconnected || request.Expired ||
+                        request.SessionId != sessionId;
+                    running.Remove(request.RequestId);
+                    if (!stale) queue.Add(request);
+                }
+                if (request.Cancelled || request.ClientDisconnected || request.Expired || request.SessionId != sessionId)
+                {
+                    CompleteRejected(request, request.Expired ? BridgeStatus.TIMEOUT :
+                        request.SessionId != sessionId ? BridgeStatus.INCOMPATIBLE : BridgeStatus.CANCELLED,
+                        request.Expired ? "execution_deadline_expired" :
+                            request.SessionId != sessionId ? "stale_session" : "execution_cancelled");
+                    return false;
+                }
+                return true;
+            }
+            if (result == null) result = BridgeResult.Fail(BridgeStatus.ERROR, "empty_result");
+            double executionMs = request.CooperativeExecutionMs + stepMs;
+            if (request.CooperativeExecutionMs > 0d || request.PreparedDescriptor?.Cooperative == true)
+                request.CooperativeSteps++;
             result.ExecutionMs = executionMs;
+            result.MainThreadBudgetMs = MainThreadBudgetMs;
+            result.MainThreadOverrun = request.CooperativeMainThreadOverrun || stepMs > MainThreadBudgetMs;
+            result.MaxMainThreadStepMs = Math.Max(stepMs, request.CooperativeMaxStepMs);
+            result.CooperativeSteps = request.CooperativeSteps;
             result.QueueDelayMs = Math.Max(0d, (DateTime.UtcNow - request.EnqueuedUtc).TotalMilliseconds - executionMs);
             if (DateTime.UtcNow >= request.DeadlineUtc && result.Status == BridgeStatus.OK &&
                 request.Mode == BridgeCommandMode.PureRead)
@@ -198,8 +279,10 @@ namespace RimWorldDevBridge
             }
             else if (DateTime.UtcNow >= request.DeadlineUtc && request.Mode != BridgeCommandMode.PureRead)
                 result.Warn("Mutation completed after its deadline; result retained to avoid ambiguous retries.");
-            if (executionMs >= 50d || executionMs > budgetMs)
-                result.Warn("slow main-thread command: " + executionMs.ToString("0.###") + " ms");
+            if (stepMs >= 50d || stepMs > MainThreadBudgetMs)
+                result.Warn("slow main-thread step: " + stepMs.ToString("0.###") + " ms");
+            if (request.CooperativeMainThreadOverrun && stepMs <= MainThreadBudgetMs)
+                result.Warn("a prior cooperative main-thread step exceeded the configured budget");
             try { completed?.Invoke(request, result); }
             catch (Exception exception)
             {
@@ -219,6 +302,7 @@ namespace RimWorldDevBridge
                 }
             }
             request.Done.Set();
+            return false;
         }
 
         private void CompleteRejected(BridgeRequest request, BridgeStatus status, string code)
@@ -226,6 +310,11 @@ namespace RimWorldDevBridge
             lock (gate) running.Remove(request.RequestId);
             request.Result = BridgeResult.Fail(status, code);
             request.Done.Set();
+        }
+
+        private bool IsStaleSession(BridgeRequest request)
+        {
+            lock (gate) return request.SessionId != sessionId;
         }
     }
 }
