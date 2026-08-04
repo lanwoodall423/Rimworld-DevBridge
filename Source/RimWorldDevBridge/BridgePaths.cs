@@ -11,10 +11,11 @@ namespace RimWorldDevBridge
         private static string userRootOverride;
         internal static string UserRoot => userRootOverride ??
             Path.Combine(GenFilePaths.SaveDataFolderPath, "RimWorldDevBridge");
-        internal static string StatusPath => Path.Combine(GenFilePaths.SaveDataFolderPath, Prefix + "Status.txt");
-        internal static string WakePath => Path.Combine(GenFilePaths.SaveDataFolderPath, Prefix + "Wake.request");
-        internal static string InputPath => Path.Combine(GenFilePaths.SaveDataFolderPath, Prefix + "In.txt");
-        internal static string OutputPath => Path.Combine(GenFilePaths.SaveDataFolderPath, Prefix + "Out.txt");
+        private static string FileRoot => userRootOverride ?? GenFilePaths.SaveDataFolderPath;
+        internal static string StatusPath => Path.Combine(FileRoot, Prefix + "Status.txt");
+        internal static string WakePath => Path.Combine(FileRoot, Prefix + "Wake.request");
+        internal static string InputPath => Path.Combine(FileRoot, Prefix + "In.txt");
+        internal static string OutputPath => Path.Combine(FileRoot, Prefix + "Out.txt");
         internal static string AdapterPath => Path.Combine(ModRoot, "DevTools", "HotAdapters");
         internal static string MacroPath => Path.Combine(UserRoot, "Macros.xml");
         internal static string FeatureTestPath => Path.Combine(UserRoot, "FeatureTests");

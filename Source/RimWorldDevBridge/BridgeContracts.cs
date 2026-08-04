@@ -296,6 +296,7 @@ namespace RimWorldDevBridge
         public volatile bool ClientDisconnected;
         public volatile bool Started;
         internal string AuthToken;
+        internal int TransportGeneration;
         internal string PreparedAdapterId;
         internal string PreparedAdapterGeneration;
         internal object PreparedAdapter;

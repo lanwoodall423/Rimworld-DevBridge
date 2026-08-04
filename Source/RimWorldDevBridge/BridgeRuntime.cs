@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -29,9 +30,7 @@ namespace RimWorldDevBridge
         private const string WakeFileName = BridgePaths.Prefix + "Wake.request";
         private const string InputFileName = BridgePaths.Prefix + "In.txt";
         private static FileSystemWatcher watcher;
-        private static TcpListener listener;
-        private static Thread listenerThread;
-        private static Timer idleTimer;
+        private static TransportState transportState;
         private static volatile bool active;
         private static volatile bool transportReady;
         private static volatile bool activationIndexStarted;
@@ -42,8 +41,8 @@ namespace RimWorldDevBridge
         private static long gameTransitionSequence;
         private static long publishedGameTransitionSequence;
         private static int publishedGameTransitionThreadId;
-        private static int activeClients;
         private static int port;
+        private static volatile string statusPath;
         private static volatile SessionIdentity identity =
             new SessionIdentity("menu-" + Guid.NewGuid().ToString("N"), string.Empty);
         private static long lastActivityUtcTicks;
@@ -57,7 +56,14 @@ namespace RimWorldDevBridge
         private static bool bootstrapped;
 
         internal static bool Active => active;
-        internal static int ActiveClients => Math.Max(0, Volatile.Read(ref activeClients));
+        internal static int ActiveClients
+        {
+            get
+            {
+                TransportState current = Volatile.Read(ref transportState);
+                return current == null ? 0 : Math.Max(0, Volatile.Read(ref current.ActiveClients));
+            }
+        }
         internal static double BootstrapMs => bootstrapMs;
         internal static double HarmonyMs => harmonyMs;
         internal static double FinalizeInitMs => finalizeInitMs;
@@ -88,6 +94,20 @@ namespace RimWorldDevBridge
             Interlocked.Read(ref publishedGameTransitionSequence);
         internal static int PublishedLifecycleThreadIdForTests =>
             Volatile.Read(ref publishedGameTransitionThreadId);
+        internal static int TransportGenerationForTests => Volatile.Read(ref transportGeneration);
+        internal static int TransportResourceGenerationForTests
+        {
+            get
+            {
+                TransportState current = Volatile.Read(ref transportState);
+                return current == null ? 0 : current.Generation;
+            }
+        }
+        internal static int TransportPortForTests => Volatile.Read(ref port);
+        internal static void SignalWakeForTests() => WakeSignal.Signal();
+        internal static void CaptureStatusPathForTests() => statusPath = BridgePaths.StatusPath;
+        internal static bool AuthenticateForTests(string raw, string expectedToken, out string payload) =>
+            TrySplitAuthentication(raw, expectedToken, out payload);
 
         internal static BridgeResult AddSessionContext(BridgeResult result, BridgeSessionContextSnapshot snapshot)
         {
@@ -105,6 +125,7 @@ namespace RimWorldDevBridge
             if (bootstrapped) return;
             bootstrapped = true;
             BridgePaths.Initialize(modRoot);
+            statusPath = BridgePaths.StatusPath;
             Authorization.RotateSession(identity.SessionId);
             Scheduler.Configure(MainThread, identity.SessionId, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
             long harmonyStart = Stopwatch.GetTimestamp();
@@ -143,7 +164,13 @@ namespace RimWorldDevBridge
             AssertMainThread("root update");
             ProcessPendingFileSignals();
             RefreshIndicator();
-            if (!active) return;
+            if (!active)
+            {
+                // Lifecycle publication must still run while transport is inactive. Keep this
+                // path limited to deferred callbacks; command and map work remains dormant.
+                DrainMainThread();
+                return;
+            }
             if (BridgeQuerySnapshotStore.ActiveCount > 0)
                 BridgeQuerySnapshotStore.CleanupStaleMaps((BridgeGameState.Maps ?? new List<Map>())
                     .Select(map => map.uniqueID));
@@ -183,6 +210,7 @@ namespace RimWorldDevBridge
         {
             long sequence = Interlocked.Increment(ref gameTransitionSequence);
             string nextSession = (enteringMenu ? "menu" : "loading") + "-" + Guid.NewGuid().ToString("N");
+            TransportState staleTransport;
             lock (Gate)
             {
                 identity = new SessionIdentity(nextSession, string.Empty);
@@ -190,32 +218,51 @@ namespace RimWorldDevBridge
                 transportReady = false;
                 activationIndexStarted = false;
                 legacyInputPending = false;
-                Interlocked.Increment(ref transportGeneration);
+                staleTransport = DetachTransportLocked();
                 Authorization.RotateSession(nextSession);
                 BridgeQuerySnapshotStore.RotateSession();
                 Scheduler.RotateSession(nextSession);
             }
+            // Serialize removal with any in-flight status write. If a new generation was already
+            // activated, its status publication owns the path and must not be deleted by this stale
+            // transition.
+            lock (StatusGate)
+            {
+                if (Volatile.Read(ref transportState) == null && !active) TryDelete(statusPath);
+            }
+            // Detachment above makes the state unreachable before any new activation can use the
+            // generation. Close only the detached resources, outside Gate, to keep the worker prefix
+            // from holding lifecycle locks while sockets/timers are being disposed.
+            CloseTransportResources(staleTransport);
 
             // The Game object is intentionally not captured. The callback is sequence/session bound
             // so an older transition cannot publish state after a newer transition or finalization.
-            MainThread.Post(_ => ApplyGameTransition(sequence, nextSession, enteringMenu), null);
+            MainThread.Post(_ => ApplyGameTransition(sequence, nextSession, enteringMenu,
+                staleTransport == null ? 0 : staleTransport.Generation), null);
         }
 
-        private static void ApplyGameTransition(long sequence, string expectedSession, bool enteringMenu)
+        private static void ApplyGameTransition(long sequence, string expectedSession, bool enteringMenu,
+            int invalidatedGeneration)
         {
             if (shuttingDown || sequence != Interlocked.Read(ref gameTransitionSequence) ||
                 !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
             AssertMainThread("game transition publication");
             if (sequence != Interlocked.Read(ref gameTransitionSequence) ||
                 !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
-            Volatile.Write(ref publishedGameTransitionThreadId, Thread.CurrentThread.ManagedThreadId);
-            Interlocked.Exchange(ref publishedGameTransitionSequence, sequence);
-            StopTransport(false);
-            if (sequence != Interlocked.Read(ref gameTransitionSequence) ||
-                !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
-            BridgeEventJournal.Record("lifecycle", (enteringMenu ? "main menu" : "game changing") +
-                " sequence:" + sequence);
-            WriteStatus("DORMANT");
+            lock (Gate)
+            {
+                if (sequence != Interlocked.Read(ref gameTransitionSequence) ||
+                    !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
+                TransportState current = Volatile.Read(ref transportState);
+                if ((invalidatedGeneration != 0 && current != null) ||
+                    (invalidatedGeneration == 0 && (current != null || active))) return;
+                Volatile.Write(ref publishedGameTransitionThreadId, Thread.CurrentThread.ManagedThreadId);
+                Interlocked.Exchange(ref publishedGameTransitionSequence, sequence);
+                BridgeEventJournal.Record("lifecycle", (enteringMenu ? "main menu" : "game changing") +
+                    " sequence:" + sequence);
+                RefreshIndicator();
+                WriteStatus("DORMANT");
+            }
         }
 
         internal static int DrainMainThreadForTests()
@@ -287,15 +334,18 @@ namespace RimWorldDevBridge
         private static void RotateSession(string prefix)
         {
             AssertMainThread("session rotation");
+            TransportState stale;
             lock (Gate)
             {
                 string next = prefix + "-" + Guid.NewGuid().ToString("N");
+                stale = DetachTransportLocked();
                 Authorization.RotateSession(next);
                 BridgeQuerySnapshotStore.RotateSession();
                 Scheduler.Configure(MainThread, next, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
                 Scheduler.RotateSession(next);
-                identity = new SessionIdentity(next, active ? Guid.NewGuid().ToString("N") : string.Empty);
+                identity = new SessionIdentity(next, string.Empty);
             }
+            CloseTransportResources(stale);
             RefreshIndicator();
         }
 
@@ -340,60 +390,66 @@ namespace RimWorldDevBridge
             lock (Gate)
             {
                 if (shuttingDown) return;
-                if (active && listener != null)
+                TransportState current = Volatile.Read(ref transportState);
+                if (IsCurrentTransport(current))
                 {
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
                     return;
                 }
-                StopTransport(false);
+                TransportState stale = DetachTransportLocked();
+                CloseTransportResources(stale);
                 try
                 {
                     SessionIdentity currentIdentity = identity;
-                    identity = new SessionIdentity(currentIdentity.SessionId, Guid.NewGuid().ToString("N"));
+                    string token = Guid.NewGuid().ToString("N");
+                    identity = new SessionIdentity(currentIdentity.SessionId, token);
                     activationStartTicks = Stopwatch.GetTimestamp();
-                    listener = new TcpListener(IPAddress.Loopback, 0);
-                    listener.Start(Settings.ConnectedClientLimit);
-                    port = ((IPEndPoint)listener.LocalEndpoint).Port;
+                    int generation = Interlocked.Increment(ref transportGeneration);
+                    TcpListener currentListener = new TcpListener(IPAddress.Loopback, 0);
+                    currentListener.Start(Settings.ConnectedClientLimit);
+                    port = ((IPEndPoint)currentListener.LocalEndpoint).Port;
+                    TransportState next = new TransportState(generation, currentListener,
+                        currentIdentity.SessionId, token);
+                    transportState = next;
                     active = true;
                     transportReady = false;
                     activationIndexStarted = false;
-                    int generation = Interlocked.Increment(ref transportGeneration);
-                    TcpListener current = listener;
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                    listenerThread = new Thread(() => Listen(current, generation))
+                    Thread listenerThread = new Thread(() => Listen(next))
                     {
                         IsBackground = true,
                         Name = "RimWorld Dev Bridge v2"
                     };
                     listenerThread.Start();
-                    idleTimer = new Timer(_ => CheckIdle(generation), null, 10000, 10000);
+                    next.IdleTimer = new Timer(_ => CheckIdle(next), null, 10000, 10000);
                     RefreshIndicator();
                     WriteStatus("ACTIVATING");
                 }
                 catch (Exception exception)
                 {
-                    StopTransport(false);
+                    TransportState failed = DetachTransportLocked();
+                    CloseTransportResources(failed);
                     WriteStatus("DORMANT", "activationError=" + BridgeText.Clean(exception.GetBaseException().Message));
                 }
             }
         }
 
-        private static void StopTransport(bool writeDormant)
+        private static void StopTransport(bool writeDormant, TransportState expectedState = null)
         {
             AssertMainThread("transport stop");
+            TransportState stale;
+            int detachedGeneration;
             lock (Gate)
             {
-                active = false;
-                transportReady = false;
-                activationIndexStarted = false;
-                Interlocked.Increment(ref transportGeneration);
-                try { idleTimer?.Dispose(); } catch { }
-                idleTimer = null;
-                try { listener?.Stop(); } catch { }
-                listener = null;
-                port = 0;
-                SessionIdentity currentIdentity = identity;
-                identity = new SessionIdentity(currentIdentity.SessionId, string.Empty);
+                if (expectedState != null && !ReferenceEquals(transportState, expectedState)) return;
+                stale = DetachTransportLocked();
+                detachedGeneration = Volatile.Read(ref transportGeneration);
+            }
+            CloseTransportResources(stale);
+            lock (Gate)
+            {
+                if (detachedGeneration != Volatile.Read(ref transportGeneration) ||
+                    transportState != null || active) return;
                 RefreshIndicator();
                 if (writeDormant && !shuttingDown) WriteStatus("DORMANT");
             }
@@ -420,58 +476,70 @@ namespace RimWorldDevBridge
             catch { }
         }
 
-        private static void CheckIdle(int generation)
+        private static void CheckIdle(TransportState state)
         {
-            if (!active || generation != transportGeneration) return;
+            if (!IsCurrentTransport(state)) return;
             if (DateTime.UtcNow.Ticks - Interlocked.Read(ref lastActivityUtcTicks) <
                 TimeSpan.FromSeconds(IdleSeconds).Ticks) return;
             MainThread.Post(_ =>
             {
-                if (generation == transportGeneration && ActiveClients == 0 &&
+                if (IsCurrentTransport(state) && ActiveClients == 0 &&
                     DateTime.UtcNow.Ticks - Interlocked.Read(ref lastActivityUtcTicks) >=
-                    TimeSpan.FromSeconds(IdleSeconds).Ticks) StopTransport(true);
+                    TimeSpan.FromSeconds(IdleSeconds).Ticks) StopTransport(true, state);
             }, null);
         }
 
-        private static void Listen(TcpListener current, int generation)
+        private static void Listen(TransportState state)
         {
-            while (active && generation == transportGeneration)
+            while (IsCurrentTransport(state))
             {
                 TcpClient client = null;
                 try
                 {
-                    client = current.AcceptTcpClient();
-                    if (Interlocked.Increment(ref activeClients) > Settings.ConnectedClientLimit)
+                    client = state.Listener.AcceptTcpClient();
+                    if (!IsCurrentTransport(state))
                     {
-                        Interlocked.Decrement(ref activeClients);
+                        client.Close();
+                        client = null;
+                        return;
+                    }
+                    if (Interlocked.Increment(ref state.ActiveClients) > Settings.ConnectedClientLimit)
+                    {
+                        Interlocked.Decrement(ref state.ActiveClients);
                         WriteDirect(client, "id=unknown\nstatus=BUSY\nerror=connected_client_limit");
                         client = null;
                         continue;
                     }
+                    state.Clients.TryAdd(client, 0);
                     TcpClient accepted = client;
                     client = null;
-                    if (!ThreadPool.QueueUserWorkItem(_ => HandleClient(accepted)))
+                    if (!IsCurrentTransport(state) || !state.Clients.ContainsKey(accepted))
                     {
-                        accepted.Close();
-                        Interlocked.Decrement(ref activeClients);
-                        RequestIndicatorRefresh();
+                        RemoveClient(state, accepted);
+                        continue;
+                    }
+                    if (!ThreadPool.QueueUserWorkItem(_ => HandleClient(state, accepted)))
+                    {
+                        RemoveClient(state, accepted);
+                        RequestIndicatorRefresh(state);
                     }
                     else
                     {
-                        RequestIndicatorRefresh();
+                        RequestIndicatorRefresh(state);
                     }
                 }
-                catch (SocketException) { if (!active || generation != transportGeneration) return; }
+                catch (SocketException) { if (!IsCurrentTransport(state)) return; }
                 catch (ObjectDisposedException) { return; }
                 catch { try { client?.Close(); } catch { } }
             }
         }
 
-        private static void HandleClient(TcpClient client)
+        private static void HandleClient(TransportState state, TcpClient client)
         {
             BridgeRequest request = null;
             try
             {
+                if (!IsCurrentTransport(state)) return;
                 client.NoDelay = true;
                 client.ReceiveTimeout = BridgeProtocol.MaximumDeadlineMs;
                 client.SendTimeout = BridgeProtocol.MaximumDeadlineMs;
@@ -491,19 +559,25 @@ namespace RimWorldDevBridge
                         writer.Write(BridgeProtocol.Serialize(invalid, "line"));
                         return;
                     }
-                    SessionIdentity acceptedIdentity = identity;
-                    string prefix = acceptedIdentity.Token + "|";
-                    if (string.IsNullOrEmpty(raw) || !raw.StartsWith(prefix, StringComparison.Ordinal))
+                    if (!IsCurrentTransport(state) || string.IsNullOrEmpty(state.Token) ||
+                        string.IsNullOrEmpty(state.SessionId) || !TrySplitAuthentication(raw,
+                            state.Token, out string payload))
                     {
                         writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=authentication_failed");
                         return;
                     }
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                    if (!BridgeProtocol.TryParse(raw.Substring(prefix.Length), acceptedIdentity.SessionId, out request,
+                    if (!BridgeProtocol.TryParse(payload, state.SessionId, out request,
                         out BridgeResult parseFailure))
                     {
                         Decorate(parseFailure, request, "core", BridgeProtocol.BridgeVersion);
                         writer.Write(BridgeProtocol.Serialize(parseFailure, "line"));
+                        return;
+                    }
+                    request.TransportGeneration = state.Generation;
+                    if (!IsCurrentTransport(state))
+                    {
+                        writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=stale_transport");
                         return;
                     }
                     if (request.Command == "CANCEL")
@@ -532,6 +606,11 @@ namespace RimWorldDevBridge
                         writer.Write(BridgeProtocol.Serialize(prepareFailure, request.OutputFormat));
                         return;
                     }
+                    if (!IsCurrentTransport(state) || request.SessionId != SessionId)
+                    {
+                        writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=stale_transport");
+                        return;
+                    }
                     request.EnqueuedUtc = DateTime.UtcNow;
                     BridgeResult enqueueFailure = Scheduler.Enqueue(request);
                     if (enqueueFailure != null)
@@ -542,6 +621,11 @@ namespace RimWorldDevBridge
                     }
                     while (!request.Done.Wait(20))
                     {
+                        if (!IsCurrentTransport(state))
+                        {
+                            request.Cancelled = true;
+                            if (!request.Started) Scheduler.Cancel(request.RequestId);
+                        }
                         if (request.Expired)
                         {
                             request.Cancelled = true;
@@ -561,18 +645,18 @@ namespace RimWorldDevBridge
             catch { if (request != null && !request.Started) request.ClientDisconnected = true; }
             finally
             {
-                Interlocked.Decrement(ref activeClients);
-                RequestIndicatorRefresh();
+                RemoveClient(state, client);
+                RequestIndicatorRefresh(state);
             }
         }
 
-        private static void RequestIndicatorRefresh()
+        private static void RequestIndicatorRefresh(TransportState state)
         {
             try
             {
                 MainThread.Post(_ =>
                 {
-                    if (!shuttingDown) RefreshIndicator();
+                    if (!shuttingDown && IsCurrentTransport(state)) RefreshIndicator();
                 }, null);
             }
             catch { }
@@ -596,6 +680,8 @@ namespace RimWorldDevBridge
                     {
                     failure = request.SessionId != SessionId
                         ? BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_session")
+                        : !IsCurrentRequestTransport(request)
+                            ? BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport")
                         : request.Expired || request.Cancelled
                             ? BridgeResult.Fail(request.Expired ? BridgeStatus.TIMEOUT : BridgeStatus.CANCELLED,
                                 request.Expired ? "deadline_expired" : "cancelled_before_prepare")
@@ -644,6 +730,9 @@ namespace RimWorldDevBridge
 
         private static BridgeResult ExecuteScheduled(BridgeRequest request)
         {
+            if (!IsCurrentRequestTransport(request))
+                return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport"), request,
+                    "core", BridgeProtocol.BridgeVersion);
             BridgeCommandDescriptor descriptor = request.PreparedDescriptor ?? BridgeDispatch.Describe(request);
             if (descriptor == null) return Decorate(BridgeResult.Fail(BridgeStatus.NOT_FOUND,
                 "unknown_command"), request, "core", BridgeProtocol.BridgeVersion);
@@ -656,6 +745,9 @@ namespace RimWorldDevBridge
                 return Decorate(authorization, request, descriptor.Provider, descriptor.ProviderVersion);
             if (Authorization.TryGetCompleted(request, out BridgeResult cached))
                 return Decorate(cached, request, descriptor.Provider, descriptor.ProviderVersion);
+            if (!IsCurrentRequestTransport(request) || request.SessionId != SessionId)
+                return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport"), request,
+                    descriptor.Provider, descriptor.ProviderVersion);
             if (descriptor.RequiresMap && BridgeGameState.CurrentMap == null)
                 return Decorate(BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "map_required"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
@@ -667,20 +759,29 @@ namespace RimWorldDevBridge
                 return Decorate(BridgeResult.Fail(request.Expired ? BridgeStatus.TIMEOUT : BridgeStatus.CANCELLED,
                     request.Expired ? "deadline_expired" : "cancelled_before_execution"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
+            if (!IsCurrentRequestTransport(request) || request.SessionId != SessionId)
+                return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport"), request,
+                    descriptor.Provider, descriptor.ProviderVersion);
             int tickBefore = BridgeGameState.TickManager?.TicksGame ?? -1;
             BridgeExecutionContext context = new BridgeExecutionContext(request, BridgeGameState.CurrentMap,
                 () => request.Cancelled || request.ClientDisconnected);
             request.ExecutionReached = true;
             BridgeResult result = BridgeDispatch.Execute(context);
+            bool staleTransport = !IsCurrentRequestTransport(request);
             if (request.Cancelled || request.ClientDisconnected || request.Expired ||
-                request.SessionId != SessionId)
+                request.SessionId != SessionId || staleTransport)
             {
                 return Decorate(BridgeResult.Fail(request.Expired ? BridgeStatus.TIMEOUT :
-                    request.SessionId != SessionId ? BridgeStatus.INCOMPATIBLE : BridgeStatus.CANCELLED,
+                    (request.SessionId != SessionId || staleTransport) ? BridgeStatus.INCOMPATIBLE :
+                        BridgeStatus.CANCELLED,
                     request.Expired ? "execution_deadline_expired" :
+                        staleTransport ? "stale_transport" :
                         request.SessionId != SessionId ? "stale_session" : "execution_cancelled"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
             }
+            if (!IsCurrentRequestTransport(request) || request.SessionId != SessionId)
+                return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport"), request,
+                    descriptor.Provider, descriptor.ProviderVersion);
             if (result == null && request.YieldExecution) return null;
             if (result == null) result = BridgeResult.Fail(BridgeStatus.ERROR, "empty_result");
             result.TickBefore = tickBefore;
@@ -693,7 +794,8 @@ namespace RimWorldDevBridge
         {
             BridgeCommandDescriptor descriptor = request.PreparedDescriptor ?? BridgeDispatch.Describe(request);
             if (descriptor == null) return;
-            bool currentSession = string.Equals(request.SessionId, SessionId, StringComparison.Ordinal);
+            bool currentSession = string.Equals(request.SessionId, SessionId, StringComparison.Ordinal) &&
+                IsCurrentRequestTransport(request);
             if (!request.IdempotentReplay && currentSession)
             {
                 if (request.ExecutionReached) Authorization.Remember(request, result);
@@ -717,6 +819,90 @@ namespace RimWorldDevBridge
             result.Mode = request?.Mode ?? BridgeCommandMode.PureRead;
             result.PreparationMs = request?.PreparationMs ?? result.PreparationMs;
             return result;
+        }
+
+        private static bool IsCurrentRequestTransport(BridgeRequest request)
+        {
+            if (request == null || request.TransportGeneration == 0) return true;
+            TransportState current = Volatile.Read(ref transportState);
+            return current != null && IsCurrentTransport(current) &&
+                current.Generation == request.TransportGeneration;
+        }
+
+        private static bool IsCurrentTransport(TransportState state)
+        {
+            if (state == null || state.Invalidated || !active) return false;
+            if (!ReferenceEquals(Volatile.Read(ref transportState), state)) return false;
+            if (state.Generation != Volatile.Read(ref transportGeneration)) return false;
+            SessionIdentity current = identity;
+            if (string.IsNullOrEmpty(current.SessionId) || string.IsNullOrEmpty(current.Token) ||
+                string.IsNullOrEmpty(state.SessionId) || string.IsNullOrEmpty(state.Token)) return false;
+            return string.Equals(current.SessionId, state.SessionId, StringComparison.Ordinal) &&
+                ConstantTimeTokenEquals(current.Token, state.Token);
+        }
+
+        private static bool TrySplitAuthentication(string raw, string expectedToken, out string payload)
+        {
+            payload = null;
+            if (string.IsNullOrEmpty(raw) || string.IsNullOrEmpty(expectedToken)) return false;
+            int separator = raw.IndexOf('|');
+            if (separator <= 0) return false;
+            string supplied = raw.Substring(0, separator);
+            if (!ConstantTimeTokenEquals(supplied, expectedToken)) return false;
+            payload = raw.Substring(separator + 1);
+            return true;
+        }
+
+        private static bool ConstantTimeTokenEquals(string left, string right)
+        {
+            if (left == null || right == null) return false;
+            int difference = left.Length ^ right.Length;
+            int length = Math.Max(left.Length, right.Length);
+            for (int index = 0; index < length; index++)
+            {
+                int leftValue = index < left.Length ? left[index] : 0;
+                int rightValue = index < right.Length ? right[index] : 0;
+                difference |= leftValue ^ rightValue;
+            }
+            return difference == 0;
+        }
+
+        private static TransportState DetachTransportLocked()
+        {
+            TransportState stale = transportState;
+            transportState = null;
+            if (stale != null) stale.Invalidated = true;
+            active = false;
+            transportReady = false;
+            activationIndexStarted = false;
+            legacyInputPending = false;
+            port = 0;
+            Interlocked.Increment(ref transportGeneration);
+            SessionIdentity current = identity;
+            identity = new SessionIdentity(current.SessionId, string.Empty);
+            return stale;
+        }
+
+        private static void CloseTransportResources(TransportState stale)
+        {
+            if (stale == null) return;
+            stale.Invalidated = true;
+            try { stale.IdleTimer?.Dispose(); } catch { }
+            try { stale.Listener?.Stop(); } catch { }
+            foreach (TcpClient client in stale.Clients.Keys.ToArray())
+            {
+                try { client.Close(); } catch { }
+            }
+            stale.Clients.Clear();
+            Volatile.Write(ref stale.ActiveClients, 0);
+        }
+
+        private static void RemoveClient(TransportState state, TcpClient client)
+        {
+            if (state == null || client == null) return;
+            if (state.Clients.TryRemove(client, out _))
+                Interlocked.Decrement(ref state.ActiveClients);
+            try { client.Close(); } catch { }
         }
 
         private static void ProcessLegacyFile()
@@ -867,6 +1053,27 @@ namespace RimWorldDevBridge
         private static void AssertMainThread(string operation)
         {
             MainThread.AssertOwnerThread(operation);
+        }
+
+        private sealed class TransportState
+        {
+            internal readonly int Generation;
+            internal readonly TcpListener Listener;
+            internal readonly string SessionId;
+            internal readonly string Token;
+            internal readonly ConcurrentDictionary<TcpClient, byte> Clients =
+                new ConcurrentDictionary<TcpClient, byte>();
+            internal volatile Timer IdleTimer;
+            internal volatile bool Invalidated;
+            internal int ActiveClients;
+
+            internal TransportState(int generation, TcpListener listener, string sessionId, string token)
+            {
+                Generation = generation;
+                Listener = listener;
+                SessionId = sessionId;
+                Token = token;
+            }
         }
 
         private sealed class SessionIdentity

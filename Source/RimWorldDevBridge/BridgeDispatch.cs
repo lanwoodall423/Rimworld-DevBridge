@@ -49,6 +49,7 @@ namespace RimWorldDevBridge
                 DetailLevel = parent.DetailLevel,
                 AllowExpensive = parent.AllowExpensive,
                 AuthToken = parent.AuthToken,
+                TransportGeneration = parent.TransportGeneration,
                 IdempotencyKey = parent.IdempotencyKey,
                 NestingDepth = parent.NestingDepth + 1
             };
@@ -94,6 +95,7 @@ namespace RimWorldDevBridge
                 Mode = source.Mode,
                 Cost = source.Cost,
                 AuthToken = source.AuthToken,
+                TransportGeneration = source.TransportGeneration,
                 IdempotencyKey = source.IdempotencyKey,
                 PreparedAdapterId = source.PreparedAdapterId,
                 PreparedAdapterGeneration = source.PreparedAdapterGeneration,

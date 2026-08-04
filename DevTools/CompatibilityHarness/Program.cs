@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Runtime.Serialization.Json;
@@ -70,6 +71,7 @@ internal static class Program
         Run("macro cycle quarantined", MacroCycleQuarantined);
         Run("manifest generation reuse rejected", ManifestGenerationReuseRejected);
         Run("slow legacy adapter circuit breaker", SlowLegacyAdapterCircuitBreaker);
+        Run("production transport lifecycle", ProductionTransportLifecycle);
         Console.WriteLine("compatibility=" + (failed == 0 ? "PASS" : "FAIL") +
             " passed=" + passed + " failed=" + failed);
         int exitCode = failed == 0 ? 0 : 1;
@@ -497,7 +499,7 @@ internal static class Program
 
     private static void WorkerGameTransitionLifecycle()
     {
-        BridgeRuntime.DrainMainThreadForTests();
+        BridgeRuntime.OnRootUpdate();
         InvokeRotateSession("lifecycle-test");
         FieldInfo authorizationField = typeof(BridgeRuntime).GetField("Authorization",
             BindingFlags.Static | BindingFlags.NonPublic);
@@ -534,7 +536,7 @@ internal static class Program
         Equal(publishedBefore, BridgeRuntime.PublishedLifecycleSequenceForTests,
             "lifecycle publication was not deferred");
 
-        Check(BridgeRuntime.DrainMainThreadForTests() >= 1, "null transition publication drain");
+        BridgeRuntime.OnRootUpdate();
         Equal(nullSequence, BridgeRuntime.PublishedLifecycleSequenceForTests,
             "null transition was not published");
         Equal(Thread.CurrentThread.ManagedThreadId, BridgeRuntime.PublishedLifecycleThreadIdForTests,
@@ -566,11 +568,113 @@ internal static class Program
         Check(worker.Join(5000), "rapid replacement transition worker did not finish");
         long newestSequence = BridgeRuntime.LifecycleSequenceForTests;
         Check(newestSequence > replacementSequence, "rapid transition sequence did not advance");
-        BridgeRuntime.DrainMainThreadForTests();
+        BridgeRuntime.OnRootUpdate();
         Equal(newestSequence, BridgeRuntime.PublishedLifecycleSequenceForTests,
             "older lifecycle callback published after newer transition");
         Equal(Thread.CurrentThread.ManagedThreadId, BridgeRuntime.PublishedLifecycleThreadIdForTests,
             "rapid lifecycle publication ran off owner thread");
+    }
+
+    private static void ProductionTransportLifecycle()
+    {
+        BridgePaths.Initialize(AppDomain.CurrentDomain.BaseDirectory);
+        BridgeRuntime.CaptureStatusPathForTests();
+        Check(!BridgeRuntime.AuthenticateForTests("|STATUS|", string.Empty, out _),
+            "empty expected token authenticated");
+        Check(!BridgeRuntime.AuthenticateForTests("|STATUS|", "token", out _),
+            "bare delimiter authenticated in parser");
+        Check(BridgeRuntime.AuthenticateForTests("token|STATUS|", "token", out string payload) &&
+            payload == "STATUS|", "valid token parser rejected");
+        BridgeRuntime.OnRootUpdate();
+        BridgeRuntime.SignalWakeForTests();
+        BridgeRuntime.OnRootUpdate();
+        Check(BridgeRuntime.Active, "wake did not activate transport");
+        int oldGeneration = BridgeRuntime.TransportGenerationForTests;
+        Equal(oldGeneration, BridgeRuntime.TransportResourceGenerationForTests,
+            "active transport generation mismatch");
+        int port = BridgeRuntime.TransportPortForTests;
+        Check(port > 0, "active transport has no port");
+        Check(SendUnauthenticatedRequest(port).Contains("authentication_failed"),
+            "bare delimiter authenticated");
+
+        Exception workerException = null;
+        Thread worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnGameChanging(null); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "active transition worker did not finish");
+        Check(workerException == null, "active transition escaped exception");
+        Check(!BridgeRuntime.Active, "transition left transport active");
+        Equal(0, BridgeRuntime.TransportResourceGenerationForTests,
+            "transition left transport resources attached");
+        Check(!File.Exists(BridgePaths.StatusPath), "transition left stale status file");
+        Check(!CanConnect(port), "old listener accepted after invalidation");
+
+        int transitionSequence = (int)BridgeRuntime.LifecycleSequenceForTests;
+        BridgeRuntime.SignalWakeForTests();
+        BridgeRuntime.OnRootUpdate();
+        Check(BridgeRuntime.Active, "immediate wake did not reactivate transport");
+        int newGeneration = BridgeRuntime.TransportGenerationForTests;
+        Check(newGeneration > oldGeneration, "transport generation did not advance");
+        Equal(newGeneration, BridgeRuntime.TransportResourceGenerationForTests,
+            "reactivated transport generation mismatch");
+        Check(BridgeRuntime.PublishedLifecycleSequenceForTests != transitionSequence,
+            "stale transition callback published after reactivation");
+        Check(SendUnauthenticatedRequest(BridgeRuntime.TransportPortForTests)
+            .Contains("authentication_failed"), "reactivated empty-token authentication changed");
+        Check(!File.ReadAllText(BridgePaths.StatusPath).Contains("bridge=DORMANT"),
+            "stale transition overwrote active status");
+
+        workerException = null;
+        worker = new Thread(() =>
+        {
+            try
+            {
+                Verse.Game replacement = (Verse.Game)System.Runtime.Serialization.FormatterServices
+                    .GetUninitializedObject(typeof(Verse.Game));
+                BridgeRuntime.OnGameChanging(replacement);
+            }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "replacement transition worker did not finish");
+        Check(workerException == null, "replacement transition escaped exception");
+        Check(!BridgeRuntime.Active, "replacement transition left transport active");
+        BridgeRuntime.OnRootUpdate();
+        Equal(0, BridgeRuntime.TransportResourceGenerationForTests,
+            "replacement cleanup did not run through root update");
+    }
+
+    private static string SendUnauthenticatedRequest(int port)
+    {
+        using (System.Net.Sockets.TcpClient client = new System.Net.Sockets.TcpClient())
+        {
+            client.Connect("127.0.0.1", port);
+            using (NetworkStream stream = client.GetStream())
+            {
+                stream.ReadTimeout = 3000;
+                byte[] request = Encoding.UTF8.GetBytes("|STATUS|\n");
+                stream.Write(request, 0, request.Length);
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true))
+                    return reader.ReadToEnd();
+            }
+        }
+    }
+
+    private static bool CanConnect(int port)
+    {
+        try
+        {
+            using (System.Net.Sockets.TcpClient client = new System.Net.Sockets.TcpClient())
+            {
+                client.Connect("127.0.0.1", port);
+                return true;
+            }
+        }
+        catch (SocketException) { return false; }
+        catch (InvalidOperationException) { return false; }
     }
 
     private static void BridgeIndicatorStateTransitions()
