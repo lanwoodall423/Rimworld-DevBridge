@@ -26,6 +26,7 @@ internal static class Program
         Run("legacy request", LegacyRequest);
         Run("structured request", StructuredRequest);
         Run("agent identity isolation", AgentIdentityIsolation);
+        Run("runtime boundary characterization", RuntimeBoundaryCharacterization);
         Run("invalid timeout rejected", InvalidTimeoutRejected);
         Run("out of range timeout rejected", OutOfRangeTimeoutRejected);
         Run("malformed option rejected", MalformedOptionRejected);
@@ -150,6 +151,22 @@ internal static class Program
         Check(scheduler.Enqueue(queued) == null, "agent request was not queued");
         Check(!scheduler.Cancel(queued.RequestId, "agent-b"), "another agent cancelled a request");
         Check(scheduler.Cancel(queued.RequestId, "agent-a"), "owner agent could not cancel its request");
+    }
+
+    private static void RuntimeBoundaryCharacterization()
+    {
+        BridgeRuntime.BridgeRuntimeStateSnapshot snapshot = BridgeRuntime.StateSnapshot;
+        Check(snapshot != null, "runtime snapshot missing");
+        Check(BridgeCommands.Describe("STATUS") != null, "status descriptor missing");
+        Check(BridgeCommands.Describe("AGENT_CONTEXT") != null, "agent context descriptor missing");
+        Check(snapshot.Context != null, "session context missing");
+        BridgeResult context = BridgeRuntime.AddSessionContext(BridgeResult.Ok("test.characterization"), snapshot);
+        Equal(snapshot.Context.SessionId, FieldValue(context, "session"), "shared session");
+        Equal(snapshot.Context.WriteContext, FieldValue(context, "context"), "shared lease context");
+        Equal(snapshot.MutationConfirmation.State, FieldValue(context, "mutationConfirmation"),
+            "shared confirmation state");
+        Equal(BridgeText.Invariant(snapshot.RemoteMutationEnabled),
+            FieldValue(context, "remoteMutationEnabled"), "shared mutation setting");
     }
 
     private static void InvalidTimeoutRejected()
