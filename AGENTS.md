@@ -4,6 +4,8 @@
 - Generic adapter discovery scans a loaded owner's `DevTools/BridgeAdapters`; the legacy `DevTools/HotAdapters` source is development-only.
 - Build: `dotnet build Source\RimWorldDevBridge\RimWorldDevBridge.csproj -c Release`.
 - Coordinator build: `dotnet build DevTools\RestartCoordinator\RimWorldDevBridge.RestartCoordinator.csproj -c Release`.
+- Full private build: `DevTools\Build-RimWorldDevBridge.ps1` after configuring private RimWorld/Unity/Harmony paths.
+- Portable validation: `DevTools\Build-RimWorldDevBridge.ps1 -PortableOnly`.
 - Validate: `DevTools\Test-BridgeSourceInvariants.ps1`, `DevTools\Package-RimWorldDevBridge.ps1 -Build`.
 - Canonical client: `DevTools\devbridge.ps1`; `Send-RimWorldBridge.ps1` is a temporary delegating wrapper.
 - Client output is JSON on stdout with diagnostics on stderr; use `--agent-id` only for an explicit override.

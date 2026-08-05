@@ -89,13 +89,13 @@ versioned `cooperative-v1` provider contract without changing existing synchrono
 Build, launch or safely attach, verify the loaded manifest, wake the bridge, and run a command:
 
 ```powershell
-& "C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge\DevTools\Launch-And-Test-RimWorld.ps1"
+& ".\DevTools\Launch-And-Test-RimWorld.ps1"
 ```
 
 Run queued feature tests against a map-ready sandbox:
 
 ```powershell
-& "C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge\DevTools\Launch-And-Test-RimWorld.ps1" `
+& ".\DevTools\Launch-And-Test-RimWorld.ps1" `
   -Command RUN_FEATURE_TESTS -StartupTimeoutSeconds 600
 ```
 
@@ -107,13 +107,13 @@ The launcher never stops an attached process and stops only a process it started
 Run offline checks with:
 
 ```powershell
-dotnet build "Source\RimWorldDevBridge\RimWorldDevBridge.csproj" -c Release
-dotnet build "DevTools\RestartCoordinator\RimWorldDevBridge.RestartCoordinator.csproj" -c Release
-dotnet build "DevTools\CompatibilityHarness\CompatibilityHarness.csproj" -c Release
-& "DevTools\CompatibilityHarness\bin\Release\net472\RimWorldDevBridge.CompatibilityHarness.exe"
-& "DevTools\Test-BridgeSourceInvariants.ps1"
-& "DevTools\Test-RimWorldLauncher.ps1"
+& ".\DevTools\Build-RimWorldDevBridge.ps1"
 ```
+
+The full build requires private RimWorld 1.6 Managed assemblies and Harmony. Set
+`RIMWORLD_MANAGED_DIR` and `RIMWORLD_HARMONY_PATH`, or pass the corresponding parameters. The
+checked-in `Build/devbridge.build.json.example` contains no machine-specific paths. Portable CI
+does not download or publish proprietary game dependencies.
 
 Create and verify the distributable package with:
 

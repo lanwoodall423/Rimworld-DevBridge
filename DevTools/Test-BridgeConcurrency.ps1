@@ -3,7 +3,7 @@ param(
     [int]$TimeoutMs = 10000
 )
 
-$clientPath = Join-Path $PSScriptRoot "Send-RimWorldBridge.ps1"
+$clientPath = Join-Path $PSScriptRoot "devbridge.ps1"
 $pool = [RunspaceFactory]::CreateRunspacePool(1, $Clients)
 $pool.Open()
 $calls = @()
@@ -13,7 +13,7 @@ try {
     foreach ($number in 1..$Clients) {
         $powerShell = [PowerShell]::Create()
         $powerShell.RunspacePool = $pool
-        [void]$powerShell.AddScript("& '$escapedPath' STATUS -TimeoutMs $TimeoutMs")
+        [void]$powerShell.AddScript("& '$escapedPath' call --command=STATUS --timeout-ms=$TimeoutMs --json")
         $calls += [pscustomobject]@{
             PowerShell = $powerShell
             Handle = $powerShell.BeginInvoke()
@@ -23,10 +23,9 @@ try {
     $responses = foreach ($call in $calls) {
         ($call.PowerShell.EndInvoke($call.Handle) | Out-String).Trim()
     }
-    $ids = @($responses | ForEach-Object {
-        if ($_ -match '(?m)^id=([^\r\n]+)') { $Matches[1] }
-    })
-    $successful = @($responses | Where-Object { $_ -match '(?m)^status=OK$' }).Count
+    $objects = @($responses | ForEach-Object { $_ | ConvertFrom-Json })
+    $ids = @($objects | ForEach-Object { $_.id })
+    $successful = @($objects | Where-Object { "$($_.status)" -eq "OK" }).Count
     $uniqueIds = @($ids | Sort-Object -Unique).Count
 
     if ($successful -eq $Clients -and $uniqueIds -eq $Clients) {

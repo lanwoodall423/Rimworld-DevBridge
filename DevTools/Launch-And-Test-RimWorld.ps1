@@ -23,7 +23,7 @@ $inputPath = Join-Path $saveDir "RimWorld-DevBridge-In.txt"
 $outputPath = Join-Path $saveDir "RimWorld-DevBridge-Out.txt"
 $playerLog = Join-Path $saveDir "Player.log"
 $manifestPath = Join-Path $modRoot "BRIDGE_MANIFEST.txt"
-$clientPath = Join-Path $PSScriptRoot "Send-RimWorldBridge.ps1"
+$clientPath = Join-Path $PSScriptRoot "devbridge.ps1"
 $projectPath = Join-Path $modRoot "Source\RimWorldDevBridge\RimWorldDevBridge.csproj"
 $logRoot = Join-Path $saveDir "RimWorldDevBridge\LauncherLogs"
 $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
@@ -96,19 +96,30 @@ function Assert-ProcessRunning {
 function Invoke-Bridge([string]$Name, [string]$Value, [string]$Options = "") {
     $shellPath = (Get-Process -Id $PID).Path
     $clientArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $clientPath,
-        "-Command", $Name, "-TimeoutMs", "$CommandTimeoutMs")
-    if (-not [string]::IsNullOrEmpty($Value)) { $clientArguments += @("-Argument", $Value) }
-    if (-not [string]::IsNullOrEmpty($Options)) { $clientArguments += @("-Options", $Options) }
+        "call", "--command=$Name", "--bridge-root=$modRoot", "--user-root=$saveDir",
+        "--timeout-ms=$CommandTimeoutMs", "--json")
+    if (-not [string]::IsNullOrEmpty($Value)) { $clientArguments += "--argument=$Value" }
+    if (-not [string]::IsNullOrEmpty($Options)) {
+        foreach ($option in ($Options -split '&')) {
+            if (-not [string]::IsNullOrWhiteSpace($option)) { $clientArguments += "--option=$option" }
+        }
+    }
     $lines = & $shellPath $clientArguments 2>&1
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         $lines | ForEach-Object { Write-Output $_ }
         Fail 4 ("bridge_client_exit_{0}" -f $exitCode)
     }
-    return @($lines)
+    $json = @($lines | ForEach-Object { "$($_)" } | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+    if ($json.Count -eq 0) { Fail 4 "bridge_client_invalid_json" }
+    try { return ($json[0] | ConvertFrom-Json) }
+    catch { Fail 4 "bridge_client_invalid_json" }
 }
 
 function Response-Value($Lines, [string]$Name) {
+    if ($null -ne $Lines -and $Lines.PSObject.Properties[$Name]) {
+        return [string]$Lines.PSObject.Properties[$Name].Value
+    }
     $prefix = $Name + "="
     $line = $Lines | Where-Object { "$_".StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
         Select-Object -First 1
@@ -233,7 +244,7 @@ if ($Command.ToUpperInvariant() -eq "RUN_FEATURE_TESTS") {
     $options += "&lease=$lease&idempotency=$([Guid]::NewGuid().ToString('N'))"
 }
 $response = Invoke-Bridge $Command $Argument $options
-$response | ForEach-Object { Write-Output $_ }
+$response | ConvertTo-Json -Depth 8 -Compress | Write-Output
 $resultStatus = Response-Value $response "status"
 if ($resultStatus -ne "OK") { Fail 5 ("command_status_{0}" -f $resultStatus) }
 

@@ -1,0 +1,17 @@
+name: Private RimWorld build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  full-build:
+    # This label must be assigned only to a private runner with a licensed local RimWorld install.
+    runs-on: [self-hosted, rimworld-private]
+    env:
+      RIMWORLD_MANAGED_DIR: ${{ secrets.RIMWORLD_MANAGED_DIR }}
+      RIMWORLD_HARMONY_PATH: ${{ secrets.RIMWORLD_HARMONY_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full private build and validation
+        shell: pwsh
+        run: ./DevTools/Build-RimWorldDevBridge.ps1
