@@ -1,8 +1,8 @@
 # RimWorld Dev Bridge - Codex Handoff
 
-The bridge is installed at:
-
-`C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge`
+The bridge location is installation-specific. Supply `--bridge-root`, set
+`RIMWORLD_DEVBRIDGE_BRIDGE_ROOT`, or use the bounded platform discovery performed by the canonical
+client. Do not assume a Steam or RimWorld installation path.
 
 It is a loopback-only, on-demand development bridge. Treat the connected game as a test/sandbox
 unless the user explicitly identifies it as live play. Do not infer player preferences or normal
@@ -11,8 +11,13 @@ play patterns from bridge state.
 ## Start Every Session
 
 ```powershell
-& "C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge\DevTools\Send-RimWorldBridge.ps1" SYNC
+& ".\DevTools\devbridge.ps1" wake --json
+& ".\DevTools\devbridge.ps1" read --command SYNC --json
 ```
+
+`DevTools/devbridge.ps1` is the canonical client. It resolves paths from explicit arguments,
+documented environment variables, user configuration, and bounded platform discovery.
+`Send-RimWorldBridge.ps1` is a temporary compatibility wrapper and only delegates to the canonical client.
 
 Keep the returned `fingerprint`. `SYNC <fingerprint>` reports `same` until the core or active
 adapter manifests change. The client compares the loaded bridge version, protocol, and schema with
@@ -50,19 +55,26 @@ codes are `remote_mutation_disabled`, `no_game_loaded`, `in_game_confirmation_re
 
 ## Efficient Workflow
 
-1. Run `SYNC`.
-2. Start with `STATUS`, `MAP_SUMMARY`, `CODEX`, `AQUACULTURE`, or another adapter summary.
-3. Use paged narrow reads such as `THINGS "filter=...&limit=50"`; follow the returned cursor. `PAWNS`,
+1. Run `DevTools/devbridge.ps1 discover --json`, then `wake --json` if transport is dormant.
+2. Query `context --package-id Lan.RimWorldDevBridge --json` and retrieve descriptors with
+   `describe --package-id Lan.RimWorldDevBridge --json`.
+3. Start with `DevTools/devbridge.ps1 read --command STATUS --json`, `MAP_SUMMARY`, or another adapter summary.
+4. Use paged narrow reads such as `DevTools/devbridge.ps1 read --command THINGS --argument "filter=...&limit=50" --json`; follow the returned cursor. `PAWNS`,
    `THINGS`, and `JOBS` cursors are versioned immutable snapshots bound to the session, map, filter,
    fields, and stable `thingId` ordering. They expire after bounded retention and reject old offset
    cursors with `snapshot_cursor_required`; other paged commands retain the legacy cursor behavior.
-4. Use `BATCH "STATUS;SELECTED;UI_STATE"` to reduce round trips.
-5. Run `RELOAD_HOT_ADAPTERS` after publishing a new adapter generation.
-6. Use `ADAPTER_HEALTH`, `SCHEDULER_METRICS`, `COMMAND_METRICS`, and `PERFORMANCE` for evidence.
+5. Use `DevTools/devbridge.ps1 adapter reload --package-id <id> --json` after publishing a new adapter generation.
+6. Use `DevTools/devbridge.ps1 read --command ADAPTER_HEALTH --json`, `SCHEDULER_METRICS`, `COMMAND_METRICS`, and `PERFORMANCE` for evidence.
 
 Multiple clients have isolated request IDs and responses. RimWorld/Unity access is serialized on
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit
 override. A timed-out or disconnected queued request is cancelled before execution.
+
+The canonical client supports `discover`, `wake`, `read`, `context`, `describe`, `call`, `mutate`,
+`cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and `restart request|status|wait`.
+It emits JSON on stdout and diagnostics on stderr. Idempotency keys are generated for mutations when
+omitted and are returned in the JSON response; callers should supply the same key for an intentional retry.
+Transport and lease secrets are redacted unless `--unsafe-debug` is explicitly supplied.
 
 The game shows a small runtime-only bridge indicator whenever transport is active or a write lease
 exists. Read-only, sandbox, and live-confirmed states are distinct; live-confirmed write access is
@@ -110,11 +122,13 @@ Create and verify the distributable package with:
 & "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.1.0.zip"
 ```
 
-Packaging stages five Dev Bridge-owned files: `About/About.xml`, `LoadFolders.xml`,
-`BRIDGE_MANIFEST.txt`, the 1.6 core assembly, and the external `RestartCoordinator/` executable.
-It excludes all adapters, external integration files, harness/build output, game/Unity/Harmony
-reference assemblies, and development scripts. The package verifier validates raw ZIP names before
-extraction and compares the packaged core byte-for-byte and by SHA-256 with the built source DLL.
+Packaging stages ten Dev Bridge-owned files: `About/About.xml`, `AGENTS.md`, `BRIDGE_HANDOFF.md`,
+`LoadFolders.xml`, `BRIDGE_MANIFEST.txt`, the 1.6 core assembly, the external `RestartCoordinator/`
+executable, `DevTools/devbridge.ps1`, its temporary `Send-RimWorldBridge.ps1` compatibility wrapper,
+and `DevTools/DEVBRIDGE_AGENT.md`. It excludes all adapters, external integration files,
+harness/build output, game/Unity/Harmony reference assemblies, and test scripts. The package verifier
+validates raw ZIP names before extraction, parses the canonical client, and compares the packaged core
+byte-for-byte and by SHA-256 with the built source DLL.
 
 ## Feature Tests
 

@@ -22,8 +22,13 @@ $packageEntries = @(
     @{ Relative = 'About/About.xml'; Source = (Join-Path $modRoot 'About/About.xml') },
     @{ Relative = 'LoadFolders.xml'; Source = (Join-Path $modRoot 'LoadFolders.xml') },
     @{ Relative = 'BRIDGE_MANIFEST.txt'; Source = $manifestPath },
+    @{ Relative = 'BRIDGE_HANDOFF.md'; Source = (Join-Path $modRoot 'BRIDGE_HANDOFF.md') },
+    @{ Relative = 'AGENTS.md'; Source = (Join-Path $modRoot 'AGENTS.md') },
     @{ Relative = '1.6/Assemblies/RimWorldDevBridge.dll'; Source = $coreSource },
-    @{ Relative = 'RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe'; Source = $coordinatorSource }
+    @{ Relative = 'RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe'; Source = $coordinatorSource },
+    @{ Relative = 'DevTools/devbridge.ps1'; Source = (Join-Path $PSScriptRoot 'devbridge.ps1') },
+    @{ Relative = 'DevTools/Send-RimWorldBridge.ps1'; Source = (Join-Path $PSScriptRoot 'Send-RimWorldBridge.ps1') },
+    @{ Relative = 'DevTools/DEVBRIDGE_AGENT.md'; Source = (Join-Path $PSScriptRoot 'DEVBRIDGE_AGENT.md') }
 )
 
 function Read-BridgeVersion([string]$Path) {

@@ -5,6 +5,8 @@
 - Build: `dotnet build Source\RimWorldDevBridge\RimWorldDevBridge.csproj -c Release`.
 - Coordinator build: `dotnet build DevTools\RestartCoordinator\RimWorldDevBridge.RestartCoordinator.csproj -c Release`.
 - Validate: `DevTools\Test-BridgeSourceInvariants.ps1`, `DevTools\Package-RimWorldDevBridge.ps1 -Build`.
+- Canonical client: `DevTools\devbridge.ps1`; `Send-RimWorldBridge.ps1` is a temporary delegating wrapper.
+- Client output is JSON on stdout with diagnostics on stderr; use `--agent-id` only for an explicit override.
 - Before runtime tests, query live context with `DevTools\devbridge.ps1 discover --json` and `context --package-id Lan.RimWorldDevBridge --json`.
 - Adapter-only changes use `adapter publish` then `adapter reload`; gameplay assemblies, defs, Harmony patches, serialized types, or core changes require a full restart.
 - Remote mutation is disabled by default. A client-supplied sandbox/live label is intent only; writes additionally require server-observed in-game confirmation for the current save and an agent-owned lease.

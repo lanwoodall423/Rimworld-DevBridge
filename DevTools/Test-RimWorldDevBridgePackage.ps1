@@ -12,8 +12,13 @@ $root = $null
 $errors = New-Object 'System.Collections.Generic.List[string]'
 $expectedFiles = @(
     'About/About.xml',
+    'AGENTS.md',
+    'BRIDGE_HANDOFF.md',
     'LoadFolders.xml',
     'BRIDGE_MANIFEST.txt',
+    'DevTools/DEVBRIDGE_AGENT.md',
+    'DevTools/Send-RimWorldBridge.ps1',
+    'DevTools/devbridge.ps1',
     '1.6/Assemblies/RimWorldDevBridge.dll',
     'RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe'
 )
@@ -142,6 +147,18 @@ try {
         $values = Read-KeyValueFile $bridgeManifestPath
         if ($values['bridge'] -ne $ExpectedBridgeVersion) { Add-Error "BRIDGE_MANIFEST bridge version is not $ExpectedBridgeVersion." }
         if ([int]$values['protocol'] -ne $ExpectedProtocol) { Add-Error "BRIDGE_MANIFEST protocol is not $ExpectedProtocol." }
+        foreach ($declaredKey in @('handoff', 'client', 'compatibilityWrapper', 'agentGuide')) {
+            $declared = [string]$values[$declaredKey]
+            if ([string]::IsNullOrWhiteSpace($declared)) {
+                Add-Error "BRIDGE_MANIFEST is missing declared file $declaredKey."
+            }
+            elseif (-not ($expectedFiles -contains $declared)) {
+                Add-Error "BRIDGE_MANIFEST declares an unexpected file $declared."
+            }
+            elseif (-not (Test-Path -LiteralPath (Join-Path $root ($declared -replace '/', '\')) -PathType Leaf)) {
+                Add-Error "BRIDGE_MANIFEST declared file is absent $declared."
+            }
+        }
     }
 
     $corePath = Join-Path $root '1.6/Assemblies/RimWorldDevBridge.dll'
@@ -163,6 +180,16 @@ try {
             }
         }
         catch { Add-Error ('Restart coordinator metadata is invalid: ' + $_.Exception.Message) }
+    }
+
+    $clientPath = Join-Path $root 'DevTools/devbridge.ps1'
+    if (Test-Path -LiteralPath $clientPath -PathType Leaf) {
+        try {
+            $tokens = [System.Management.Automation.Language.Parser]::ParseFile($clientPath,
+                [ref]$null, [ref]$null)
+            if ($null -eq $tokens) { Add-Error 'Canonical client could not be parsed.' }
+        }
+        catch { Add-Error ('Canonical client is invalid: ' + $_.Exception.Message) }
     }
 
     if ($errors.Count -gt 0) {

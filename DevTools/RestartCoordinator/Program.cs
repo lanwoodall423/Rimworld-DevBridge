@@ -271,7 +271,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     case "wait": return Wait(message);
                     case "register": return Register(message);
                     case "launch": return Launch(message);
-                    case "heartbeat": return Status(message);
+                    case "heartbeat": return Heartbeat();
                     default: return new CoordinatorResponse { Ok = false, Error = "unknown_coordinator_operation", ExitCode = 2 };
                 }
             }
@@ -301,6 +301,18 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Phase = ticket?.Phase,
                 Json = Program.Json(machine.Snapshot),
                 ExitCode = ticket == null ? 2 : 0
+            };
+        }
+
+        private CoordinatorResponse Heartbeat()
+        {
+            Pump();
+            return new CoordinatorResponse
+            {
+                Ok = true,
+                Phase = machine.Snapshot.Phase.ToString(),
+                Json = Program.Json(machine.Snapshot),
+                ExitCode = 0
             };
         }
 
