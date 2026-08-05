@@ -70,6 +70,12 @@ Multiple clients have isolated request IDs and responses. RimWorld/Unity access 
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit
 override. A timed-out or disconnected queued request is cancelled before execution.
 
+Threading boundary: `BridgeTransportServer` performs only bounded socket/protocol work on worker
+threads. `BridgeTransportState` binds clients and resources to one transport generation, and stale
+workers cannot publish a newer generation. Request preparation, command execution, status/UI work,
+and every Verse/Unity read run through the owner game thread. Adapter filesystem indexing uses
+immutable main-thread-captured source records and posts status publication back to that thread.
+
 The canonical client supports `discover`, `wake`, `read`, `context`, `describe`, `call`, `mutate`,
 `cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and `restart request|status|wait`.
 It emits JSON on stdout and diagnostics on stderr. Idempotency keys are generated for mutations when

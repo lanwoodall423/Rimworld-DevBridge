@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -34,7 +33,7 @@ namespace RimWorldDevBridge
         private const string WakeFileName = BridgePaths.Prefix + "Wake.request";
         private const string InputFileName = BridgePaths.Prefix + "In.txt";
         private static FileSystemWatcher watcher;
-        private static TransportState transportState;
+        private static BridgeTransportState transportState;
         private static volatile bool active;
         private static volatile bool transportReady;
         private static volatile bool activationIndexStarted;
@@ -71,10 +70,11 @@ namespace RimWorldDevBridge
         {
             get
             {
-                TransportState current = Volatile.Read(ref transportState);
+                BridgeTransportState current = Volatile.Read(ref transportState);
                 return current == null ? 0 : Math.Max(0, Volatile.Read(ref current.ActiveClients));
             }
         }
+        internal static int ConnectedClientLimit => Settings.ConnectedClientLimit;
         internal static double BootstrapMs => bootstrapMs;
         internal static double HarmonyMs => harmonyMs;
         internal static double FinalizeInitMs => finalizeInitMs;
@@ -110,7 +110,7 @@ namespace RimWorldDevBridge
         {
             get
             {
-                TransportState current = Volatile.Read(ref transportState);
+                BridgeTransportState current = Volatile.Read(ref transportState);
                 return current == null ? 0 : current.Generation;
             }
         }
@@ -125,7 +125,7 @@ namespace RimWorldDevBridge
             PublishStateIfDirty(true);
         }
         internal static bool AuthenticateForTests(string raw, string expectedToken, out string payload) =>
-            TrySplitAuthentication(raw, expectedToken, out payload);
+            BridgeTransportAuthentication.TrySplit(raw, expectedToken, out payload);
 
         internal static BridgeResult AddSessionContext(BridgeResult result, BridgeSessionContextSnapshot snapshot)
         {
@@ -153,7 +153,7 @@ namespace RimWorldDevBridge
             lock (Gate)
             {
                 BridgeSessionContextSnapshot context = Authorization.Snapshot();
-                TransportState current = Volatile.Read(ref transportState);
+                BridgeTransportState current = Volatile.Read(ref transportState);
                 BridgeMutationConfirmationSnapshot confirmation = MutationConfirmation.Snapshot(
                     identity.SessionId, Settings.RemoteMutationEnabled);
                 return new BridgeRuntimeStateSnapshot(
@@ -286,7 +286,7 @@ namespace RimWorldDevBridge
         {
             long sequence = Interlocked.Increment(ref gameTransitionSequence);
             string nextSession = (enteringMenu ? "menu" : "loading") + "-" + Guid.NewGuid().ToString("N");
-            TransportState staleTransport;
+            BridgeTransportState staleTransport;
             lock (Gate)
             {
                 identity = new SessionIdentity(nextSession, string.Empty);
@@ -311,7 +311,7 @@ namespace RimWorldDevBridge
             // Detachment above makes the state unreachable before any new activation can use the
             // generation. Close only the detached resources, outside Gate, to keep the worker prefix
             // from holding lifecycle locks while sockets/timers are being disposed.
-            CloseTransportResources(staleTransport);
+            BridgeTransportServer.Close(staleTransport);
             CancelLeaseExpiryTimer();
 
             // The Game object is intentionally not captured. The callback is sequence/session bound
@@ -332,7 +332,7 @@ namespace RimWorldDevBridge
             {
                 if (sequence != Interlocked.Read(ref gameTransitionSequence) ||
                     !string.Equals(SessionId, expectedSession, StringComparison.Ordinal)) return;
-                TransportState current = Volatile.Read(ref transportState);
+                BridgeTransportState current = Volatile.Read(ref transportState);
                 if ((invalidatedGeneration != 0 && current != null) ||
                     (invalidatedGeneration == 0 && (current != null || active))) return;
                 Volatile.Write(ref publishedGameTransitionThreadId, Thread.CurrentThread.ManagedThreadId);
@@ -595,7 +595,7 @@ namespace RimWorldDevBridge
         private static void RotateSession(string prefix)
         {
             AssertMainThread("session rotation");
-            TransportState stale;
+            BridgeTransportState stale;
             lock (Gate)
             {
                 string next = prefix + "-" + Guid.NewGuid().ToString("N");
@@ -608,7 +608,7 @@ namespace RimWorldDevBridge
                 identity = new SessionIdentity(next, string.Empty);
                 MarkStateDirty();
             }
-            CloseTransportResources(stale);
+            BridgeTransportServer.Close(stale);
             CancelLeaseExpiryTimer();
             PublishStateIfDirty(true);
         }
@@ -651,14 +651,14 @@ namespace RimWorldDevBridge
         private static void StartTransport()
         {
             AssertMainThread("transport activation");
-            TransportState stale = null;
-            TransportState failedToClose = null;
+            BridgeTransportState stale = null;
+            BridgeTransportState failedToClose = null;
             string activationError = null;
             bool started = false;
             lock (Gate)
             {
                 if (shuttingDown) return;
-                TransportState current = Volatile.Read(ref transportState);
+                BridgeTransportState current = Volatile.Read(ref transportState);
                 if (IsCurrentTransport(current))
                 {
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
@@ -675,20 +675,19 @@ namespace RimWorldDevBridge
                     TcpListener currentListener = new TcpListener(IPAddress.Loopback, 0);
                     currentListener.Start(Settings.ConnectedClientLimit);
                     port = ((IPEndPoint)currentListener.LocalEndpoint).Port;
-                    TransportState next = new TransportState(generation, currentListener,
+                    BridgeTransportState next = new BridgeTransportState(generation, currentListener,
                         currentIdentity.SessionId, token);
                     transportState = next;
                     active = true;
                     transportReady = false;
                     activationIndexStarted = false;
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                    Thread listenerThread = new Thread(() => Listen(next))
-                    {
-                        IsBackground = true,
-                        Name = "RimWorld Dev Bridge v2"
-                    };
-                    listenerThread.Start();
-                    next.IdleTimer = new Timer(_ => CheckIdle(next), null, 10000, 10000);
+                    new BridgeTransportServer(next, IsCurrentTransport, PrepareTransportRequest,
+                        Scheduler.Enqueue, Scheduler.Cancel, () => Settings.ConnectedClientLimit, Decorate, () => SessionId, CheckIdle,
+                        RequestIndicatorRefresh, state =>
+                        {
+                            if (ReferenceEquals(Volatile.Read(ref transportState), state)) MarkStateDirty();
+                        }, MarkTransportActivity).Start();
                     MarkStateDirty();
                     started = true;
                 }
@@ -699,15 +698,15 @@ namespace RimWorldDevBridge
                     MarkStateDirty();
                 }
             }
-            CloseTransportResources(stale);
-            CloseTransportResources(failedToClose);
+            BridgeTransportServer.Close(stale);
+            BridgeTransportServer.Close(failedToClose);
             if (started || activationError != null) PublishStateIfDirty(true, activationError);
         }
 
-        private static void StopTransport(bool writeDormant, TransportState expectedState = null)
+        private static void StopTransport(bool writeDormant, BridgeTransportState expectedState = null)
         {
             AssertMainThread("transport stop");
-            TransportState stale;
+            BridgeTransportState stale;
             int detachedGeneration;
             lock (Gate)
             {
@@ -715,7 +714,7 @@ namespace RimWorldDevBridge
                 stale = DetachTransportLocked();
                 detachedGeneration = Volatile.Read(ref transportGeneration);
             }
-            CloseTransportResources(stale);
+            BridgeTransportServer.Close(stale);
             bool publish = false;
             lock (Gate)
             {
@@ -748,7 +747,7 @@ namespace RimWorldDevBridge
             catch { }
         }
 
-        private static void CheckIdle(TransportState state)
+        private static void CheckIdle(BridgeTransportState state)
         {
             if (!IsCurrentTransport(state)) return;
             if (DateTime.UtcNow.Ticks - Interlocked.Read(ref lastActivityUtcTicks) <
@@ -761,168 +760,18 @@ namespace RimWorldDevBridge
             }, null);
         }
 
-        private static void Listen(TransportState state)
+        private static void MarkTransportActivity()
         {
-            while (IsCurrentTransport(state))
-            {
-                TcpClient client = null;
-                try
-                {
-                    client = state.Listener.AcceptTcpClient();
-                    if (!IsCurrentTransport(state))
-                    {
-                        client.Close();
-                        client = null;
-                        return;
-                    }
-                    if (Interlocked.Increment(ref state.ActiveClients) > Settings.ConnectedClientLimit)
-                    {
-                        Interlocked.Decrement(ref state.ActiveClients);
-                        WriteDirect(client, "id=unknown\nstatus=BUSY\nerror=connected_client_limit");
-                        client = null;
-                        continue;
-                    }
-                    state.Clients.TryAdd(client, 0);
-                    TcpClient accepted = client;
-                    client = null;
-                    if (!IsCurrentTransport(state) || !state.Clients.ContainsKey(accepted))
-                    {
-                        RemoveClient(state, accepted);
-                        continue;
-                    }
-                    if (!ThreadPool.QueueUserWorkItem(_ => HandleClient(state, accepted)))
-                    {
-                        RemoveClient(state, accepted);
-                        RequestIndicatorRefresh(state);
-                    }
-                    else
-                    {
-                        RequestIndicatorRefresh(state);
-                    }
-                }
-                catch (SocketException) { if (!IsCurrentTransport(state)) return; }
-                catch (ObjectDisposedException) { return; }
-                catch { try { client?.Close(); } catch { } }
-            }
+            Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
         }
 
-        private static void HandleClient(TransportState state, TcpClient client)
+        private static BridgePreparationResult PrepareTransportRequest(BridgeRequest request)
         {
-            BridgeRequest request = null;
-            try
-            {
-                if (!IsCurrentTransport(state)) return;
-                client.NoDelay = true;
-                client.ReceiveTimeout = BridgeProtocol.MaximumDeadlineMs;
-                client.SendTimeout = BridgeProtocol.MaximumDeadlineMs;
-                using (client)
-                using (NetworkStream stream = client.GetStream())
-                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, false, 4096, true))
-                using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, true)
-                { AutoFlush = true, NewLine = "\n" })
-                {
-                    string raw;
-                    try { raw = ReadBoundedLine(reader, BridgeProtocol.MaxRequestBytes); }
-                    catch (InvalidDataException exception)
-                    {
-                        BridgeResult invalid = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT,
-                            "request_too_large", exception.Message);
-                        Decorate(invalid, null, "core", BridgeProtocol.BridgeVersion);
-                        writer.Write(BridgeProtocol.Serialize(invalid, "line"));
-                        return;
-                    }
-                    if (!IsCurrentTransport(state) || string.IsNullOrEmpty(state.Token) ||
-                        string.IsNullOrEmpty(state.SessionId) || !TrySplitAuthentication(raw,
-                            state.Token, out string payload))
-                    {
-                        writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=authentication_failed");
-                        return;
-                    }
-                    Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                    if (!BridgeProtocol.TryParse(payload, state.SessionId, out request,
-                        out BridgeResult parseFailure))
-                    {
-                        Decorate(parseFailure, request, "core", BridgeProtocol.BridgeVersion);
-                        writer.Write(BridgeProtocol.Serialize(parseFailure, "line"));
-                        return;
-                    }
-                    request.TransportGeneration = state.Generation;
-                    if (!IsCurrentTransport(state))
-                    {
-                        writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=stale_transport");
-                        return;
-                    }
-                    if (request.Command == "CANCEL")
-                    {
-                        BridgeResult cancelled = BridgeResult.Ok("core.cancel")
-                            .Add("cancelled", Scheduler.Cancel(request.Argument, request.AgentId));
-                        Decorate(cancelled, request, "core", BridgeProtocol.BridgeVersion);
-                        writer.Write(BridgeProtocol.Serialize(cancelled, request.OutputFormat));
-                        return;
-                    }
-                    long prepareStart = Stopwatch.GetTimestamp();
-                    BridgeResult prepareFailure = PrepareRequestOnMainThread(request, out BridgeCommandDescriptor descriptor);
-                    request.PreparationMs = BridgeTiming.Milliseconds(prepareStart);
-                    if (descriptor == null)
-                    {
-                        BridgeResult unavailable = prepareFailure ?? (BridgeAdapterCatalog.Indexing
-                            ? BridgeResult.Fail(BridgeStatus.BUSY, "adapter_indexing")
-                            : BridgeResult.Fail(BridgeStatus.NOT_FOUND, "unknown_command"));
-                        Decorate(unavailable, request, "core", BridgeProtocol.BridgeVersion);
-                        writer.Write(BridgeProtocol.Serialize(unavailable, request.OutputFormat));
-                        return;
-                    }
-                    if (prepareFailure != null)
-                    {
-                        Decorate(prepareFailure, request, descriptor.Provider, descriptor.ProviderVersion);
-                        writer.Write(BridgeProtocol.Serialize(prepareFailure, request.OutputFormat));
-                        return;
-                    }
-                    if (!IsCurrentTransport(state) || request.SessionId != SessionId)
-                    {
-                        writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=stale_transport");
-                        return;
-                    }
-                    request.EnqueuedUtc = DateTime.UtcNow;
-                    BridgeResult enqueueFailure = Scheduler.Enqueue(request);
-                    if (enqueueFailure != null)
-                    {
-                        Decorate(enqueueFailure, request, descriptor.Provider, descriptor.ProviderVersion);
-                        writer.Write(BridgeProtocol.Serialize(enqueueFailure, request.OutputFormat));
-                        return;
-                    }
-                    while (!request.Done.Wait(20))
-                    {
-                        if (!IsCurrentTransport(state))
-                        {
-                            request.Cancelled = true;
-                            if (!request.Started) Scheduler.Cancel(request.RequestId);
-                        }
-                        if (request.Expired)
-                        {
-                            request.Cancelled = true;
-                            if (!request.Started) Scheduler.Cancel(request.RequestId);
-                        }
-                        if (Disconnected(client))
-                        {
-                            request.ClientDisconnected = true;
-                            if (!request.Started) Scheduler.Cancel(request.RequestId);
-                            return;
-                        }
-                    }
-                    writer.Write(BridgeProtocol.Serialize(request.Result, request.OutputFormat));
-                    Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                }
-            }
-            catch { if (request != null && !request.Started) request.ClientDisconnected = true; }
-            finally
-            {
-                RemoveClient(state, client);
-                RequestIndicatorRefresh(state);
-            }
+            BridgeResult failure = PrepareRequestOnMainThread(request, out BridgeCommandDescriptor descriptor);
+            return new BridgePreparationResult(descriptor, failure);
         }
 
-        private static void RequestIndicatorRefresh(TransportState state)
+        private static void RequestIndicatorRefresh(BridgeTransportState state)
         {
             try
             {
@@ -944,8 +793,8 @@ namespace RimWorldDevBridge
             descriptor = null;
             if (MainThread.IsOwnerThread) return PrepareRequest(request, out descriptor);
 
-            TaskCompletionSource<PreparationResult> completion =
-                new TaskCompletionSource<PreparationResult>();
+            TaskCompletionSource<BridgePreparationResult> completion =
+                new TaskCompletionSource<BridgePreparationResult>();
             try
             {
                 MainThread.Post(_ =>
@@ -968,7 +817,7 @@ namespace RimWorldDevBridge
                         failure = BridgeResult.Fail(BridgeStatus.ERROR, "main_thread_prepare_failed",
                             exception.GetBaseException().Message);
                     }
-                    completion.TrySetResult(new PreparationResult(preparedDescriptor, failure));
+                    completion.TrySetResult(new BridgePreparationResult(preparedDescriptor, failure));
                 }, null);
             }
             catch (Exception exception)
@@ -984,7 +833,7 @@ namespace RimWorldDevBridge
                 request.Cancelled = true;
                 return BridgeResult.Fail(BridgeStatus.TIMEOUT, "main_thread_prepare_timeout");
             }
-            PreparationResult result = completion.Task.Result;
+            BridgePreparationResult result = completion.Task.Result;
             descriptor = result.Descriptor;
             return result.Failure;
         }
@@ -1136,12 +985,12 @@ namespace RimWorldDevBridge
         private static bool IsCurrentRequestTransport(BridgeRequest request)
         {
             if (request == null || request.TransportGeneration == 0) return true;
-            TransportState current = Volatile.Read(ref transportState);
+            BridgeTransportState current = Volatile.Read(ref transportState);
             return current != null && IsCurrentTransport(current) &&
                 current.Generation == request.TransportGeneration;
         }
 
-        private static bool IsCurrentTransport(TransportState state)
+        private static bool IsCurrentTransport(BridgeTransportState state)
         {
             if (state == null || state.Invalidated || !active) return false;
             if (!ReferenceEquals(Volatile.Read(ref transportState), state)) return false;
@@ -1150,38 +999,12 @@ namespace RimWorldDevBridge
             if (string.IsNullOrEmpty(current.SessionId) || string.IsNullOrEmpty(current.Token) ||
                 string.IsNullOrEmpty(state.SessionId) || string.IsNullOrEmpty(state.Token)) return false;
             return string.Equals(current.SessionId, state.SessionId, StringComparison.Ordinal) &&
-                ConstantTimeTokenEquals(current.Token, state.Token);
+                BridgeTransportAuthentication.ConstantTimeEquals(current.Token, state.Token);
         }
 
-        private static bool TrySplitAuthentication(string raw, string expectedToken, out string payload)
+        private static BridgeTransportState DetachTransportLocked()
         {
-            payload = null;
-            if (string.IsNullOrEmpty(raw) || string.IsNullOrEmpty(expectedToken)) return false;
-            int separator = raw.IndexOf('|');
-            if (separator <= 0) return false;
-            string supplied = raw.Substring(0, separator);
-            if (!ConstantTimeTokenEquals(supplied, expectedToken)) return false;
-            payload = raw.Substring(separator + 1);
-            return true;
-        }
-
-        private static bool ConstantTimeTokenEquals(string left, string right)
-        {
-            if (left == null || right == null) return false;
-            int difference = left.Length ^ right.Length;
-            int length = Math.Max(left.Length, right.Length);
-            for (int index = 0; index < length; index++)
-            {
-                int leftValue = index < left.Length ? left[index] : 0;
-                int rightValue = index < right.Length ? right[index] : 0;
-                difference |= leftValue ^ rightValue;
-            }
-            return difference == 0;
-        }
-
-        private static TransportState DetachTransportLocked()
-        {
-            TransportState stale = transportState;
+            BridgeTransportState stale = transportState;
             transportState = null;
             if (stale != null) stale.Invalidated = true;
             active = false;
@@ -1194,31 +1017,6 @@ namespace RimWorldDevBridge
             identity = new SessionIdentity(current.SessionId, string.Empty);
             MarkStateDirty();
             return stale;
-        }
-
-        private static void CloseTransportResources(TransportState stale)
-        {
-            if (stale == null) return;
-            stale.Invalidated = true;
-            try { stale.IdleTimer?.Dispose(); } catch { }
-            try { stale.Listener?.Stop(); } catch { }
-            foreach (TcpClient client in stale.Clients.Keys.ToArray())
-            {
-                try { client.Close(); } catch { }
-            }
-            stale.Clients.Clear();
-            Volatile.Write(ref stale.ActiveClients, 0);
-        }
-
-        private static void RemoveClient(TransportState state, TcpClient client)
-        {
-            if (state == null || client == null) return;
-            if (state.Clients.TryRemove(client, out _))
-            {
-                Interlocked.Decrement(ref state.ActiveClients);
-                if (ReferenceEquals(Volatile.Read(ref transportState), state)) MarkStateDirty();
-            }
-            try { client.Close(); } catch { }
         }
 
         private static void ProcessLegacyFile()
@@ -1270,40 +1068,6 @@ namespace RimWorldDevBridge
                 });
             }
             catch { }
-        }
-
-        private static bool Disconnected(TcpClient client)
-        {
-            try { return client.Client.Poll(0, SelectMode.SelectRead) && client.Client.Available == 0; }
-            catch { return true; }
-        }
-
-        private static string ReadBoundedLine(StreamReader reader, int maxBytes)
-        {
-            StringBuilder value = new StringBuilder();
-            while (true)
-            {
-                int next = reader.Read();
-                if (next < 0 || next == '\n') break;
-                if (next != '\r') value.Append((char)next);
-                if (value.Length > maxBytes)
-                    throw new InvalidDataException("Request exceeds maximum bytes.");
-            }
-            if (Encoding.UTF8.GetByteCount(value.ToString()) > maxBytes)
-                throw new InvalidDataException("Request exceeds maximum bytes.");
-            return value.ToString();
-        }
-
-        private static void WriteDirect(TcpClient client, string response)
-        {
-            try
-            {
-                using (client)
-                using (NetworkStream stream = client.GetStream())
-                using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
-                    writer.Write(response);
-            }
-            catch { try { client?.Close(); } catch { } }
         }
 
         private static bool WriteStatus(BridgeRuntimeStateSnapshot snapshot, string state, string extra = null)
@@ -1442,27 +1206,6 @@ namespace RimWorldDevBridge
             }
         }
 
-        private sealed class TransportState
-        {
-            internal readonly int Generation;
-            internal readonly TcpListener Listener;
-            internal readonly string SessionId;
-            internal readonly string Token;
-            internal readonly ConcurrentDictionary<TcpClient, byte> Clients =
-                new ConcurrentDictionary<TcpClient, byte>();
-            internal volatile Timer IdleTimer;
-            internal volatile bool Invalidated;
-            internal int ActiveClients;
-
-            internal TransportState(int generation, TcpListener listener, string sessionId, string token)
-            {
-                Generation = generation;
-                Listener = listener;
-                SessionId = sessionId;
-                Token = token;
-            }
-        }
-
         private sealed class SessionIdentity
         {
             internal readonly string SessionId;
@@ -1475,78 +1218,6 @@ namespace RimWorldDevBridge
             }
         }
 
-        private sealed class PreparationResult
-        {
-            internal readonly BridgeCommandDescriptor Descriptor;
-            internal readonly BridgeResult Failure;
-
-            internal PreparationResult(BridgeCommandDescriptor descriptor, BridgeResult failure)
-            {
-                Descriptor = descriptor;
-                Failure = failure;
-            }
-        }
     }
 
-    internal static class BridgeMetrics
-    {
-        private static readonly object Gate = new object();
-        private static readonly Dictionary<string, CommandMetric> Values =
-            new Dictionary<string, CommandMetric>(StringComparer.OrdinalIgnoreCase);
-
-        internal static void Record(BridgeCommandDescriptor descriptor, BridgeResult result, string agentId = null)
-        {
-            lock (Gate)
-            {
-                if (!Values.TryGetValue(descriptor.Name, out CommandMetric metric))
-                    Values[descriptor.Name] = metric = new CommandMetric();
-                metric.Count++;
-                metric.TotalMs += result.ExecutionMs;
-                metric.MaxMs = Math.Max(metric.MaxMs, result.ExecutionMs);
-                metric.MaxStepMs = Math.Max(metric.MaxStepMs, result.MaxMainThreadStepMs);
-                if (result.MainThreadOverrun) metric.Overruns++;
-                metric.CooperativeSteps += result.CooperativeSteps;
-                if (descriptor.NonCooperative || result.NonCooperativeExecution) metric.NonCooperative = true;
-                if (descriptor.Cooperative) metric.Cooperative = true;
-                metric.LastStatus = result.Status;
-                if (metric.Agents.Count < 64 && !string.IsNullOrWhiteSpace(agentId)) metric.Agents.Add(agentId);
-                if (!result.IsSuccess) metric.Failures++;
-            }
-        }
-
-        internal static BridgeResult Report()
-        {
-            BridgeResult result = BridgeResult.Ok("core.commandMetrics");
-            lock (Gate)
-            {
-                foreach (KeyValuePair<string, CommandMetric> pair in Values.OrderByDescending(value => value.Value.MaxMs))
-                    result.AddLine("command=" + pair.Key + " calls:" + pair.Value.Count + " failures:" +
-                        pair.Value.Failures + " meanMs:" + (pair.Value.Count > 0 ? pair.Value.TotalMs / pair.Value.Count : 0d)
-                            .ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + " maxMs:" +
-                        pair.Value.MaxMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
-                        " maxStepMs:" + pair.Value.MaxStepMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
-                         " overruns:" + pair.Value.Overruns + " cooperativeSteps:" + pair.Value.CooperativeSteps +
-                         " agents:" + pair.Value.Agents.Count +
-                        " contract:" + (pair.Value.NonCooperative ? "legacy-sync-non-cooperative" :
-                            pair.Value.Cooperative ? "cooperative-v1" : "sync") +
-                        " last:" + pair.Value.LastStatus);
-            }
-            return result;
-        }
-
-        private sealed class CommandMetric
-        {
-            internal long Count;
-            internal long Failures;
-            internal double TotalMs;
-            internal double MaxMs;
-            internal double MaxStepMs;
-            internal long Overruns;
-            internal long CooperativeSteps;
-            internal bool NonCooperative;
-            internal bool Cooperative;
-            internal BridgeStatus LastStatus;
-            internal readonly HashSet<string> Agents = new HashSet<string>(StringComparer.Ordinal);
-        }
-    }
 }

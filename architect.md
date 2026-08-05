@@ -72,16 +72,23 @@ and invokes the normal authenticated client. It only stops a process it launched
      rotates authorization, cancels queued requests, and invalidates references.
 
 2. **Transport and protocol boundary**
-   - Loopback TCP starts only after a wake request and stops after bounded idle.
-   - Requests are byte-bounded and parsed into `BridgeRequest`; responses are
-     `BridgeResult` values with status, schema, timing, provider, mode, mutation,
-     truncation, warnings, and structured fields.
+    - Loopback TCP starts only after a wake request and stops after bounded idle.
+    - `BridgeTransportServer` owns worker-side accept, authentication framing,
+      request preparation handoff, enqueue/wait, and client cleanup. Its
+      `BridgeTransportState` is generation-scoped and contains no RimWorld or
+      Unity access. `BridgeTransportAuthentication` is a pure constant-time
+      token/parser boundary.
+    - Requests are byte-bounded and parsed into `BridgeRequest`; responses are
+      `BridgeResult` values with status, schema, timing, provider, mode, mutation,
+      truncation, warnings, and structured fields.
    - Protocol 9 line requests remain accepted. Protocol 10 adds key/value request
      options and JSON output without changing the legacy PowerShell entry point.
 
 3. **Main-thread scheduler**
-   - Background clients enqueue into a bounded priority queue. Only one scheduled
-     main-thread drain callback exists at a time.
+    - Background clients enqueue into bounded per-agent FIFO queues. Deterministic
+      round-robin selection prevents one agent from monopolizing a drain while
+      preserving ordering within an agent. Only one scheduled main-thread drain
+      callback exists at a time.
    - Drain work has a per-frame time/operation budget. Expired, cancelled,
      disconnected, stale-session, unauthorized, or invalid requests are rejected
      before command execution.
@@ -91,6 +98,31 @@ and invokes the normal authenticated client. It only stops a process it launched
       cooperative resumable steps. Adapters are cooperative only when they
       explicitly opt into the versioned contract; legacy synchronous code is
       measured, reported as non-cooperative, and cannot be safely preempted.
+
+## Runtime boundaries and threading
+
+- `BridgeRuntime` owns lifecycle, session and transport-generation invalidation,
+  the main-thread boundary, shared state publication, status files, and the
+  coordinator-facing lifecycle hooks. It is deliberately the composition root,
+  not a second command or adapter implementation.
+- `BridgeTransportServer` owns only sockets and worker-side protocol handling.
+  It may parse bounded bytes, authenticate, enqueue, wait, and close clients.
+  It must never read `Current`, `Find`, `LoadedModManager`, maps, UI, Unity, or
+  any other RimWorld state. It asks `BridgeRuntime` to prepare work on the main
+  thread through a callback boundary.
+- `BridgeTransportState` owns resources for one transport generation. A stale
+  worker may close only its own clients/resources; it cannot publish state for a
+  newer generation.
+- `BridgeMetrics` owns command timing/overrun/agent-attribution aggregation and
+  has no game-thread dependency. `BridgeTransportAuthentication` owns only
+  bounded, constant-time token comparison and framing validation.
+- `BridgeScheduler`, `BridgeAuthorization`, `BridgeAdapterCatalog`, and
+  `BridgeQuerySnapshotStore` remain independently testable owners of scheduling,
+  leases, adapter generations, and immutable query snapshots respectively.
+- All Verse/Unity reads and all command execution occur on the owner game thread.
+  Filesystem hashing/indexing and socket work may run off-thread only when their
+  inputs are immutable snapshots and their callbacks return through the main
+  thread dispatcher.
 
 4. **Authorization and idempotency**
    - Remote mutation is disabled by default. A server-controlled, runtime-only
@@ -198,8 +230,11 @@ Only after all six pass may the superseded host path be deleted or disconnected.
 
 ## Implemented v2.1 evidence
 
-- The offline compatibility harness covers 28 protocol, bound, cursor, scheduler,
-  cancellation, idempotency, manifest, feature-test, batch, and macro cases.
+- The Release compatibility harness reports its case count at runtime and covers
+  protocol, boundary characterization, cursors, fair scheduling, cancellation,
+  restart barriers, idempotency, leases, mutation confirmation, lifecycle,
+  manifests, feature tests, batches, macros, transport, and production queries
+  (60 cases in the current revision).
 - A source invariant check confirms no dormant update work, AppDomain-wide provider
   scan, eager adapter load, macro parse, or feature-test parse.
 - Final cold launches measured 16.329-21.568 ms construction/bootstrap including
