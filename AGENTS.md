@@ -16,4 +16,5 @@
 - `gameIdentity` is process-local; `saveIdentity` is a versioned server-observed digest or `none` for a new/unsaved game. Neither is a portable save identifier, and raw save metadata is not exposed.
 - Restart automation may control only an explicitly coordinator-owned sandbox; attached or live processes require a person or external orchestrator.
 - Dev Bridge owns contracts, discovery, validation, execution, safety, and diagnostics. Integrations and adapter distribution remain owner-controlled; Dev Bridge is optional.
+- Dev Bridge-owned source is licensed under the MIT License in `LICENSE`; this does not license RimWorld, Unity, Harmony, or owner-mod content.
 - Full workflow: `DevTools/DEVBRIDGE_AGENT.md`.

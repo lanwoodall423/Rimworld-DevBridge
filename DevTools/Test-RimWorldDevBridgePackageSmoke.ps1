@@ -24,7 +24,7 @@ try {
     }
 
     $validate = (& powershell.exe @arguments validate --bridge-root $root --json | Out-String).Trim() | ConvertFrom-Json
-    if ($validate.valid -ne $true -or $validate.requiredFiles -ne 10) {
+    if ($validate.valid -ne $true -or $validate.requiredFiles -ne 11) {
         throw 'packaged manifest validation did not pass'
     }
 

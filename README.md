@@ -32,6 +32,13 @@ from a client label, command, naming convention, dev mode, or bridge state. The 
 coordinator controls only explicitly owned sandbox processes. Attached or live processes require a
 person or external orchestrator.
 
+## License
+
+Dev Bridge-owned source is released under the MIT License in `LICENSE`. The notice is included in
+source distributions and the release package. This license applies only to Dev Bridge-owned work;
+it does not grant rights to RimWorld, Unity, Harmony, or participating owner-mod content. Those
+dependencies and integrations remain separately owned and subject to their own terms.
+
 ## Canonical Client
 
 Run the client from this repository or from the packaged ZIP:

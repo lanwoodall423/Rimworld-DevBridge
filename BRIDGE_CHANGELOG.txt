@@ -9,3 +9,4 @@
 1.1.0|b7a31d4c|Added SYNC fingerprints, adapter versions, compact deltas, and restart detection.
 1.0.0|legacy-v6|Created the standalone bridge, generic inspector, hot macros, and adapter discovery.
 2.1.0-security|v10.1-typed-core|Remote mutation is disabled by default; leases require server-controlled in-game confirmation bound to the current game and session, stable denial codes, immediate lease invalidation on revocation or transition, and audit records with observed authorization state but no transport tokens.
+2.1.0-license|MIT|Added the repository MIT License notice and packaged-license validation; third-party and proprietary dependency terms remain separate.

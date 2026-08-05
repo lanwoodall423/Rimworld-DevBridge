@@ -13,4 +13,7 @@ dependencies are available, source invariants, and package verification. Preserv
 compatibility unless a change is explicitly documented. Runtime behavior must remain main-thread
 safe and read-only by default.
 
-Do not add a license file through a contribution without an explicit project-owner decision.
+This repository is released under the MIT License in `LICENSE`. Preserve that notice in source
+distributions and packages. Do not add third-party license text or imply that the MIT License covers
+RimWorld, Unity, Harmony, or participating mod content; retain their upstream notices and obtain
+their terms separately.

@@ -459,13 +459,16 @@ function Invoke-Validate([string[]] $values) {
     $root = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
     if ($null -eq $root) { throw "bridge_root_required: supply --bridge-root or RIMWORLD_DEVBRIDGE_BRIDGE_ROOT" }
     $required = @(
-        "About/About.xml", "LoadFolders.xml", "BRIDGE_MANIFEST.txt", "BRIDGE_HANDOFF.md",
+        "About/About.xml", "LoadFolders.xml", "BRIDGE_MANIFEST.txt", "BRIDGE_HANDOFF.md", "LICENSE",
         "AGENTS.md", "1.6/Assemblies/RimWorldDevBridge.dll", "RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe",
         "DevTools/devbridge.ps1", "DevTools/Send-RimWorldBridge.ps1", "DevTools/DEVBRIDGE_AGENT.md"
     )
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root ($_ -replace '/', '\')) -PathType Leaf) })
     if ($missing.Count -gt 0) { throw "package_required_file_missing: $($missing -join ',')" }
     $manifest = Read-BridgeManifest $root
+    if ($manifest.license -ne 'MIT' -or $manifest.licenseFile -ne 'LICENSE') {
+        throw 'package_license_metadata_invalid: expected MIT and LICENSE'
+    }
     return [ordered]@{ valid = $true; bridgeRoot = $root; bridge = $manifest.bridge; protocol = $manifest.protocol; schema = $manifest.schema; requiredFiles = $required.Count }
 }
 

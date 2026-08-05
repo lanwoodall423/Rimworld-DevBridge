@@ -10,8 +10,14 @@ foreach ($script in $scripts) {
     if ($errors.Count -gt 0) { throw "PowerShell parse failed: $($script.FullName): $($errors -join '; ')" }
 }
 $manifest = Get-Content -LiteralPath (Join-Path $root 'BRIDGE_MANIFEST.txt')
-foreach ($required in @('bridge=', 'protocol=', 'schema=', 'handoff=', 'client=', 'compatibilityWrapper=', 'agentGuide=')) {
+foreach ($required in @('bridge=', 'protocol=', 'schema=', 'handoff=', 'client=', 'compatibilityWrapper=', 'agentGuide=', 'license=')) {
     if (-not ($manifest -match ('^' + [regex]::Escape($required)))) { throw "BRIDGE_MANIFEST is missing $required" }
+}
+if (-not ($manifest -match '^license=MIT$') -or -not ($manifest -match '^licenseFile=LICENSE$')) {
+    throw 'BRIDGE_MANIFEST license metadata is not MIT/LICENSE.'
+}
+if ((Get-Content -LiteralPath (Join-Path $root 'LICENSE') -TotalCount 1) -ne 'MIT License') {
+    throw 'LICENSE does not contain the MIT License header.'
 }
 [xml](Get-Content -LiteralPath (Join-Path $root 'LoadFolders.xml')) | Out-Null
 Write-Output ('portableChecks=PASS scripts={0}' -f $scripts.Count)

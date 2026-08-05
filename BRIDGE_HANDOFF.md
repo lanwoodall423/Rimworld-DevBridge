@@ -143,10 +143,12 @@ Create and verify the distributable package with:
 & "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.1.0.zip"
 ```
 
-Packaging stages ten Dev Bridge-owned files: `About/About.xml`, `AGENTS.md`, `BRIDGE_HANDOFF.md`,
+Packaging stages eleven Dev Bridge-owned files: `About/About.xml`, `AGENTS.md`, `BRIDGE_HANDOFF.md`,
 `LoadFolders.xml`, `BRIDGE_MANIFEST.txt`, the 1.6 core assembly, the external `RestartCoordinator/`
 executable, `DevTools/devbridge.ps1`, its temporary `Send-RimWorldBridge.ps1` compatibility wrapper,
-and `DevTools/DEVBRIDGE_AGENT.md`. It excludes all adapters, external integration files,
+`DevTools/DEVBRIDGE_AGENT.md`, and the repository `LICENSE`. The MIT notice applies only to
+Dev Bridge-owned repository content; it does not grant rights to RimWorld, Unity, Harmony, or
+participating mod content. It excludes all adapters, external integration files,
 harness/build output, game/Unity/Harmony reference assemblies, and test scripts. The package verifier
 validates raw ZIP names before extraction, parses the canonical client, and compares the packaged core
 byte-for-byte and by SHA-256 with the built source DLL.
