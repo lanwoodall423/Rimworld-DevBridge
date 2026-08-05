@@ -1,0 +1,38 @@
+# Build outputs and intermediate state
+[Bb]in/
+[Oo]bj/
+**/[Bb]in/
+**/[Oo]bj/
+*.user
+*.suo
+*.nupkg
+
+# Generated mod, coordinator, harness, and package outputs
+1.6/Assemblies/
+Release/
+Source/Build/
+DevTools/StagedCore/
+DevTools/FeatureTests/Pending/
+DevTools/FeatureTests/Completed/
+DevTools/LauncherLogs/
+DevTools/HotAdapters/
+DevTools/BridgeAdapters/
+Build/devbridge.build.json
+
+# Binaries and archives are never source inputs
+*.dll
+*.exe
+*.pdb
+*.zip
+*.dmp
+*.log
+
+# Local test and tool state
+.vs/
+.idea/
+TestResults/
+coverage/
+RimWorld-DevBridge-Status.txt
+RimWorld-DevBridge-*.request
+RimWorld-DevBridge-*.txt
+RimWorld-DevBridge-*.json

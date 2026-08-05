@@ -1,0 +1,9 @@
+<Project>
+  <Target Name="ValidateDevBridgeRimWorldReferences" BeforeTargets="ResolveReferences" Condition="'$(DevBridgeRequiresRimWorldReferences)' == 'true'">
+    <Error Condition="'$(RimWorldManagedDir)' == ''" Text="RimWorldManagedDir is not configured. Set RIMWORLD_MANAGED_DIR or pass /p:RimWorldManagedDir=&lt;RimWorldWin64_Data/Managed&gt;. No proprietary assemblies are downloaded by this project." />
+    <Error Condition="'$(RimWorldHarmonyPath)' == ''" Text="RimWorldHarmonyPath is not configured. Set RIMWORLD_HARMONY_PATH or pass /p:RimWorldHarmonyPath=&lt;0Harmony.dll&gt;. No Harmony binary is downloaded by this project." />
+    <Error Condition="!Exists('$(RimWorldManagedDir)\Assembly-CSharp.dll')" Text="Assembly-CSharp.dll was not found under RimWorldManagedDir='$(RimWorldManagedDir)'. Supply the private RimWorld 1.6 Managed directory." />
+    <Error Condition="!Exists('$(RimWorldManagedDir)\UnityEngine.CoreModule.dll')" Text="UnityEngine.CoreModule.dll was not found under RimWorldManagedDir='$(RimWorldManagedDir)'. Supply the private RimWorld 1.6 Managed directory." />
+    <Error Condition="!Exists('$(RimWorldHarmonyPath)')" Text="0Harmony.dll was not found at RimWorldHarmonyPath='$(RimWorldHarmonyPath)'. Supply the private Harmony assembly path." />
+  </Target>
+</Project>

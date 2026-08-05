@@ -4,6 +4,7 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>RimWorldDevBridge.CompatibilityHarness</AssemblyName>
+    <DevBridgeRequiresRimWorldReferences>true</DevBridgeRequiresRimWorldReferences>
     <LangVersion>latest</LangVersion>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
   </PropertyGroup>
@@ -12,15 +13,15 @@
     <ProjectReference Include="..\..\Source\RimWorldDevBridge\RimWorldDevBridge.csproj" />
     <ProjectReference Include="FixtureAdapter\FixtureAdapter.csproj" ReferenceOutputAssembly="false" />
     <Reference Include="Assembly-CSharp">
-      <HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <HintPath>$(RimWorldManagedDir)\Assembly-CSharp.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(RimWorldManagedDir)\UnityEngine.CoreModule.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>C:\Games\Steam\steamapps\workshop\content\294100\2009463077\Current\Assemblies\0Harmony.dll</HintPath>
+      <HintPath>$(RimWorldHarmonyPath)</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>

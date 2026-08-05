@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <DevBridgeRepoRoot Condition="'$(DevBridgeRepoRoot)' == ''">$(MSBuildThisFileDirectory)</DevBridgeRepoRoot>
+    <RimWorldManagedDir Condition="'$(RimWorldManagedDir)' == '' and '$(RIMWORLD_MANAGED_DIR)' != ''">$(RIMWORLD_MANAGED_DIR)</RimWorldManagedDir>
+    <RimWorldHarmonyPath Condition="'$(RimWorldHarmonyPath)' == '' and '$(RIMWORLD_HARMONY_PATH)' != ''">$(RIMWORLD_HARMONY_PATH)</RimWorldHarmonyPath>
+    <DevBridgeGameOutputRoot Condition="'$(DevBridgeGameOutputRoot)' == ''">$(DevBridgeRepoRoot)1.6\Assemblies\</DevBridgeGameOutputRoot>
+    <DevBridgeCoordinatorOutputRoot Condition="'$(DevBridgeCoordinatorOutputRoot)' == ''">$(DevBridgeRepoRoot)1.6\Assemblies\RestartCoordinator\net472\</DevBridgeCoordinatorOutputRoot>
+  </PropertyGroup>
+</Project>

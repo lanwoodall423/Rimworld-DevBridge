@@ -5,6 +5,7 @@
     <TargetFramework>net472</TargetFramework>
     <RootNamespace>RimWorldDevBridge</RootNamespace>
     <AssemblyName>RimWorldDevBridge</AssemblyName>
+    <DevBridgeRequiresRimWorldReferences>true</DevBridgeRequiresRimWorldReferences>
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
@@ -12,16 +13,16 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
     <Optimize>true</Optimize>
-    <OutputPath>..\..\1.6\Assemblies\</OutputPath>
+    <OutputPath>$(DevBridgeGameOutputRoot)</OutputPath>
     <DebugType>none</DebugType>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="Assembly-CSharp"><HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.CoreModule"><HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.IMGUIModule"><HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.ImageConversionModule"><HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.ImageConversionModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="UnityEngine.ScreenCaptureModule"><HintPath>C:\Games\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.ScreenCaptureModule.dll</HintPath><Private>false</Private></Reference>
-    <Reference Include="0Harmony"><HintPath>C:\Games\Steam\steamapps\workshop\content\294100\2009463077\Current\Assemblies\0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp"><HintPath>$(RimWorldManagedDir)\Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(RimWorldManagedDir)\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(RimWorldManagedDir)\UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(RimWorldManagedDir)\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ImageConversionModule"><HintPath>$(RimWorldManagedDir)\UnityEngine.ImageConversionModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule"><HintPath>$(RimWorldManagedDir)\UnityEngine.ScreenCaptureModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(RimWorldHarmonyPath)</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 </Project>

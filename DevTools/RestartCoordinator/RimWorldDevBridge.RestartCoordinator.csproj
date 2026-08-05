@@ -6,7 +6,8 @@
     <RootNamespace>RimWorldDevBridge.RestartCoordinator</RootNamespace>
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
-    <OutputPath>..\..\1.6\Assemblies\RestartCoordinator\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>$(DevBridgeCoordinatorOutputRoot)</OutputPath>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\..\Source\RimWorldDevBridge\BridgeRestartCoordinator.cs" Link="BridgeRestartCoordinator.cs" />
