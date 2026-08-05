@@ -21,9 +21,16 @@ short-lived lease, authentication, validation, deadline, and idempotency checks.
 that remote tools may modify or destroy game state and can be revoked in-game. Tokens and lease
 secrets are redacted by default.
 
-Use read-only commands first. Never enable mutation or confirm a game unless an operator has
-verified that the save is disposable. The external restart coordinator controls only explicitly
-owned sandbox processes. Attached or live processes require a person or external orchestrator.
+The server records `gameIdentity` and `saveIdentity` separately. The former identifies the current
+in-memory game for this process. The latter is a versioned SHA-256 digest of the server-observed
+loaded-save value and is `none` for new or unsaved games. Raw save names/paths and other sensitive
+metadata are never exposed; these identities are process/session-scoped, not portable save IDs.
+
+Every connected game is live and non-disposable by default. Use read-only commands first. Only the
+human operator may explicitly identify the current game as a disposable sandbox; never infer this
+from a client label, command, naming convention, dev mode, or bridge state. The external restart
+coordinator controls only explicitly owned sandbox processes. Attached or live processes require a
+person or external orchestrator.
 
 ## Canonical Client
 

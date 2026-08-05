@@ -62,7 +62,11 @@ and invokes the normal authenticated client. It only stops a process it launched
    - The mod constructor records paths, installs one explicit game-change patch and
      one lightweight `Root.Update` signal/drain hook, creates one save-data wake
      watcher, registers process shutdown, and writes a fixed dormant status.
-     `GameComponent.FinalizeInit` supplies game readiness.
+      `GameComponent.FinalizeInit` supplies game readiness. RimWorld may invoke
+      this callback from a loading/long-event worker before the authoritative
+      Unity thread has been observed; the callback therefore queues inert
+      lifecycle data only. `Root.Update` is the sole owner-adoption point and
+      drains that lifecycle queue before inactive-mode return.
    - Dormant mode performs no provider scan, adapter load, macro/test parse,
      fingerprint, map scan, timer, or TCP work; the permanent update hook only
      checks coalesced file signals and returns.
@@ -122,13 +126,20 @@ and invokes the normal authenticated client. It only stops a process it launched
 - All Verse/Unity reads and all command execution occur on the owner game thread.
   Filesystem hashing/indexing and socket work may run off-thread only when their
   inputs are immutable snapshots and their callbacks return through the main
-  thread dispatcher.
+  thread dispatcher. `FinalizeInit` worker callbacks carry only a transition
+  sequence; they never capture or dereference `Current.Game`, settings, save
+  metadata, UI, or paths. The owner thread performs finalization once, drops
+  obsolete sequence callbacks, and treats repeated notifications as harmless.
 
 4. **Authorization and idempotency**
-   - Remote mutation is disabled by default. A server-controlled, runtime-only
+    - Every connected game is live and non-disposable by default. Only the human
+      operator may explicitly identify the currently loaded game as a disposable
+      sandbox; a client label, command, naming convention, dev mode, or inference
+      never proves sandbox status. Remote mutation is disabled by default. A server-controlled, runtime-only
       confirmation must be made in-game for the currently loaded Game/save before
       a lease can be issued or honored. A client context label is intent only.
-      Confirmation is bound to the session and process-local Game identity, is
+       Confirmation is bound to the session, process-local Game identity, and independent
+       server-observed save identity, is
       visibly revocable, and clears leases on revocation, setting disable, game
       transition, main-menu return, and bridge restart.
    - Writes then require an explicit short-lived agent-owned lease bound to the
@@ -139,8 +150,10 @@ and invokes the normal authenticated client. It only stops a process it launched
      Unknown commands are forbidden rather than implicitly safe.
     - Completed writes are cached by session plus idempotency key. A retry returns
       the original result. A bounded audit records every accepted mutation with
-      server-observed game identity, confirmation state, setting state, lease
-      context, and expiry, never transport or lease tokens.
+       server-observed game identity, independent save identity, confirmation state, setting
+       state, lease context, and expiry, never transport or lease tokens. Game identity is
+       process-local. Save identity is a versioned digest of the loaded-save value or `none`
+       for a new/unsaved game; raw save metadata and paths are not retained or published.
 
 5. **Commands and inspection**
     - Core commands use typed handlers and meaningful statuses. Lists use stable
@@ -234,7 +247,7 @@ Only after all six pass may the superseded host path be deleted or disconnected.
   protocol, boundary characterization, cursors, fair scheduling, cancellation,
   restart barriers, idempotency, leases, mutation confirmation, lifecycle,
   manifests, feature tests, batches, macros, transport, and production queries
-  (60 cases in the current revision).
+   (the reported pass/fail count is authoritative for each build).
 - A source invariant check confirms no dormant update work, AppDomain-wide provider
   scan, eager adapter load, macro parse, or feature-test parse.
 - Final cold launches measured 16.329-21.568 ms construction/bootstrap including

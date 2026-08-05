@@ -42,6 +42,7 @@ namespace RimWorldDevBridge
         private static bool updatePatched;
         private static int transportGeneration;
         private static long gameTransitionSequence;
+        private static long finalizedGameTransitionSequence = long.MinValue;
         private static long publishedGameTransitionSequence;
         private static long stateVersion;
         private static int stateDirty = 1;
@@ -58,6 +59,9 @@ namespace RimWorldDevBridge
         private static double activationMs;
         private static double statusWriteMs;
         private static int statusWriteCount;
+        private static int finalizeInitRequestThreadId;
+        private static int finalizeInitExecutionThreadId;
+        private static int finalizeInitDeferredCount;
         private static long bootstrapManagedDeltaBytes;
         private static string coreFingerprint;
         private static bool bootstrapped;
@@ -101,6 +105,14 @@ namespace RimWorldDevBridge
         internal static bool MainThreadBudgetPending => Settings.MainThreadBudgetMs != EffectiveMainThreadBudgetMs;
         internal static bool SchedulerSettingsPending => QueueCapacityPending || MainThreadBudgetPending;
         internal static long LifecycleSequenceForTests => Interlocked.Read(ref gameTransitionSequence);
+        internal static long FinalizedLifecycleSequenceForTests =>
+            Interlocked.Read(ref finalizedGameTransitionSequence);
+        internal static int FinalizeInitRequestThreadIdForTests =>
+            Volatile.Read(ref finalizeInitRequestThreadId);
+        internal static int FinalizeInitExecutionThreadIdForTests =>
+            Volatile.Read(ref finalizeInitExecutionThreadId);
+        internal static int FinalizeInitDeferredCountForTests =>
+            Volatile.Read(ref finalizeInitDeferredCount);
         internal static long PublishedLifecycleSequenceForTests =>
             Interlocked.Read(ref publishedGameTransitionSequence);
         internal static int PublishedLifecycleThreadIdForTests =>
@@ -213,10 +225,38 @@ namespace RimWorldDevBridge
 
         public static void OnFinalizeInit()
         {
+            Volatile.Write(ref finalizeInitRequestThreadId, Thread.CurrentThread.ManagedThreadId);
+            long sequence = Interlocked.Read(ref gameTransitionSequence);
+            if (!MainThread.IsOwnerEstablished || !MainThread.IsOwnerThread)
+            {
+                Interlocked.Increment(ref finalizeInitDeferredCount);
+                MainThread.PostLifecycle(CompleteDeferredFinalizeInit, sequence);
+                return;
+            }
+            CompleteFinalizeInit(sequence);
+        }
+
+        private static void CompleteDeferredFinalizeInit(object state)
+        {
+            CompleteFinalizeInit((long)state);
+        }
+
+        private static void CompleteFinalizeInit(long sequence)
+        {
+            if (shuttingDown || sequence != Interlocked.Read(ref gameTransitionSequence) ||
+                sequence == Interlocked.Read(ref finalizedGameTransitionSequence)) return;
+            if (!MainThread.IsOwnerEstablished || !MainThread.IsOwnerThread)
+            {
+                MainThread.PostLifecycle(CompleteDeferredFinalizeInit, sequence);
+                return;
+            }
+            Volatile.Write(ref finalizeInitExecutionThreadId, Thread.CurrentThread.ManagedThreadId);
             AssertMainThread("finalize initialization");
             long start = Stopwatch.GetTimestamp();
             RotateSession("game");
+            if (shuttingDown || sequence != Interlocked.Read(ref gameTransitionSequence)) return;
             MutationConfirmation.BindCurrentGame(SessionId, Current.Game);
+            if (shuttingDown || sequence != Interlocked.Read(ref gameTransitionSequence)) return;
             bool wakePending = File.Exists(BridgePaths.WakePath);
             if (wakePending)
             {
@@ -226,6 +266,7 @@ namespace RimWorldDevBridge
             if (File.Exists(BridgePaths.InputPath)) InputSignal.Signal();
             BridgeEventJournal.Record("lifecycle", "game finalized session:" + identity.SessionId);
             finalizeInitMs = BridgeTiming.Milliseconds(start);
+            Interlocked.Exchange(ref finalizedGameTransitionSequence, sequence);
             MarkStateDirty();
             PublishStateIfDirty(true);
         }
@@ -234,6 +275,8 @@ namespace RimWorldDevBridge
         {
             MainThread.AdoptOwnerThread();
             AssertMainThread("root update");
+            MainThread.DrainLifecycle(8, Math.Max(1, Scheduler.MainThreadBudgetMs), exception =>
+                Log.Error("[RimWorld Dev Bridge] Lifecycle callback failed: " + exception));
             ProcessPendingFileSignals();
             long scheduledLeaseExpiry = Interlocked.Read(ref leaseExpiryTicks);
             if (scheduledLeaseExpiry != 0 && scheduledLeaseExpiry <= DateTime.UtcNow.Ticks)

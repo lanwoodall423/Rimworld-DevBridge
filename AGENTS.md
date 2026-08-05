@@ -11,7 +11,9 @@
 - Client output is JSON on stdout with diagnostics on stderr; use `--agent-id` only for an explicit override.
 - Before runtime tests, query live context with `DevTools\devbridge.ps1 discover --json` and `context --package-id Lan.RimWorldDevBridge --json`.
 - Adapter-only changes use `adapter publish` then `adapter reload`; gameplay assemblies, defs, Harmony patches, serialized types, or core changes require a full restart.
+- Every connected game is live and non-disposable by default. Only the human operator may explicitly identify the current game as a disposable sandbox. A client label, command, naming convention, dev mode, or inference never proves sandbox status.
 - Remote mutation is disabled by default. A client-supplied sandbox/live label is intent only; writes additionally require server-observed in-game confirmation for the current save and an agent-owned lease.
+- `gameIdentity` is process-local; `saveIdentity` is a versioned server-observed digest or `none` for a new/unsaved game. Neither is a portable save identifier, and raw save metadata is not exposed.
 - Restart automation may control only an explicitly coordinator-owned sandbox; attached or live processes require a person or external orchestrator.
 - Dev Bridge owns contracts, discovery, validation, execution, safety, and diagnostics. Integrations and adapter distribution remain owner-controlled; Dev Bridge is optional.
 - Full workflow: `DevTools/DEVBRIDGE_AGENT.md`.

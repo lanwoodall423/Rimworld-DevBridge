@@ -268,7 +268,7 @@ namespace RimWorldDevBridge
             BridgeResult result = BridgeResult.Ok("core.session")
                 .Add("gameLoaded", Current.Game != null)
                 .Add("mapLoaded", BridgeGameState.CurrentMap != null)
-                .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? true);
+                .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? false);
             return BridgeRuntime.AddSessionContext(result, state);
         }
 

@@ -27,6 +27,7 @@ internal static class Program
         Run("structured request", StructuredRequest);
         Run("agent identity isolation", AgentIdentityIsolation);
         Run("runtime boundary characterization", RuntimeBoundaryCharacterization);
+        Run("finalize init defers before owner adoption", FinalizeInitDefersBeforeOwnerAdoption);
         Run("invalid timeout rejected", InvalidTimeoutRejected);
         Run("out of range timeout rejected", OutOfRangeTimeoutRejected);
         Run("malformed option rejected", MalformedOptionRejected);
@@ -56,6 +57,9 @@ internal static class Program
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
         Run("remote mutation confirmation security", RemoteMutationConfirmationSecurity);
+        Run("remote mutation settings fail closed", RemoteMutationSettingsFailClosed);
+        Run("mutation confirmation prompt stages", MutationConfirmationPromptStages);
+        Run("mutation identity boundaries", MutationIdentityBoundaries);
         Run("production pawn thing job snapshots", ProductionPawnThingJobSnapshots);
         Run("wake signal idempotence", WakeSignalIdempotence);
         Run("main thread dispatch queue", MainThreadDispatchQueue);
@@ -167,6 +171,68 @@ internal static class Program
             "shared confirmation state");
         Equal(BridgeText.Invariant(snapshot.RemoteMutationEnabled),
             FieldValue(context, "remoteMutationEnabled"), "shared mutation setting");
+    }
+
+    private static void FinalizeInitDefersBeforeOwnerAdoption()
+    {
+        int callerThread = Thread.CurrentThread.ManagedThreadId;
+        int deferredBefore = BridgeRuntime.FinalizeInitDeferredCountForTests;
+        long initialSequence = BridgeRuntime.LifecycleSequenceForTests;
+        Exception workerException = null;
+        Thread worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnFinalizeInit(); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "pre-adoption finalize worker did not finish");
+        Check(workerException == null, "pre-adoption finalize escaped an exception");
+        Check(BridgeRuntime.FinalizeInitDeferredCountForTests > deferredBefore,
+            "pre-adoption finalize was not queued");
+        Equal(0, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "pre-adoption finalize touched game state on the worker");
+
+        // Make the queued request stale before the first authoritative Root.Update. Its inert
+        // callback must be discarded while the transition callback remains sequence-aware.
+        worker = new Thread(() => BridgeRuntime.OnGameChanging(null));
+        worker.Start();
+        Check(worker.Join(5000), "pre-adoption transition worker did not finish");
+        Check(BridgeRuntime.LifecycleSequenceForTests > initialSequence,
+            "pre-adoption transition did not advance the lifecycle sequence");
+        BridgeRuntime.OnRootUpdate();
+        Equal(0, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "stale finalize callback executed");
+
+        // A current request is still deferred, then executes exactly once on the owner thread.
+        long currentSequence = BridgeRuntime.LifecycleSequenceForTests;
+        workerException = null;
+        worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnFinalizeInit(); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "current finalize worker did not finish");
+        Check(workerException == null, "current finalize escaped an exception");
+        BridgeRuntime.OnRootUpdate();
+        Equal(callerThread, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "deferred finalize executed off the owner thread");
+        Equal(currentSequence, BridgeRuntime.FinalizedLifecycleSequenceForTests,
+            "current finalize did not publish its lifecycle sequence");
+
+        int executionThread = BridgeRuntime.FinalizeInitExecutionThreadIdForTests;
+        workerException = null;
+        worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnFinalizeInit(); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "duplicate finalize worker did not finish");
+        Check(workerException == null, "duplicate finalize escaped an exception");
+        BridgeRuntime.OnRootUpdate();
+        Equal(executionThread, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "duplicate finalize ran more than once");
     }
 
     private static void InvalidTimeoutRejected()
@@ -967,6 +1033,7 @@ internal static class Program
             auditRequest.IdempotencyKey = "audit-security-key";
             auditRequest.AuthToken = "secret-token";
             auditRequest.MutationGameIdentity = "game-audit";
+            auditRequest.MutationSaveIdentity = "save-audit";
             auditRequest.MutationGameLoaded = true;
             auditRequest.MutationSettingEnabled = true;
             auditRequest.MutationConfirmationState = "confirmed";
@@ -977,7 +1044,8 @@ internal static class Program
             Thread.Sleep(100);
             string audit = File.Exists(BridgePaths.AuditPath) ? File.ReadAllText(BridgePaths.AuditPath) : string.Empty;
             Check(audit.Contains("gameLoaded=true") && audit.Contains("confirmation=confirmed") &&
-                audit.Contains("leaseContext=sandbox"), "audit omitted server authorization state");
+                audit.Contains("leaseContext=sandbox") && audit.Contains("saveIdentity=save-audit"),
+                "audit omitted server authorization state");
             Check(!audit.Contains("secret-token"), "audit leaked a transport/lease token");
 
             Exception workerError = null;
@@ -1011,6 +1079,94 @@ internal static class Program
             BridgeRuntime.ApplyRemoteMutationSettings();
             InvokeRotateSession("mutation-security-cleanup");
         }
+    }
+
+    private static void RemoteMutationSettingsFailClosed()
+    {
+        BridgeSettings previousSettings = RimWorldDevBridgeMod.Settings;
+        try
+        {
+            RimWorldDevBridgeMod.Settings = null;
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            Check(!BridgeRuntime.StateSnapshot.RemoteMutationEnabled,
+                "unavailable settings enabled remote mutation");
+            Equal("remote_mutation_disabled",
+                FieldValue(BridgeRuntime.AcquireWriteLease("sandbox", "settings-unavailable"), "error"),
+                "unavailable settings lease error");
+
+            RimWorldDevBridgeMod.Settings = new BridgeSettings();
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            Check(!BridgeRuntime.StateSnapshot.RemoteMutationEnabled,
+                "uninitialized settings enabled remote mutation");
+            Equal("remote_mutation_disabled",
+                FieldValue(BridgeRuntime.AcquireWriteLease("sandbox", "settings-uninitialized"), "error"),
+                "uninitialized settings lease error");
+        }
+        finally
+        {
+            RimWorldDevBridgeMod.Settings = previousSettings;
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            InvokeRotateSession("settings-fail-closed-cleanup");
+        }
+    }
+
+    private static void MutationConfirmationPromptStages()
+    {
+        BridgeMutationConfirmationSnapshot unconfirmed = new BridgeMutationConfirmationSnapshot(
+            true, true, false, "missing", "session-prompt", "game-prompt", null, null);
+        BridgeMutationConfirmationSnapshot confirmed = new BridgeMutationConfirmationSnapshot(
+            true, true, true, "confirmed", "session-prompt", "game-prompt", null,
+            DateTime.UtcNow);
+        BridgeMutationConfirmationPrompt prompt = new BridgeMutationConfirmationPrompt();
+        int confirmationCalls = 0;
+
+        Equal(BridgeMutationConfirmation.Warning,
+            "Remote tools may modify or destroy this game.", "confirmation warning text");
+        Check(!prompt.ConfirmSecondStage(() => BridgeResult.Ok()),
+            "confirmation callback ran before the second stage");
+        Check(prompt.BeginSecondStage(unconfirmed) && prompt.IsAwaitingSecondConfirmation,
+            "first confirmation stage did not open the second stage");
+        prompt.CancelFirstStage();
+        Check(!prompt.IsAwaitingSecondConfirmation && confirmationCalls == 0,
+            "first-stage cancellation did not remain inert");
+        Check(prompt.BeginSecondStage(unconfirmed), "second-stage dialog could not reopen");
+        prompt.CancelSecondStage();
+        Check(!prompt.IsAwaitingSecondConfirmation && confirmationCalls == 0,
+            "second-stage cancellation invoked authority");
+        Check(prompt.BeginSecondStage(unconfirmed), "second-stage dialog did not reopen");
+        Check(prompt.ConfirmSecondStage(() => { confirmationCalls++; return BridgeResult.Ok(); }),
+            "second-stage confirmation was not accepted");
+        Check(confirmationCalls == 1 && !prompt.IsAwaitingSecondConfirmation,
+            "confirmation authority was not invoked exactly once");
+        Check(!prompt.BeginSecondStage(confirmed),
+            "already confirmed state opened a second-stage dialog");
+    }
+
+    private static void MutationIdentityBoundaries()
+    {
+        Verse.Game game = (Verse.Game)FormatterServices.GetUninitializedObject(typeof(Verse.Game));
+        string gameIdentity = BridgeMutationConfirmation.IdentityFor(game);
+        Equal(null, BridgeMutationConfirmation.SaveIdentityFor(game),
+            "new game unexpectedly received a save identity");
+
+        object initData = FormatterServices.GetUninitializedObject(typeof(Verse.GameInitData));
+        SetField(initData, "gameToLoad", "Save-A.rws");
+        SetField(game, "initData", initData);
+        string saveA = BridgeMutationConfirmation.SaveIdentityFor(game);
+        Check(!string.IsNullOrWhiteSpace(saveA) && saveA != gameIdentity && !saveA.Contains("Save-A"),
+            "loaded save identity was not independent and redacted");
+
+        BridgeMutationConfirmation confirmation = new BridgeMutationConfirmation();
+        confirmation.BindCurrentGame("session-identity", game);
+        Check(confirmation.Confirm("session-identity", gameIdentity, saveA).Status == BridgeStatus.OK,
+            "loaded save confirmation failed");
+        SetField(initData, "gameToLoad", "Save-B.rws");
+        string saveB = BridgeMutationConfirmation.SaveIdentityFor(game);
+        Check(saveA != saveB && !confirmation.IsConfirmed("session-identity", gameIdentity, saveB),
+            "changing the loaded save retained confirmation");
+        confirmation.BindCurrentGame("session-identity", game);
+        Check(confirmation.Confirm("session-identity", gameIdentity, saveB).Status == BridgeStatus.OK,
+            "new loaded save could not be rebound and confirmed");
     }
 
     private static void WithTestGame(bool remoteMutationEnabled, Action action)

@@ -526,7 +526,7 @@ namespace RimWorldDevBridge
                 .Add("loadedMods", LoadedModManager.RunningModsListForReading.Count)
                 .Add("adapterIndex", BridgeAdapterCatalog.State).Add("adapterFingerprint", BridgeAdapterCatalog.Fingerprint)
                 .Add("logErrors", errors).Add("devMode", Prefs.DevMode)
-                .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? true);
+                .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? false);
         }
 
         private static BridgeResult CaptureState(BridgeExecutionContext context)
