@@ -23,6 +23,8 @@ namespace RimWorldDevBridge
         private static readonly object StatusGate = new object();
         private static readonly object LeaseTimerGate = new object();
         private static readonly BridgeAuthorization Authorization = new BridgeAuthorization();
+        private static readonly BridgeMutationConfirmation MutationConfirmation =
+            new BridgeMutationConfirmation();
         private static readonly BridgeScheduler Scheduler = new BridgeScheduler(ExecuteScheduled, CompleteScheduled);
         private static readonly string BootId = Guid.NewGuid().ToString("N");
         private static readonly BridgeMainThreadContext MainThread = new BridgeMainThreadContext();
@@ -115,6 +117,13 @@ namespace RimWorldDevBridge
         internal static int TransportPortForTests => Volatile.Read(ref port);
         internal static void SignalWakeForTests() => WakeSignal.Signal();
         internal static void CaptureStatusPathForTests() => statusPath = BridgePaths.StatusPath;
+        internal static void BindCurrentGameForTests(Game game)
+        {
+            AssertMainThread("test game confirmation binding");
+            MutationConfirmation.BindCurrentGame(SessionId, game);
+            MarkStateDirty();
+            PublishStateIfDirty(true);
+        }
         internal static bool AuthenticateForTests(string raw, string expectedToken, out string payload) =>
             TrySplitAuthentication(raw, expectedToken, out payload);
 
@@ -130,8 +139,14 @@ namespace RimWorldDevBridge
                     System.Globalization.CultureInfo.InvariantCulture) ?? "none");
         }
 
-        internal static BridgeResult AddSessionContext(BridgeResult result, BridgeRuntimeStateSnapshot snapshot) =>
-            AddSessionContext(result, snapshot.Context);
+        internal static BridgeResult AddSessionContext(BridgeResult result, BridgeRuntimeStateSnapshot snapshot)
+        {
+            return AddSessionContext(result, snapshot.Context)
+                .Add("remoteMutationEnabled", snapshot.RemoteMutationEnabled)
+                .Add("mutationConfirmation", snapshot.MutationConfirmation.State)
+                .Add("mutationGameLoaded", snapshot.MutationConfirmation.GameLoaded)
+                .Add("mutationConfirmed", snapshot.MutationConfirmation.Confirmed);
+        }
 
         private static BridgeRuntimeStateSnapshot CaptureStateSnapshot()
         {
@@ -139,6 +154,8 @@ namespace RimWorldDevBridge
             {
                 BridgeSessionContextSnapshot context = Authorization.Snapshot();
                 TransportState current = Volatile.Read(ref transportState);
+                BridgeMutationConfirmationSnapshot confirmation = MutationConfirmation.Snapshot(
+                    identity.SessionId, Settings.RemoteMutationEnabled);
                 return new BridgeRuntimeStateSnapshot(
                     Interlocked.Read(ref stateVersion),
                     current != null && active,
@@ -148,7 +165,7 @@ namespace RimWorldDevBridge
                     Settings.ConnectedClientLimit,
                     Volatile.Read(ref port),
                     current?.Token ?? string.Empty,
-                    context);
+                    context, Settings.RemoteMutationEnabled, confirmation);
             }
         }
 
@@ -199,6 +216,7 @@ namespace RimWorldDevBridge
             AssertMainThread("finalize initialization");
             long start = Stopwatch.GetTimestamp();
             RotateSession("game");
+            MutationConfirmation.BindCurrentGame(SessionId, Current.Game);
             bool wakePending = File.Exists(BridgePaths.WakePath);
             if (wakePending)
             {
@@ -278,6 +296,7 @@ namespace RimWorldDevBridge
                 legacyInputPending = false;
                 staleTransport = DetachTransportLocked();
                 Authorization.RotateSession(nextSession);
+                MutationConfirmation.Invalidate(nextSession);
                 BridgeQuerySnapshotStore.RotateSession();
                 Scheduler.RotateSession(nextSession);
                 MarkStateDirty();
@@ -355,6 +374,8 @@ namespace RimWorldDevBridge
             AssertMainThread("restart drain");
             long barrierId = Scheduler.BeginDrain();
             Authorization.ClearLeases();
+            MutationConfirmation.Revoke();
+            CancelLeaseExpiryTimer();
             MarkStateDirty();
             PublishStateIfDirty(true, "restartDrain=active barrierId=" + barrierId);
             return Scheduler.DrainStatus(request);
@@ -367,6 +388,8 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult AcquireWriteLease(string context, string agentId)
         {
+            BridgeResult gate = RequireMutationConfirmation();
+            if (gate != null) return gate;
             BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled, agentId);
             if (result.IsSuccess)
             {
@@ -380,6 +403,8 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult RenewWriteLease(string leaseToken, string agentId)
         {
+            BridgeResult gate = RequireMutationConfirmation();
+            if (gate != null) return gate;
             BridgeResult result = Authorization.Renew(leaseToken, Settings.RemoteMutationEnabled, agentId);
             if (result.IsSuccess)
             {
@@ -400,6 +425,63 @@ namespace RimWorldDevBridge
                 PublishStateIfDirty(true);
             }
             return result;
+        }
+
+        internal static BridgeResult ConfirmMutationForCurrentGame()
+        {
+            AssertMainThread("remote mutation confirmation");
+            if (!Settings.RemoteMutationEnabled)
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
+            if (Current.Game == null)
+                return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "no_game_loaded");
+            BridgeResult result = MutationConfirmation.Confirm(SessionId,
+                BridgeMutationConfirmation.IdentityFor(Current.Game),
+                BridgeMutationConfirmation.SaveIdentityFor(Current.Game));
+            if (result.IsSuccess)
+            {
+                MarkStateDirty();
+                PublishStateIfDirty(true);
+            }
+            return result;
+        }
+
+        internal static BridgeResult RevokeMutationConfirmation()
+        {
+            AssertMainThread("remote mutation revocation");
+            MutationConfirmation.Revoke();
+            Authorization.ClearLeases();
+            CancelLeaseExpiryTimer();
+            MarkStateDirty();
+            PublishStateIfDirty(true);
+            return BridgeResult.Ok("core.mutationConfirmationRevoked");
+        }
+
+        internal static void ApplyRemoteMutationSettings()
+        {
+            AssertMainThread("remote mutation setting");
+            if (!Settings.RemoteMutationEnabled)
+            {
+                MutationConfirmation.Revoke();
+                Authorization.ClearLeases();
+                CancelLeaseExpiryTimer();
+            }
+            MarkStateDirty();
+            PublishStateIfDirty(true);
+        }
+
+        private static BridgeResult RequireMutationConfirmation()
+        {
+            AssertMainThread("remote mutation authorization");
+            if (!Settings.RemoteMutationEnabled)
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
+            if (Current.Game == null)
+                return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "no_game_loaded");
+            string gameIdentity = BridgeMutationConfirmation.IdentityFor(Current.Game);
+            string saveIdentity = BridgeMutationConfirmation.SaveIdentityFor(Current.Game);
+            if (!MutationConfirmation.IsConfirmed(SessionId, gameIdentity, saveIdentity))
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "in_game_confirmation_required",
+                    "Confirm remote mutation in-game before requesting a write lease.");
+            return null;
         }
 
         internal static void RefreshIndicator()
@@ -519,6 +601,7 @@ namespace RimWorldDevBridge
                 string next = prefix + "-" + Guid.NewGuid().ToString("N");
                 stale = DetachTransportLocked();
                 Authorization.RotateSession(next);
+                MutationConfirmation.Invalidate(next);
                 BridgeQuerySnapshotStore.RotateSession();
                 Scheduler.Configure(MainThread, next, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
                 Scheduler.RotateSession(next);
@@ -932,6 +1015,9 @@ namespace RimWorldDevBridge
             if (request.SessionId != identity.SessionId)
                 return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_session"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
+            BridgeResult mutationGate = ObserveMutationAuthorization(request, descriptor);
+            if (mutationGate != null)
+                return Decorate(mutationGate, request, descriptor.Provider, descriptor.ProviderVersion);
             BridgeResult authorization = Authorization.Authorize(request, descriptor, request.AuthToken,
                 Settings.RemoteMutationEnabled);
             if (authorization != null)
@@ -955,6 +1041,9 @@ namespace RimWorldDevBridge
             if (!IsCurrentRequestTransport(request) || request.SessionId != SessionId)
                 return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
+            mutationGate = ObserveMutationAuthorization(request, descriptor);
+            if (mutationGate != null)
+                return Decorate(mutationGate, request, descriptor.Provider, descriptor.ProviderVersion);
             int tickBefore = BridgeGameState.TickManager?.TicksGame ?? -1;
             BridgeExecutionContext context = new BridgeExecutionContext(request, BridgeGameState.CurrentMap,
                 () => request.Cancelled || request.ClientDisconnected);
@@ -972,6 +1061,9 @@ namespace RimWorldDevBridge
                         request.SessionId != SessionId ? "stale_session" : "execution_cancelled"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
             }
+            mutationGate = ObserveMutationAuthorization(request, descriptor);
+            if (mutationGate != null)
+                return Decorate(mutationGate, request, descriptor.Provider, descriptor.ProviderVersion);
             if (!IsCurrentRequestTransport(request) || request.SessionId != SessionId)
                 return Decorate(BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_transport"), request,
                     descriptor.Provider, descriptor.ProviderVersion);
@@ -981,6 +1073,32 @@ namespace RimWorldDevBridge
             result.TickAfter = BridgeGameState.TickManager?.TicksGame ?? -1;
             Decorate(result, request, descriptor.Provider, descriptor.ProviderVersion);
             return result;
+        }
+
+        private static BridgeResult ObserveMutationAuthorization(BridgeRequest request,
+            BridgeCommandDescriptor descriptor)
+        {
+            if (descriptor == null || descriptor.Mode == BridgeCommandMode.PureRead) return null;
+            request.MutationSettingEnabled = Settings.RemoteMutationEnabled;
+            if (!request.MutationSettingEnabled)
+            {
+                request.MutationConfirmationState = "disabled";
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
+            }
+            Game game = Current.Game;
+            request.MutationGameLoaded = game != null;
+            request.MutationGameIdentity = BridgeMutationConfirmation.IdentityFor(game) ?? "none";
+            request.MutationSaveIdentity = BridgeMutationConfirmation.SaveIdentityFor(game) ?? "none";
+            BridgeMutationConfirmationSnapshot snapshot = MutationConfirmation.Snapshot(
+                request.SessionId, request.MutationSettingEnabled);
+            request.MutationConfirmationState = snapshot.State;
+            if (!request.MutationGameLoaded)
+                return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "no_game_loaded");
+            if (!MutationConfirmation.IsConfirmed(request.SessionId, request.MutationGameIdentity,
+                request.MutationSaveIdentity))
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "in_game_confirmation_required",
+                    "Confirm remote mutation in-game before executing a mutation.");
+            return null;
         }
 
         private static void CompleteScheduled(BridgeRequest request, BridgeResult result)
@@ -1220,6 +1338,10 @@ namespace RimWorldDevBridge
                     "leaseState=" + context.LeaseState,
                     "leaseExpiresUtc=" + (context.LeaseExpiresUtc?.ToString("o",
                         System.Globalization.CultureInfo.InvariantCulture) ?? "none"),
+                    "remoteMutationEnabled=" + snapshot.RemoteMutationEnabled,
+                    "mutationConfirmation=" + snapshot.MutationConfirmation.State,
+                    "mutationGameLoaded=" + snapshot.MutationConfirmation.GameLoaded,
+                    "mutationConfirmed=" + snapshot.MutationConfirmation.Confirmed,
                     "transportGeneration=" + snapshot.TransportGeneration,
                     "bootstrapMs=" + bootstrapMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                     "harmonyMs=" + harmonyMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
@@ -1298,10 +1420,13 @@ namespace RimWorldDevBridge
             internal readonly int Port;
             internal readonly string TransportToken;
             internal readonly BridgeSessionContextSnapshot Context;
+            internal readonly bool RemoteMutationEnabled;
+            internal readonly BridgeMutationConfirmationSnapshot MutationConfirmation;
 
             internal BridgeRuntimeStateSnapshot(long version, bool transportActive, bool transportReady,
                 int transportGeneration, int connectedClients, int connectedClientLimit, int port,
-                string transportToken, BridgeSessionContextSnapshot context)
+                string transportToken, BridgeSessionContextSnapshot context, bool remoteMutationEnabled,
+                BridgeMutationConfirmationSnapshot mutationConfirmation)
             {
                 Version = version;
                 TransportActive = transportActive;
@@ -1312,6 +1437,8 @@ namespace RimWorldDevBridge
                 Port = port;
                 TransportToken = transportToken ?? string.Empty;
                 Context = context;
+                RemoteMutationEnabled = remoteMutationEnabled;
+                MutationConfirmation = mutationConfirmation;
             }
         }
 

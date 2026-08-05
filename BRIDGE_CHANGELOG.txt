@@ -8,3 +8,4 @@
 1.2.0|d42f91bc|Added bounded concurrent clients with isolated replies and serialized game actions.
 1.1.0|b7a31d4c|Added SYNC fingerprints, adapter versions, compact deltas, and restart detection.
 1.0.0|legacy-v6|Created the standalone bridge, generic inspector, hot macros, and adapter discovery.
+2.1.0-security|v10.1-typed-core|Remote mutation is disabled by default; leases require server-controlled in-game confirmation bound to the current game and session, stable denial codes, immediate lease invalidation on revocation or transition, and audit records with observed authorization state but no transport tokens.

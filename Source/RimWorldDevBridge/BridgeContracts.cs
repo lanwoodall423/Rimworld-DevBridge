@@ -309,6 +309,13 @@ namespace RimWorldDevBridge
         internal bool ExecutionReached;
         internal long QueueBarrierId;
         internal double PreparationMs;
+        internal string MutationGameIdentity;
+        internal string MutationSaveIdentity;
+        internal string MutationConfirmationState;
+        internal bool MutationGameLoaded;
+        internal bool MutationSettingEnabled;
+        internal string AuthorizedLeaseContext;
+        internal DateTime? AuthorizedLeaseExpiresUtc;
         internal object CooperativeState;
         internal bool YieldExecution;
         internal double CooperativeExecutionMs;

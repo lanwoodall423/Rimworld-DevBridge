@@ -3,3 +3,4 @@ protocol=10
 schema=v10.1-typed-core
 handoff=BRIDGE_HANDOFF.md
 changes=Removed dormant frame work, added authoritative lazy manifests, owner-mod BridgeAdapters discovery, immutable query snapshots, runtime safety indicator, cooperative built-in scheduling, adapter overrun diagnostics, fair agent scheduling, durable external restart coordination, and portable Dev Bridge-only release packaging
+remoteMutation=disabled-by-default; in-game-confirmation-required; client-context-is-intent-only

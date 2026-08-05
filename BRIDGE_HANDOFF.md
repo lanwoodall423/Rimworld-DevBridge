@@ -23,21 +23,30 @@ Use `CAPABILITIES`, `HELP read`, `HELP write`, `HELP available`, `HELP <adapter>
 
 ## Safety
 
-Sessions start read-only. Every non-read command requires all of:
+Remote mutation is disabled by default. Every non-read command requires all of:
 
-- The bridge setting `Allow explicitly leased remote mutations` enabled.
-- `WRITE_LEASE sandbox` or `WRITE_LEASE live-confirmed`.
+- The bridge setting `Allow remote mutation leases (in-game confirmation still required)` enabled.
+- An explicit in-game confirmation for the currently loaded game in the visible bridge warning panel.
+- `WRITE_LEASE sandbox` or `WRITE_LEASE live-confirmed`; the context is intent, not proof that a save is disposable.
 - The returned short-lived token in `lease=<token>`.
 - A stable `idempotency=<key>` for safe retry.
 - `allowExpensive=true` for expensive or simulation commands.
 
-Use `RENEW_WRITE_LEASE` with `lease=<token>` to extend an active lease, or
-`REVOKE_WRITE_LEASE` with the same token to remove it immediately. Both operations update the
-status file and runtime indicator.
+The in-game confirmation warns that remote tools may modify or destroy game state and has a visible
+revoke control. It is bound to the current session and loaded game, resets on save/game transition,
+main-menu return, bridge restart, setting disable, and explicit revocation, and clears all leases when
+revoked. No bridge client can create or restore this confirmation.
 
-Dev mode alone never authorizes a write. Potentially destructive commands require a sandbox lease.
-Modes are derived transitively for batches, macros, and feature tests. Mutations produce a summary
-and a bounded audit under RimWorld user data.
+Use `RENEW_WRITE_LEASE` with `lease=<token>` to extend an active lease only while confirmation remains
+valid. `REVOKE_WRITE_LEASE` removes an active lease immediately and remains available as a safety
+operation. Both operations update the status file and runtime indicator.
+
+Dev mode and a client label such as `WRITE_LEASE sandbox` never authorize a write. Potentially
+destructive commands require a sandbox lease. Modes are derived transitively for batches, macros, and
+feature tests. Mutations produce a summary and a bounded audit under RimWorld user data. Stable denial
+codes are `remote_mutation_disabled`, `no_game_loaded`, `in_game_confirmation_required`,
+`write_lease_required`, `write_lease_invalid`, `write_lease_expired`, and
+`write_lease_agent_mismatch`.
 
 ## Efficient Workflow
 

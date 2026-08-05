@@ -7,6 +7,7 @@
 - Validate: `DevTools\Test-BridgeSourceInvariants.ps1`, `DevTools\Package-RimWorldDevBridge.ps1 -Build`.
 - Before runtime tests, query live context with `DevTools\devbridge.ps1 discover --json` and `context --package-id Lan.RimWorldDevBridge --json`.
 - Adapter-only changes use `adapter publish` then `adapter reload`; gameplay assemblies, defs, Harmony patches, serialized types, or core changes require a full restart.
+- Remote mutation is disabled by default. A client-supplied sandbox/live label is intent only; writes additionally require server-observed in-game confirmation for the current save and an agent-owned lease.
 - Restart automation may control only an explicitly coordinator-owned sandbox; attached or live processes require a person or external orchestrator.
 - Dev Bridge owns contracts, discovery, validation, execution, safety, and diagnostics. Integrations and adapter distribution remain owner-controlled; Dev Bridge is optional.
 - Full workflow: `DevTools/DEVBRIDGE_AGENT.md`.

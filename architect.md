@@ -93,13 +93,22 @@ and invokes the normal authenticated client. It only stops a process it launched
       measured, reported as non-cooperative, and cannot be safely preempted.
 
 4. **Authorization and idempotency**
-   - Sessions start read-only. Writes require an explicit short-lived lease bound
-     to the session and a declared sandbox/live context. Remote mutation can be
-     disabled in settings.
+   - Remote mutation is disabled by default. A server-controlled, runtime-only
+      confirmation must be made in-game for the currently loaded Game/save before
+      a lease can be issued or honored. A client context label is intent only.
+      Confirmation is bound to the session and process-local Game identity, is
+      visibly revocable, and clears leases on revocation, setting disable, game
+      transition, main-menu return, and bridge restart.
+   - Writes then require an explicit short-lived agent-owned lease bound to the
+      session and declared sandbox/live context. Stable denial codes distinguish
+      disabled mutation, no game, missing confirmation, and invalid/expired/
+      wrong-agent leases.
    - Command, macro, batch, and feature-test modes are derived transitively.
      Unknown commands are forbidden rather than implicitly safe.
-   - Completed writes are cached by session plus idempotency key. A retry returns
-     the original result. A bounded audit records every accepted mutation.
+    - Completed writes are cached by session plus idempotency key. A retry returns
+      the original result. A bounded audit records every accepted mutation with
+      server-observed game identity, confirmation state, setting state, lease
+      context, and expiry, never transport or lease tokens.
 
 5. **Commands and inspection**
     - Core commands use typed handlers and meaningful statuses. Lists use stable

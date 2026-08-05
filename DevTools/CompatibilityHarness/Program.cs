@@ -54,6 +54,7 @@ internal static class Program
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
+        Run("remote mutation confirmation security", RemoteMutationConfirmationSecurity);
         Run("production pawn thing job snapshots", ProductionPawnThingJobSnapshots);
         Run("wake signal idempotence", WakeSignalIdempotence);
         Run("main thread dispatch queue", MainThreadDispatchQueue);
@@ -870,36 +871,158 @@ internal static class Program
         Equal(0, BridgeRuntime.StatusWriteCountForTests, "dormant status was recomputed every frame");
         Equal(0, BridgeRuntime.IndicatorRefreshCountForTests, "dormant indicator was refreshed every frame");
 
-        BridgeResult acquired = BridgeRuntime.AcquireWriteLease("sandbox");
-        Check(acquired.Status == BridgeStatus.OK, "lease acquisition failed");
-        int writesAfterAcquire = BridgeRuntime.StatusWriteCountForTests;
-        Check(writesAfterAcquire > 0, "lease acquisition did not publish status");
-        Check(BridgeRuntime.IndicatorRefreshCountForTests > 0, "lease acquisition did not refresh indicator");
-        string leaseToken = FieldValue(acquired, "lease");
-        BridgeResult renewed = BridgeRuntime.RenewWriteLease(leaseToken);
-        Check(renewed.Status == BridgeStatus.OK, "lease renewal failed");
-        Check(BridgeRuntime.StatusWriteCountForTests > writesAfterAcquire,
-            "lease renewal did not publish status");
+        WithTestGame(true, () =>
+        {
+            BridgeRuntime.ConfirmMutationForCurrentGame();
+            BridgeResult acquired = BridgeRuntime.AcquireWriteLease("sandbox");
+            Check(acquired.Status == BridgeStatus.OK, "lease acquisition failed");
+            int writesAfterAcquire = BridgeRuntime.StatusWriteCountForTests;
+            Check(writesAfterAcquire > 0, "lease acquisition did not publish status");
+            Check(BridgeRuntime.IndicatorRefreshCountForTests > 0, "lease acquisition did not refresh indicator");
+            string leaseToken = FieldValue(acquired, "lease");
+            BridgeResult renewed = BridgeRuntime.RenewWriteLease(leaseToken);
+            Check(renewed.Status == BridgeStatus.OK, "lease renewal failed");
+            Check(BridgeRuntime.StatusWriteCountForTests > writesAfterAcquire,
+                "lease renewal did not publish status");
 
-        FieldInfo authorizationField = typeof(BridgeRuntime).GetField("Authorization",
-            BindingFlags.Static | BindingFlags.NonPublic);
-        ExpireAllLeases((BridgeAuthorization)authorizationField.GetValue(null));
-        FieldInfo expiryField = typeof(BridgeRuntime).GetField("leaseExpiryTicks",
-            BindingFlags.Static | BindingFlags.NonPublic);
-        expiryField.SetValue(null, DateTime.UtcNow.AddSeconds(-1).Ticks);
-        BridgeRuntime.OnRootUpdate();
-        Check(!BridgeRuntime.SessionContext.WriteLeaseActive, "expired lease remained active");
-        Check(BridgeRuntime.StatusWriteCountForTests > writesAfterAcquire,
-            "lease expiration did not publish status");
-        int writesAfterExpiry = BridgeRuntime.StatusWriteCountForTests;
-        BridgeRuntime.OnRootUpdate();
-        Equal(writesAfterExpiry, BridgeRuntime.StatusWriteCountForTests,
-            "post-expiry dormant status kept publishing");
-        BridgeResult reacquired = BridgeRuntime.AcquireWriteLease("sandbox");
-        BridgeResult revoked = BridgeRuntime.RevokeWriteLease(FieldValue(reacquired, "lease"));
-        Check(revoked.Status == BridgeStatus.OK && !BridgeRuntime.SessionContext.WriteLeaseActive,
-            "lease revocation did not invalidate authority");
+            FieldInfo authorizationField = typeof(BridgeRuntime).GetField("Authorization",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            ExpireAllLeases((BridgeAuthorization)authorizationField.GetValue(null));
+            FieldInfo expiryField = typeof(BridgeRuntime).GetField("leaseExpiryTicks",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            expiryField.SetValue(null, DateTime.UtcNow.AddSeconds(-1).Ticks);
+            BridgeRuntime.OnRootUpdate();
+            Check(!BridgeRuntime.SessionContext.WriteLeaseActive, "expired lease remained active");
+            Check(BridgeRuntime.StatusWriteCountForTests > writesAfterAcquire,
+                "lease expiration did not publish status");
+            int writesAfterExpiry = BridgeRuntime.StatusWriteCountForTests;
+            BridgeRuntime.OnRootUpdate();
+            Equal(writesAfterExpiry, BridgeRuntime.StatusWriteCountForTests,
+                "post-expiry dormant status kept publishing");
+            BridgeResult reacquired = BridgeRuntime.AcquireWriteLease("sandbox");
+            BridgeResult revoked = BridgeRuntime.RevokeWriteLease(FieldValue(reacquired, "lease"));
+            Check(revoked.Status == BridgeStatus.OK && !BridgeRuntime.SessionContext.WriteLeaseActive,
+                "lease revocation did not invalidate authority");
+        });
         InvokeRotateSession("event-driven-cleanup");
+    }
+
+    private static void RemoteMutationConfirmationSecurity()
+    {
+        InvokeRotateSession("mutation-security");
+        WithTestGame(false, () =>
+        {
+            BridgeResult disabled = BridgeRuntime.AcquireWriteLease("sandbox", "malicious-agent");
+            Equal("remote_mutation_disabled", FieldValue(disabled, "error"),
+                "default-disabled mutation lease error");
+            Check(!BridgeRuntime.SessionContext.WriteLeaseActive, "disabled setting issued a lease");
+        });
+
+        WithTestGame(true, () =>
+        {
+            BridgeResult malicious = BridgeRuntime.AcquireWriteLease("sandbox", "malicious-agent");
+            Equal("in_game_confirmation_required", FieldValue(malicious, "error"),
+                "sandbox label was treated as confirmation");
+            BridgeResult confirmed = BridgeRuntime.ConfirmMutationForCurrentGame();
+            Check(confirmed.Status == BridgeStatus.OK, "in-game confirmation was not accepted");
+            BridgeResult acquired = BridgeRuntime.AcquireWriteLease("sandbox", "agent-a");
+            Check(acquired.Status == BridgeStatus.OK, "confirmed lease was not issued");
+            string token = FieldValue(acquired, "lease");
+            Equal("write_lease_agent_mismatch",
+                FieldValue(BridgeRuntime.RenewWriteLease(token, "agent-b"), "error"),
+                "wrong agent renewed lease");
+            Equal("write_lease_agent_mismatch",
+                FieldValue(BridgeRuntime.RevokeWriteLease(token, "agent-b"), "error"),
+                "wrong agent revoked lease");
+            BridgeResult revoked = BridgeRuntime.RevokeMutationConfirmation();
+            Check(revoked.Status == BridgeStatus.OK && !BridgeRuntime.SessionContext.WriteLeaseActive,
+                "confirmation revocation did not clear the lease");
+            Equal("in_game_confirmation_required",
+                FieldValue(BridgeRuntime.AcquireWriteLease("sandbox", "agent-a"), "error"),
+                "lease was issued after confirmation revocation");
+
+            BridgeResult auditRequestResult = BridgeRuntime.ConfirmMutationForCurrentGame();
+            Check(auditRequestResult.Status == BridgeStatus.OK, "audit confirmation setup failed");
+            BridgeResult auditLease = BridgeRuntime.AcquireWriteLease("sandbox", "agent-a");
+            BridgeRequest auditRequest = Request("audit-security", BridgeRuntime.SessionId);
+            auditRequest.Command = "SET_SPEED";
+            auditRequest.Mode = BridgeCommandMode.Reversible;
+            auditRequest.IdempotencyKey = "audit-security-key";
+            auditRequest.AuthToken = "secret-token";
+            auditRequest.MutationGameIdentity = "game-audit";
+            auditRequest.MutationGameLoaded = true;
+            auditRequest.MutationSettingEnabled = true;
+            auditRequest.MutationConfirmationState = "confirmed";
+            auditRequest.AuthorizedLeaseContext = FieldValue(auditLease, "context");
+            FieldInfo authorizationField = typeof(BridgeRuntime).GetField("Authorization",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            ((BridgeAuthorization)authorizationField.GetValue(null)).Audit(auditRequest, BridgeResult.Ok());
+            Thread.Sleep(100);
+            string audit = File.Exists(BridgePaths.AuditPath) ? File.ReadAllText(BridgePaths.AuditPath) : string.Empty;
+            Check(audit.Contains("gameLoaded=true") && audit.Contains("confirmation=confirmed") &&
+                audit.Contains("leaseContext=sandbox"), "audit omitted server authorization state");
+            Check(!audit.Contains("secret-token"), "audit leaked a transport/lease token");
+
+            Exception workerError = null;
+            Thread worker = new Thread(() =>
+            {
+                try { BridgeRuntime.OnGameChanging(null); } catch (Exception error) { workerError = error; }
+            });
+            worker.Start();
+            worker.Join();
+            Check(workerError == null && !BridgeRuntime.SessionContext.WriteLeaseActive &&
+                !BridgeRuntime.StateSnapshot.MutationConfirmation.Confirmed,
+                "game transition did not immediately invalidate mutation authority");
+        });
+
+        FieldInfo currentGameField = typeof(Verse.Current).GetField("gameInt",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        object previousGame = currentGameField.GetValue(null);
+        BridgeSettings previousSettings = RimWorldDevBridgeMod.Settings;
+        try
+        {
+            RimWorldDevBridgeMod.Settings = new BridgeSettings { RemoteMutationEnabled = true };
+            currentGameField.SetValue(null, null);
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            Equal("no_game_loaded", FieldValue(BridgeRuntime.AcquireWriteLease("sandbox", "agent-a"), "error"),
+                "no-game mutation lease error");
+        }
+        finally
+        {
+            currentGameField.SetValue(null, previousGame);
+            RimWorldDevBridgeMod.Settings = previousSettings;
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            InvokeRotateSession("mutation-security-cleanup");
+        }
+    }
+
+    private static void WithTestGame(bool remoteMutationEnabled, Action action)
+    {
+        FieldInfo currentGameField = typeof(Verse.Current).GetField("gameInt",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        object previousGame = currentGameField.GetValue(null);
+        BridgeSettings previousSettings = RimWorldDevBridgeMod.Settings;
+        try
+        {
+            RimWorldDevBridgeMod.Settings = new BridgeSettings
+            {
+                RemoteMutationEnabled = remoteMutationEnabled,
+                ShowBridgeIndicator = false
+            };
+            Verse.Game game = (Verse.Game)FormatterServices.GetUninitializedObject(typeof(Verse.Game));
+            currentGameField.SetValue(null, game);
+            BridgeRuntime.BindCurrentGameForTests(game);
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            action();
+        }
+        finally
+        {
+            BridgeRuntime.RevokeMutationConfirmation();
+            currentGameField.SetValue(null, previousGame);
+            RimWorldDevBridgeMod.Settings = previousSettings;
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            InvokeRotateSession("mutation-test-game-cleanup");
+        }
     }
 
     private static void ProductionPawnThingJobSnapshots()

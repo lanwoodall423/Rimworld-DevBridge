@@ -29,7 +29,7 @@ namespace RimWorldDevBridge
                 BridgeCostClass.Normal, false, "filter:string");
             Register("DESCRIBE", "Describe one command contract.", BridgeCommandMode.PureRead,
                 BridgeCostClass.Trivial, false, "command:string");
-            Register("WRITE_LEASE", "Acquire a short-lived write lease for sandbox or confirmed live use.",
+            Register("WRITE_LEASE", "Request a short-lived write lease after in-game confirmation; context is intent only.",
                 BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "context:sandbox|live-confirmed");
             Register("RENEW_WRITE_LEASE", "Extend an active write lease without changing its context.",
                 BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "lease:string");
@@ -324,7 +324,7 @@ namespace RimWorldDevBridge
                     item.Name.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0);
             BridgeResult result = BridgeResult.Ok("core.help")
                 .Add("request", "id|COMMAND|argument|timeoutMs=4500&session=<id>&format=line|json")
-                .Add("write", "WRITE_LEASE sandbox, then lease=<token>&idempotency=<stable-key>");
+                .Add("write", "Enable remote mutation and confirm the current game in-game; WRITE_LEASE sandbox is intent only, then use lease=<token>&idempotency=<stable-key>");
             foreach (BridgeCommandDescriptor descriptor in commands.OrderBy(item => item.Name))
                 result.AddLine(CommandLine(descriptor));
             if (result.Lines.Count == 0) result.Status = BridgeStatus.NOT_FOUND;

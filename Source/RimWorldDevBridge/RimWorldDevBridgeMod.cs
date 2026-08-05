@@ -24,15 +24,16 @@ namespace RimWorldDevBridge
             Settings.Normalize();
             base.WriteSettings();
             BridgeRuntime.ApplySchedulerSettings();
-            BridgeRuntime.RefreshIndicator();
+            BridgeRuntime.ApplyRemoteMutationSettings();
         }
 
         public override void DoSettingsWindowContents(Rect inRect)
         {
             Listing_Standard listing = new Listing_Standard();
             listing.Begin(inRect);
-            listing.CheckboxLabeled("Allow explicitly leased remote mutations", ref Settings.RemoteMutationEnabled,
-                "Dev mode alone never authorizes a write. Disable this to force every remote command read-only.");
+            listing.CheckboxLabeled("Allow remote mutation leases (in-game confirmation still required)",
+                ref Settings.RemoteMutationEnabled,
+                "Disabled by default. Enabling this never authorizes a write by itself; the current game must also be explicitly confirmed in the bridge warning panel.");
             listing.Label("Operation queue capacity: requested " + Settings.QueueCapacity +
                 ", effective " + BridgeRuntime.EffectiveQueueCapacity);
             Settings.QueueCapacity = (int)listing.Slider(Settings.QueueCapacity, 8, 256);

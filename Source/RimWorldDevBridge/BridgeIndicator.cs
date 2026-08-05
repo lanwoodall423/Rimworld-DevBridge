@@ -22,9 +22,11 @@ namespace RimWorldDevBridge
         internal readonly int ConnectedClientLimit;
         internal readonly string Context;
         internal readonly DateTime? LeaseExpiresUtc;
+        internal readonly BridgeMutationConfirmationSnapshot Confirmation;
 
         private BridgeIndicatorState(BridgeIndicatorMode mode, bool visible, bool transportActive,
-            int connectedClients, int connectedClientLimit, string context, DateTime? leaseExpiresUtc)
+            int connectedClients, int connectedClientLimit, string context, DateTime? leaseExpiresUtc,
+            BridgeMutationConfirmationSnapshot confirmation)
         {
             Mode = mode;
             Visible = visible;
@@ -33,10 +35,18 @@ namespace RimWorldDevBridge
             ConnectedClientLimit = connectedClientLimit;
             Context = context;
             LeaseExpiresUtc = leaseExpiresUtc;
+            Confirmation = confirmation;
         }
 
         internal static BridgeIndicatorState Create(bool transportActive, int connectedClients,
             int connectedClientLimit, BridgeSessionContextSnapshot session, bool settingVisible)
+        {
+            return Create(transportActive, connectedClients, connectedClientLimit, session, settingVisible, null);
+        }
+
+        internal static BridgeIndicatorState Create(bool transportActive, int connectedClients,
+            int connectedClientLimit, BridgeSessionContextSnapshot session, bool settingVisible,
+            BridgeMutationConfirmationSnapshot confirmation)
         {
             bool leaseActive = session != null && session.WriteLeaseActive;
             BridgeIndicatorMode mode = !leaseActive ?
@@ -45,10 +55,11 @@ namespace RimWorldDevBridge
                     ? BridgeIndicatorMode.LiveConfirmed : BridgeIndicatorMode.Sandbox;
             // The preference controls the optional idle read-only display. Active transport and every
             // write lease always remain visible so dangerous access cannot be hidden.
-            bool visible = settingVisible || transportActive || leaseActive;
+            bool visible = settingVisible || transportActive || leaseActive ||
+                (confirmation != null && confirmation.Visible);
             return new BridgeIndicatorState(mode, visible, transportActive,
                 Math.Max(0, connectedClients), Math.Max(0, connectedClientLimit),
-                session?.WriteContext ?? "none", session?.LeaseExpiresUtc);
+                session?.WriteContext ?? "none", session?.LeaseExpiresUtc, confirmation);
         }
 
         internal string Label
@@ -71,17 +82,23 @@ namespace RimWorldDevBridge
             string expiry = LeaseExpiresUtc.HasValue
                 ? " expires:" + Math.Max(0d, (LeaseExpiresUtc.Value - utcNow).TotalSeconds).ToString("0") + "s"
                 : string.Empty;
+            string confirmation = Confirmation == null ? string.Empty :
+                "  confirmation:" + Confirmation.State;
             return transport + "  clients:" + ConnectedClients + "/" + ConnectedClientLimit +
-                "  lease:" + lease + expiry;
+                "  lease:" + lease + expiry + confirmation;
         }
 
         internal string Tooltip(DateTime utcNow)
         {
             string warning = Mode == BridgeIndicatorMode.LiveConfirmed
                 ? "\nLIVE-CONFIRMED writes are enabled."
-                : string.Empty;
+                : Confirmation != null && Confirmation.Visible
+                    ? "\nWARNING: Remote tools may modify or destroy game state."
+                    : string.Empty;
             return Label + "\n" + CompactDetails(utcNow) + warning +
-                "\nThe indicator remains visible while write access is leased.";
+                (Confirmation != null && Confirmation.Visible
+                    ? "\nIn-game confirmation is required and can be revoked here."
+                    : "\nThe indicator remains visible while write access is leased.");
         }
     }
 
@@ -100,15 +117,23 @@ namespace RimWorldDevBridge
         {
             if (snapshot == null) return;
             Refresh(snapshot.TransportActive, snapshot.ConnectedClients,
-                snapshot.ConnectedClientLimit, snapshot.Context, settingVisible, corner);
+                snapshot.ConnectedClientLimit, snapshot.Context, settingVisible, corner,
+                snapshot.MutationConfirmation);
         }
 
         internal static void Refresh(bool transportActive, int connectedClients, int connectedClientLimit,
             BridgeSessionContextSnapshot session, bool settingVisible, int corner)
         {
+            Refresh(transportActive, connectedClients, connectedClientLimit, session, settingVisible, corner, null);
+        }
+
+        private static void Refresh(bool transportActive, int connectedClients, int connectedClientLimit,
+            BridgeSessionContextSnapshot session, bool settingVisible, int corner,
+            BridgeMutationConfirmationSnapshot confirmation)
+        {
             System.Threading.Interlocked.Increment(ref refreshCount);
             BridgeIndicatorState next = BridgeIndicatorState.Create(transportActive, connectedClients,
-                connectedClientLimit, session, settingVisible);
+                connectedClientLimit, session, settingVisible, confirmation);
             state = next;
             if (!next.Visible)
             {
@@ -127,7 +152,7 @@ namespace RimWorldDevBridge
 
         internal static void Close()
         {
-            state = BridgeIndicatorState.Create(false, 0, 0, null, false);
+            state = BridgeIndicatorState.Create(false, 0, 0, null, false, null);
             CloseWindow();
         }
 
@@ -161,7 +186,8 @@ namespace RimWorldDevBridge
         }
 
         public override Vector2 InitialSize => new Vector2(355f,
-            state != null && state.Mode == BridgeIndicatorMode.LiveConfirmed ? 56f : 46f);
+            state != null && state.Confirmation != null && state.Confirmation.Visible ? 106f :
+                state != null && state.Mode == BridgeIndicatorMode.LiveConfirmed ? 56f : 46f);
 
         internal void SetState(BridgeIndicatorState next, int nextCorner)
         {
@@ -186,6 +212,28 @@ namespace RimWorldDevBridge
             Widgets.Label(new Rect(8f, 4f, inRect.width - 16f, 18f), state.Label);
             Widgets.Label(new Rect(8f, 22f, inRect.width - 16f, 18f),
                 state.CompactDetails(DateTime.UtcNow));
+            if (state.Confirmation != null && state.Confirmation.Visible)
+            {
+                Text.Font = GameFont.Small;
+                GUI.color = new Color(1f, 0.88f, 0.35f);
+                Widgets.Label(new Rect(8f, 42f, inRect.width - 16f, 18f),
+                    state.Confirmation.Confirmed
+                        ? "REMOTE WRITES CONFIRMED FOR THIS GAME"
+                        : "REMOTE WRITES REQUIRE IN-GAME CONFIRMATION");
+                Text.Font = GameFont.Tiny;
+                GUI.color = Color.white;
+                Rect buttonRect = new Rect(8f, 66f, inRect.width - 16f, 26f);
+                string button = state.Confirmation.Confirmed
+                    ? "Revoke remote mutation confirmation"
+                    : "Confirm remote mutation for this game";
+                if (Widgets.ButtonText(buttonRect, button))
+                {
+                    if (state.Confirmation.Confirmed)
+                        BridgeRuntime.RevokeMutationConfirmation();
+                    else
+                        BridgeRuntime.ConfirmMutationForCurrentGame();
+                }
+            }
             TooltipHandler.TipRegion(new Rect(0f, 0f, inRect.width, inRect.height),
                 state.Tooltip(DateTime.UtcNow));
             Text.Font = previousFont;

@@ -5,7 +5,7 @@ namespace RimWorldDevBridge
 {
     public sealed class BridgeSettings : ModSettings
     {
-        public bool RemoteMutationEnabled = true;
+        public bool RemoteMutationEnabled = false;
         public int QueueCapacity = 64;
         public int ConnectedClientLimit = 16;
         public int MainThreadBudgetMs = 3;
@@ -24,7 +24,7 @@ namespace RimWorldDevBridge
 
         public override void ExposeData()
         {
-            Scribe_Values.Look(ref RemoteMutationEnabled, "remoteMutationEnabled", true);
+            Scribe_Values.Look(ref RemoteMutationEnabled, "remoteMutationEnabled", false);
             Scribe_Values.Look(ref QueueCapacity, "queueCapacity", 64);
             Scribe_Values.Look(ref ConnectedClientLimit, "connectedClientLimit", 16);
             Scribe_Values.Look(ref MainThreadBudgetMs, "mainThreadBudgetMs", 3);
