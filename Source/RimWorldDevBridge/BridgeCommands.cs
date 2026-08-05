@@ -21,6 +21,8 @@ namespace RimWorldDevBridge
                 BridgeCostClass.Trivial, false);
             Register("SESSION", "Current game session identity and write context.", BridgeCommandMode.PureRead,
                 BridgeCostClass.Trivial, false);
+            Register("AGENT_CONTEXT", "Bounded machine-readable runtime and adapter context for repository agents.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "packageId:string&format:json");
             Register("CAPABILITIES", "List typed core and available adapter commands.", BridgeCommandMode.PureRead,
                 BridgeCostClass.Normal, false);
             Register("HELP", "Describe commands by adapter or read/write mode.", BridgeCommandMode.PureRead,
@@ -49,6 +51,12 @@ namespace RimWorldDevBridge
                 BridgeCommandMode.PureRead, BridgeCostClass.Normal, false);
             Register("RELOAD_BRIDGE", "Reindex adapter manifests and reload declarative macros.",
                 BridgeCommandMode.PureRead, BridgeCostClass.Normal, false);
+            Register("RESTART_DRAIN", "Establish a restart drain barrier and invalidate write authority.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false);
+            Register("RESTART_DRAIN_STATUS", "Report restart drain progress for the current barrier.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false);
+            Register("RESTART_HEARTBEAT", "Keep an external restart coordinator request alive.",
+                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false);
             Register("MODS", "Loaded mod identities in load order.", BridgeCommandMode.PureRead,
                 BridgeCostClass.Normal, false, "limit,cursor,filter");
             Register("DLC", "Active official expansions.", BridgeCommandMode.PureRead,
@@ -88,12 +96,16 @@ namespace RimWorldDevBridge
                 case "SYNC": return Sync(context.Request.Argument);
                 case "STATUS": return Status();
                 case "SESSION": return Session();
+                case "AGENT_CONTEXT": return AgentContext(context.Request);
                 case "CAPABILITIES": return Capabilities();
                 case "HELP": return Help(context.Request.Argument);
                 case "DESCRIBE": return DescribeResult(context.Request.Argument);
-                case "WRITE_LEASE": return BridgeRuntime.AcquireWriteLease(context.Request.Argument);
-                case "RENEW_WRITE_LEASE": return BridgeRuntime.RenewWriteLease(LeaseToken(context.Request));
-                case "REVOKE_WRITE_LEASE": return BridgeRuntime.RevokeWriteLease(LeaseToken(context.Request));
+                case "WRITE_LEASE": return BridgeRuntime.AcquireWriteLease(context.Request.Argument,
+                    context.Request.AgentId);
+                case "RENEW_WRITE_LEASE": return BridgeRuntime.RenewWriteLease(LeaseToken(context.Request),
+                    context.Request.AgentId);
+                case "REVOKE_WRITE_LEASE": return BridgeRuntime.RevokeWriteLease(LeaseToken(context.Request),
+                    context.Request.AgentId);
                 case "SET_SPEED": return SetSpeed(context.Request.Argument);
                 case "SCHEDULER_METRICS": return BridgeRuntime.SchedulerMetrics();
                 case "COMMAND_METRICS": return BridgeMetrics.Report();
@@ -104,6 +116,9 @@ namespace RimWorldDevBridge
                 case "RELOAD_BRIDGE":
                     BridgeOrchestration.Reload();
                     return BridgeAdapterCatalog.Reindex().Add("macros", "reloaded");
+                case "RESTART_DRAIN": return BridgeRuntime.BeginRestartDrain(context.Request);
+                case "RESTART_DRAIN_STATUS":
+                case "RESTART_HEARTBEAT": return BridgeRuntime.RestartDrainStatus(context.Request);
                 case "MODS": return Mods(context.Request);
                 case "DLC": return Dlc();
                 case "MAPS": return Maps();
@@ -164,8 +179,87 @@ namespace RimWorldDevBridge
                 .Add("harmonyMs", BridgeRuntime.HarmonyMs)
                 .Add("finalizeInitMs", BridgeRuntime.FinalizeInitMs)
                 .Add("activationMs", BridgeRuntime.ActivationMs)
-                .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes);
+                    .Add("bootstrapManagedDeltaBytesApprox", BridgeRuntime.BootstrapManagedDeltaBytes);
             return BridgeRuntime.AddSessionContext(result, state);
+        }
+
+        private static BridgeResult AgentContext(BridgeRequest request)
+        {
+            Dictionary<string, string> options = BridgeProtocol.ParseOptions((request.Argument ?? string.Empty)
+                .Replace(';', '&'));
+            string packageId = BridgeProtocol.Value(options, "packageId");
+            if (string.IsNullOrWhiteSpace(packageId)) packageId = request.Argument?.Trim();
+            if (string.IsNullOrWhiteSpace(packageId))
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "package_id_required");
+            BridgeRuntime.BridgeRuntimeStateSnapshot state = BridgeRuntime.StateSnapshot;
+            ModContentPack mod = (LoadedModManager.RunningModsListForReading ?? Enumerable.Empty<ModContentPack>())
+                .FirstOrDefault(item => string.Equals(item?.PackageIdPlayerFacing, packageId,
+                    StringComparison.OrdinalIgnoreCase));
+            string loadedVersion = "none";
+            if (mod != null)
+            {
+                try
+                {
+                    object metadata = mod.GetType().GetProperty("ModMetaData",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic)?.GetValue(mod, null);
+                    loadedVersion = metadata?.GetType().GetProperty("ModVersion",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic)?.GetValue(metadata, null)?.ToString() ?? "unknown";
+                }
+                catch { loadedVersion = "unknown"; }
+            }
+            BridgeResult result = BridgeResult.Ok("core.agentContext")
+                .Add("coreVersion", BridgeProtocol.BridgeVersion)
+                .Add("protocol", BridgeProtocol.ProtocolVersion)
+                .Add("schema", BridgeProtocol.CoreSchema)
+                .Add("coreFingerprint", BridgeRuntime.CoreFingerprint)
+                .Add("processId", BridgeRuntime.ProcessIdForClients)
+                .Add("bootId", BridgeRuntime.BootIdForClients)
+                .Add("transportGeneration", state.TransportGeneration)
+                .Add("gameLoaded", Current.Game != null)
+                .Add("mapReady", BridgeGameState.CurrentMap != null)
+                .Add("packageId", packageId)
+                .Add("loaded", mod != null)
+                .Add("loadedVersion", loadedVersion)
+                .Add("schedulerAvailable", true)
+                .Add("restartCoordinatorAvailable", false)
+                .Add("restartRequired", BridgeAdapterCatalog.RestartRequired)
+                .Add("agentId", request.AgentId ?? "anonymous")
+                .Add("workspaceId", request.WorkspaceId ?? "default");
+            BridgeRuntime.AddSessionContext(result, state);
+            BridgeAdapterCatalog.AddAgentContext(result, packageId);
+            int commandCount = 0;
+            foreach (BridgeCommandDescriptor descriptor in AllKnownCommands())
+            {
+                if (commandCount++ >= 96)
+                {
+                    result.Truncated = true;
+                    result.Warn("command descriptors exceeded the bounded agent context limit");
+                    break;
+                }
+                result.AddLine("command=name:" + BridgeText.Clean(descriptor.Name) +
+                    " mode:" + descriptor.Mode + " cost:" + descriptor.Cost +
+                    " argumentSchema:" + BridgeText.Clean(descriptor.ArgumentSchema) +
+                    " resultSchema:" + BridgeText.Clean(descriptor.ResultSchema) +
+                    " schemaVersion:" + descriptor.SchemaVersion + " requiresMap:" + descriptor.RequiresMap +
+                    " cooperative:" + descriptor.Cooperative + " restart:" + RestartImplication(descriptor));
+            }
+            return result;
+        }
+
+        internal static IEnumerable<BridgeCommandDescriptor> AllKnownCommands()
+        {
+            return All.Concat(BridgeAdapterCatalog.Commands).Concat(BridgeFeatureTests.Commands)
+                .Concat(BridgeOrchestration.Commands).Where(item => item != null)
+                .GroupBy(item => item.Name, StringComparer.OrdinalIgnoreCase).Select(group => group.First())
+                .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static string RestartImplication(BridgeCommandDescriptor descriptor)
+        {
+            if (string.Equals(descriptor.Provider, "core", StringComparison.OrdinalIgnoreCase)) return "none";
+            return "adapter-only-for-adapter-change;full-restart-for-gameplay-or-core-change";
         }
 
         private static BridgeResult Session()

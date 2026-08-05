@@ -9,7 +9,8 @@ param(
     [switch]$RequireMap,
     [switch]$SkipBuild,
     [switch]$NoQuickTest,
-    [switch]$KeepRunning
+    [switch]$KeepRunning,
+    [switch]$ForceKillTestOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,8 +61,12 @@ function Stop-OwnedProcess {
     if (-not $ownedProcess -or $null -eq $process) { return }
     $process.Refresh()
     if (-not $process.HasExited) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        $process.CloseMainWindow() | Out-Null
         try { $process.WaitForExit(10000) | Out-Null } catch { }
+        if (-not $process.HasExited -and $ForceKillTestOnly) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            try { $process.WaitForExit(10000) | Out-Null } catch { }
+        }
     }
     $script:ownedArtifactsRemoved = Remove-OwnedBridgeArtifacts -ProcessId $process.Id -BootId $ownedBootId `
         -StatusPath $statusPath -ArtifactPaths @($statusPath, $wakePath, $inputPath, $outputPath)
@@ -111,6 +116,29 @@ function Response-Value($Lines, [string]$Name) {
     return "$line".Substring($prefix.Length)
 }
 
+function Start-CoordinatorOwnedProcess([string]$Executable, [string[]]$Arguments) {
+    $devbridgePath = Join-Path $PSScriptRoot "devbridge.ps1"
+    $shellPath = (Get-Process -Id $PID).Path
+    $argumentText = ($Arguments | ForEach-Object {
+        if ([string]::IsNullOrEmpty($_)) { '""' }
+        elseif ($_ -match '[\s"]') { '"' + $_.Replace('"', '\\"') + '"' }
+        else { $_ }
+    }) -join ' '
+    $clientArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $devbridgePath,
+        "restart", "launch", "--bridge-root", $modRoot, "--user-root", $saveDir,
+        "--game-path", $Executable, "--working-directory", (Split-Path -Parent $Executable),
+        "--arguments", $argumentText)
+    $lines = & $shellPath $clientArguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $lines | ForEach-Object { Write-Output $_ }
+        throw "coordinator-owned launch failed"
+    }
+    $json = (@($lines) -join "`n") | ConvertFrom-Json
+    $pidValue = $json.details.ProcessId
+    if ($null -eq $pidValue) { throw "coordinator launch did not return a process id" }
+    return Get-Process -Id ([int]$pidValue) -ErrorAction Stop
+}
+
 if ($StartupTimeoutSeconds -lt 1 -or $StartupTimeoutSeconds -gt 1800) {
     throw "StartupTimeoutSeconds must be between 1 and 1800."
 }
@@ -145,8 +173,7 @@ else {
     $arguments = @()
     if (-not $NoQuickTest) { $arguments += "-quicktest" }
     $arguments += $GameArguments
-    $process = Start-Process -FilePath $GamePath -WorkingDirectory (Split-Path -Parent $GamePath) `
-        -ArgumentList $arguments -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    $process = Start-CoordinatorOwnedProcess $GamePath $arguments
     $ownedProcess = $true
     Write-Output ("launch=STARTED processId={0} arguments={1}" -f $process.Id, ($arguments -join " "))
 }

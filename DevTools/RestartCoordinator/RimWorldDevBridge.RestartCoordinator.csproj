@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>RimWorldDevBridge.RestartCoordinator</AssemblyName>
+    <RootNamespace>RimWorldDevBridge.RestartCoordinator</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <OutputPath>..\..\1.6\Assemblies\RestartCoordinator\</OutputPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\Source\RimWorldDevBridge\BridgeRestartCoordinator.cs" Link="BridgeRestartCoordinator.cs" />
+  </ItemGroup>
+</Project>

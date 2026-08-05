@@ -84,6 +84,8 @@ namespace RimWorldDevBridge
             request = new BridgeRequest
             {
                 RequestId = id,
+                AgentId = Value(options, "agentId") ?? "anonymous",
+                WorkspaceId = Value(options, "workspaceId") ?? "default",
                 SessionId = Value(options, "session") ?? currentSessionId,
                 Command = command,
                 Argument = argument,
@@ -96,7 +98,8 @@ namespace RimWorldDevBridge
                 AllowExpensive = ParseBool(Value(options, "allowExpensive")),
                 AuthToken = Value(options, "lease")
             };
-            if (!ValidOptionValue(request.SessionId, 128) || !ValidOptionValue(request.IdempotencyKey, 128) ||
+            if (!ValidOptionValue(request.AgentId, 128) || !ValidOptionValue(request.WorkspaceId, 128) ||
+                !ValidOptionValue(request.SessionId, 128) || !ValidOptionValue(request.IdempotencyKey, 128) ||
                 !ValidOptionValue(request.AuthToken, 128) || !ValidOptionValue(request.DetailLevel, 32))
             {
                 request = null;

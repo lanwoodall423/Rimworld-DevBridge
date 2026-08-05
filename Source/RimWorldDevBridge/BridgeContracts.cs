@@ -280,6 +280,8 @@ namespace RimWorldDevBridge
     public sealed class BridgeRequest
     {
         public string RequestId { get; set; }
+        public string AgentId { get; set; }
+        public string WorkspaceId { get; set; }
         public string SessionId { get; set; }
         public string Command { get; set; }
         public string Argument { get; set; }
@@ -305,6 +307,7 @@ namespace RimWorldDevBridge
         internal int NestingDepth;
         internal bool IdempotentReplay;
         internal bool ExecutionReached;
+        internal long QueueBarrierId;
         internal double PreparationMs;
         internal object CooperativeState;
         internal bool YieldExecution;

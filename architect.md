@@ -13,10 +13,10 @@ performed off-thread or by stateless external tools.
 - The unchanged project builds with zero warnings and errors.
 - `Game.FinalizeInit` calls `BridgeHost.Initialize`, which calls
   `ReloadProviders` before creating the wake watcher.
-- Provider reload scans types from every loaded AppDomain assembly, initializes
-  macros, enumerates and hashes every hot DLL, and loads each unseen DLL from
-  bytes. The live session retained 80 hot generations: 60 Horticulture, 14
-  Aquaculture, and 6 Flockmaster assemblies (4,676,096 source bytes total).
+  - Provider reload scanned types from every loaded AppDomain assembly, initialized
+    macros, enumerated and hashed every hot DLL, and loaded each unseen DLL from
+    bytes. That historical session retained 80 hot generations across several
+    external owners (4,676,096 source bytes total).
 - First wake plus `SYNC` measured about 1,277 ms in the live baseline. Subsequent
   local PowerShell calls measured about 18-33 ms before the process exited.
 - The active game process had about 11.1 GB working set and 14.5 GB private bytes;
@@ -114,8 +114,15 @@ and invokes the normal authenticated client. It only stops a process it launched
      adapters own complex inspection.
 
 6. **Adapters**
-   - Sidecar manifests are indexed off-thread only after activation. The newest
-     compatible manifest per stable adapter ID is selected without loading DLLs.
+    - On the main thread, the bridge captures exact loaded owner package IDs,
+      versions, normalized roots, and loaded module bindings. Off-thread indexing
+      then scans only each owner's nonrecursive `DevTools/BridgeAdapters` directory.
+      The newest compatible manifest per stable adapter ID is selected without
+      loading DLLs.
+    - `DevTools/HotAdapters` is a bounded legacy/development source for one
+      compatibility period, not a public distribution channel. Owner-mod copies
+      take precedence over identical legacy bindings; conflicting immutable
+      bindings are quarantined rather than selected.
    - A selected assembly loads only when one of its commands is requested. Exact
      provider types avoid assembly-wide type scans. Malformed, partial,
      incompatible, colliding, and failing generations are isolated and reported.
@@ -125,9 +132,12 @@ and invokes the normal authenticated client. It only stops a process it launched
     - Legacy convention providers require an explicit manifest with an exact
       loaded assembly identity and provider type. They are resolved only on first
       command and never trigger assembly/type discovery scans.
-    - A cooperative-v1 provider must implement the explicit step contract and
-      may yield between main-thread frames. Existing synchronous providers remain
-      compatible, but serious non-cooperative overruns open the adapter circuit.
+     - A cooperative-v1 provider must implement the explicit step contract and
+       may yield between main-thread frames. Existing synchronous providers remain
+       compatible, but serious non-cooperative overruns open the adapter circuit.
+    - Adapter implementation and distribution belong to the integrating mod. Dev
+      Bridge and participating mods are mutually optional; Dev Bridge packages
+      contain no external adapter DLLs or manifests.
 
 7. **In-game safety indicator**
    - A runtime-only nonblocking corner indicator is visible whenever transport is
@@ -197,14 +207,15 @@ Only after all six pass may the superseded host path be deleted or disconnected.
 - Raw loopback `STATUS` measured 35.288 ms for the first command and 5.813 ms
   repeated mean (1.845 ms minimum). The compatibility PowerShell process adds
   startup and script parsing overhead.
-- Before first adapter use, four adapters and 116 commands were available with
-  zero retained hot generations. First hot-provider loads measured about 5 ms
-  each. A live Aquaculture replacement selected the new manifest before load,
-  retained the old Mono generation honestly, and loaded the new generation only
-  when requested.
-- Seventy-seven unmanifested historical DLLs were then pruned. Final cold/live
-  verification found five manifests, four logical adapters, one superseded
-  generation, zero ignored DLLs, and zero retained hot assemblies before use.
+  - Before first adapter use, the historical bridge had four adapters and 116
+    commands with zero retained hot generations. First hot-provider loads measured
+     about 5 ms each. A live owner replacement selected the new manifest before
+     load, retained the old Mono generation honestly, and loaded the new generation
+     only when requested.
+  - Seventy-seven unmanifested historical DLLs were then pruned. Current Dev
+    Bridge distribution contains no owner adapter manifests or DLLs; owner mods
+    package their own current `DevTools/BridgeAdapters` pair and are discovered
+    only when the owner is loaded.
 - An unfiltered 20,000-object `THINGS limit=5` query fell from 98.567 ms in the
   initial v2 implementation to 0.052-0.225 ms after JIT. Sixteen concurrent
   compatibility clients returned isolated successful IDs. Feature-test discovery

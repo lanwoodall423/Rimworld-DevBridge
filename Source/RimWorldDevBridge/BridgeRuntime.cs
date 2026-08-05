@@ -7,6 +7,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -57,6 +58,7 @@ namespace RimWorldDevBridge
         private static double statusWriteMs;
         private static int statusWriteCount;
         private static long bootstrapManagedDeltaBytes;
+        private static string coreFingerprint;
         private static bool bootstrapped;
         private static Timer leaseExpiryTimer;
         private static long leaseExpiryTicks;
@@ -77,6 +79,9 @@ namespace RimWorldDevBridge
         internal static double ActivationMs => activationMs;
         internal static long BootstrapManagedDeltaBytes => bootstrapManagedDeltaBytes;
         internal static string SessionId => identity.SessionId;
+        internal static string BootIdForClients => BootId;
+        internal static int ProcessIdForClients => Process.GetCurrentProcess().Id;
+        internal static string CoreFingerprint => coreFingerprint ?? (coreFingerprint = ComputeCoreFingerprint());
         internal static BridgeRuntimeStateSnapshot StateSnapshot => CaptureStateSnapshot();
         internal static BridgeSessionContextSnapshot SessionContext => StateSnapshot.Context;
         internal static int StatusWriteCountForTests => Volatile.Read(ref statusWriteCount);
@@ -345,9 +350,24 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult SchedulerMetrics() => Scheduler.Metrics();
 
-        internal static BridgeResult AcquireWriteLease(string context)
+        internal static BridgeResult BeginRestartDrain(BridgeRequest request)
         {
-            BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled);
+            AssertMainThread("restart drain");
+            long barrierId = Scheduler.BeginDrain();
+            Authorization.ClearLeases();
+            MarkStateDirty();
+            PublishStateIfDirty(true, "restartDrain=active barrierId=" + barrierId);
+            return Scheduler.DrainStatus(request);
+        }
+
+        internal static BridgeResult RestartDrainStatus(BridgeRequest request) =>
+            Scheduler.DrainStatus(request);
+
+        internal static BridgeResult AcquireWriteLease(string context) => AcquireWriteLease(context, null);
+
+        internal static BridgeResult AcquireWriteLease(string context, string agentId)
+        {
+            BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled, agentId);
             if (result.IsSuccess)
             {
                 MarkStateDirty();
@@ -356,9 +376,11 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        internal static BridgeResult RenewWriteLease(string leaseToken)
+        internal static BridgeResult RenewWriteLease(string leaseToken) => RenewWriteLease(leaseToken, null);
+
+        internal static BridgeResult RenewWriteLease(string leaseToken, string agentId)
         {
-            BridgeResult result = Authorization.Renew(leaseToken, Settings.RemoteMutationEnabled);
+            BridgeResult result = Authorization.Renew(leaseToken, Settings.RemoteMutationEnabled, agentId);
             if (result.IsSuccess)
             {
                 MarkStateDirty();
@@ -367,9 +389,11 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        internal static BridgeResult RevokeWriteLease(string leaseToken)
+        internal static BridgeResult RevokeWriteLease(string leaseToken) => RevokeWriteLease(leaseToken, null);
+
+        internal static BridgeResult RevokeWriteLease(string leaseToken, string agentId)
         {
-            BridgeResult result = Authorization.Revoke(leaseToken);
+            BridgeResult result = Authorization.Revoke(leaseToken, agentId);
             if (result.IsSuccess)
             {
                 MarkStateDirty();
@@ -748,7 +772,7 @@ namespace RimWorldDevBridge
                     if (request.Command == "CANCEL")
                     {
                         BridgeResult cancelled = BridgeResult.Ok("core.cancel")
-                            .Add("cancelled", Scheduler.Cancel(request.Argument));
+                            .Add("cancelled", Scheduler.Cancel(request.Argument, request.AgentId));
                         Decorate(cancelled, request, "core", BridgeProtocol.BridgeVersion);
                         writer.Write(BridgeProtocol.Serialize(cancelled, request.OutputFormat));
                         return;
@@ -970,10 +994,11 @@ namespace RimWorldDevBridge
                 if (request.ExecutionReached) Authorization.Remember(request, result);
                 Authorization.Audit(request, result);
             }
-            BridgeMetrics.Record(descriptor, result);
+            BridgeMetrics.Record(descriptor, result, request.AgentId);
             if (currentSession)
                 BridgeEventJournal.Record("command", request.Command + " status:" + result.Status +
-                    " provider:" + descriptor.Provider + " executionMs:" + result.ExecutionMs.ToString("0.###"));
+                    " provider:" + descriptor.Provider + " agent:" + BridgeText.Clean(request.AgentId ?? "anonymous") +
+                    " executionMs:" + result.ExecutionMs.ToString("0.###"));
         }
 
         private static BridgeResult Decorate(BridgeResult result, BridgeRequest request, string provider,
@@ -1178,8 +1203,10 @@ namespace RimWorldDevBridge
                     "version=" + BridgeProtocol.BridgeVersion,
                     "protocol=" + BridgeProtocol.ProtocolVersion,
                     "schema=" + BridgeProtocol.CoreSchema,
+                    "coreFingerprint=" + CoreFingerprint,
                     "processId=" + Process.GetCurrentProcess().Id,
                     "bootId=" + BootId,
+                    "statusUtc=" + DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
                     "session=" + snapshot.Context.SessionId,
                     "transport=" + (snapshot.TransportActive ? "tcp+file" : "wake-file"),
                     "host=127.0.0.1",
@@ -1238,6 +1265,26 @@ namespace RimWorldDevBridge
         private static void AssertMainThread(string operation)
         {
             MainThread.AssertOwnerThread(operation);
+        }
+
+        private static string ComputeCoreFingerprint()
+        {
+            try
+            {
+                string path = typeof(BridgeRuntime).Assembly.Location;
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    using (SHA256 algorithm = SHA256.Create())
+                    using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
+                        return string.Concat(algorithm.ComputeHash(stream).Select(value => value.ToString("X2")));
+                }
+                return typeof(BridgeRuntime).Assembly.ManifestModule.ModuleVersionId.ToString("N");
+            }
+            catch
+            {
+                return "unknown";
+            }
         }
 
         internal sealed class BridgeRuntimeStateSnapshot
@@ -1320,7 +1367,7 @@ namespace RimWorldDevBridge
         private static readonly Dictionary<string, CommandMetric> Values =
             new Dictionary<string, CommandMetric>(StringComparer.OrdinalIgnoreCase);
 
-        internal static void Record(BridgeCommandDescriptor descriptor, BridgeResult result)
+        internal static void Record(BridgeCommandDescriptor descriptor, BridgeResult result, string agentId = null)
         {
             lock (Gate)
             {
@@ -1335,6 +1382,7 @@ namespace RimWorldDevBridge
                 if (descriptor.NonCooperative || result.NonCooperativeExecution) metric.NonCooperative = true;
                 if (descriptor.Cooperative) metric.Cooperative = true;
                 metric.LastStatus = result.Status;
+                if (metric.Agents.Count < 64 && !string.IsNullOrWhiteSpace(agentId)) metric.Agents.Add(agentId);
                 if (!result.IsSuccess) metric.Failures++;
             }
         }
@@ -1350,7 +1398,8 @@ namespace RimWorldDevBridge
                             .ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + " maxMs:" +
                         pair.Value.MaxMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
                         " maxStepMs:" + pair.Value.MaxStepMs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) +
-                        " overruns:" + pair.Value.Overruns + " cooperativeSteps:" + pair.Value.CooperativeSteps +
+                         " overruns:" + pair.Value.Overruns + " cooperativeSteps:" + pair.Value.CooperativeSteps +
+                         " agents:" + pair.Value.Agents.Count +
                         " contract:" + (pair.Value.NonCooperative ? "legacy-sync-non-cooperative" :
                             pair.Value.Cooperative ? "cooperative-v1" : "sync") +
                         " last:" + pair.Value.LastStatus);
@@ -1370,6 +1419,7 @@ namespace RimWorldDevBridge
             internal bool NonCooperative;
             internal bool Cooperative;
             internal BridgeStatus LastStatus;
+            internal readonly HashSet<string> Agents = new HashSet<string>(StringComparer.Ordinal);
         }
     }
 }

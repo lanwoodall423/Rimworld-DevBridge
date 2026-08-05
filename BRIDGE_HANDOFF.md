@@ -87,6 +87,7 @@ Run offline checks with:
 
 ```powershell
 dotnet build "Source\RimWorldDevBridge\RimWorldDevBridge.csproj" -c Release
+dotnet build "DevTools\RestartCoordinator\RimWorldDevBridge.RestartCoordinator.csproj" -c Release
 dotnet build "DevTools\CompatibilityHarness\CompatibilityHarness.csproj" -c Release
 & "DevTools\CompatibilityHarness\bin\Release\net472\RimWorldDevBridge.CompatibilityHarness.exe"
 & "DevTools\Test-BridgeSourceInvariants.ps1"
@@ -100,17 +101,19 @@ Create and verify the distributable package with:
 & "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.1.0.zip"
 ```
 
-Packaging stages only files RimWorld loads: `About`, `LoadFolders.xml`, `BRIDGE_MANIFEST.txt`,
-the 1.6 core assembly, and validated current file adapters. It excludes harness/build output,
-game/Unity/Harmony reference assemblies, development scripts, and loaded-only adapter manifests.
+Packaging stages five Dev Bridge-owned files: `About/About.xml`, `LoadFolders.xml`,
+`BRIDGE_MANIFEST.txt`, the 1.6 core assembly, and the external `RestartCoordinator/` executable.
+It excludes all adapters, external integration files, harness/build output, game/Unity/Harmony
+reference assemblies, and development scripts. The package verifier validates raw ZIP names before
+extraction and compares the packaged core byte-for-byte and by SHA-256 with the built source DLL.
 
 ## Feature Tests
 
 Queue a compact typed suite for the next game or current session:
 
 ```powershell
-& "C:\Games\Steam\steamapps\common\RimWorld\Mods\RimWorldDevBridge\DevTools\Queue-RimWorldFeatureTest.ps1" `
-  -Mod "Wildlife" -Feature "Feature name" -Test "Expected behavior" `
+& ".\DevTools\Queue-RimWorldFeatureTest.ps1" `
+  -Mod "owner.package.id" -Feature "Feature name" -Test "Expected behavior" `
   -Command "MOD_TEST_COMMAND" -ExpectStatus OK -ExpectContains "expected evidence"
 ```
 
@@ -126,18 +129,23 @@ membership/no-exception assertions, and `BLOCKED` prerequisites. Failed suites r
 
 ## Adapters
 
-Activation indexes only `*.manifest.json` sidecars off-thread. It never loads a DLL to discover its
-metadata and never scans all AppDomain types. The newest compatible generation per stable adapter ID
-becomes active; its exact provider type loads only when one of its commands is requested.
+Activation captures loaded owner mods on the RimWorld main thread, then indexes only each owner
+mod's nonrecursive `DevTools/BridgeAdapters` directory off-thread. It never loads a DLL to discover
+metadata. The newest compatible generation per stable adapter ID becomes active; its exact provider
+type loads only when one of its commands is requested. Owner mods publish and distribute their own
+adapter DLLs and manifests under this convention. Dev Bridge owns only the contract, discovery,
+validation, execution, safety, and diagnostics infrastructure; participating mods remain usable
+without Dev Bridge, and Dev Bridge has no gameplay-mod dependency.
 
-Current distributable file adapters are `AquacultureFishing`, `Flockmaster`,
-`HorticultureNovelSeeds`, `KnowledgeFramework`, and `lan.deferredreality.framework`. `Wildlife`
-remains a loaded-assembly integration and is intentionally not redistributed; its colliding legacy
-`PERFORMANCE` command is exposed as `WILDLIFE_PERFORMANCE` when its external package is loaded.
+`DevTools/HotAdapters` remains a legacy/development override for one compatibility period and is
+never included in a public Dev Bridge package. Owner copies win over identical legacy bindings;
+conflicting immutable bindings are quarantined and reported. Source package/kind are included in
+health output without exposing absolute paths.
 
-Publish adapters with `DevTools\Publish-RimWorldBridgeAdapter.ps1`. Publication writes a uniquely
-named DLL first and atomically publishes its manifest last, so partial generations are ignored.
-The Aquaculture, Flockmaster, and Horticulture build helpers already invoke this publisher.
+Publish adapters with the integrating mod's own publisher. The existing
+`DevTools\Publish-RimWorldBridgeAdapter.ps1` remains useful for development; publication writes a
+uniquely named DLL first and atomically publishes its manifest last, so partial generations are
+ignored.
 
 Old Mono assemblies cannot be unloaded. `ADAPTER_HEALTH` reports selected, superseded, retained,
 failed, incompatible, ignored, verification, timing, and estimated retained bytes. Restart after the

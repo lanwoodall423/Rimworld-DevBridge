@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "packageId": "Lan.RimWorldDevBridge",
+  "adapterDirectory": "DevTools/BridgeAdapters",
+  "adapterSource": "Source/RimWorldDevBridge/BridgeAdapterCatalog.cs",
+  "buildEntrypoint": "DevTools/Package-RimWorldDevBridge.ps1",
+  "validateEntrypoint": "DevTools/Test-RimWorldDevBridgePackage.ps1",
+  "runtimeGuide": "DevTools/DEVBRIDGE_AGENT.md"
+}

@@ -17,6 +17,9 @@ namespace RimWorldDevBridge
     {
         private const int CircuitBreakFailures = 3;
         private const double LegacySeriousOverrunMs = 250d;
+        private const int MaximumAdapterSources = 256;
+        private const int MaximumManifestsPerSource = 256;
+        private const long MaximumAdapterBytes = 64L * 1024L * 1024L;
         private static readonly object Gate = new object();
         private static readonly Dictionary<string, AdapterGeneration> Active =
             new Dictionary<string, AdapterGeneration>(StringComparer.OrdinalIgnoreCase);
@@ -25,17 +28,31 @@ namespace RimWorldDevBridge
         private static readonly List<AdapterGeneration> All = new List<AdapterGeneration>();
         private static readonly List<string> IndexErrors = new List<string>();
         private static HashSet<string> loadedPackages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static Dictionary<string, string> loadedPackageRoots =
-            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static List<BridgeAdapterSourceRecord> sourceRecords = new List<BridgeAdapterSourceRecord>();
         private static volatile bool indexing;
         private static string state = "dormant";
         private static string fingerprint = BridgeProtocol.CoreSchema;
         private static int ignoredAssemblyCount;
         private static double indexMs;
+        private static long indexGeneration;
+        private static long sourceGeneration;
+        private static int lastIndexThreadId;
 
         internal static bool Indexing => indexing;
         internal static string State => state;
         internal static string Fingerprint => fingerprint;
+        internal static bool RestartRequired
+        {
+            get
+            {
+                lock (Gate)
+                {
+                    int threshold = RimWorldDevBridgeMod.Settings?.RetainedAdapterRestartThreshold ?? 8;
+                    return All.Count(item => item.Assembly != null && !item.RetainedOnly) >= threshold;
+                }
+            }
+        }
+        internal static int LastIndexThreadIdForTests => Volatile.Read(ref lastIndexThreadId);
         internal static IEnumerable<BridgeCommandDescriptor> Commands
         {
             get { lock (Gate) return CommandsByName.Keys.OrderBy(value => value)
@@ -44,36 +61,129 @@ namespace RimWorldDevBridge
 
         internal static void ActivateIndexing()
         {
-            loadedPackages = new HashSet<string>(LoadedModManager.RunningModsListForReading
-                .Select(mod => mod.PackageIdPlayerFacing), StringComparer.OrdinalIgnoreCase);
-            loadedPackageRoots = LoadedModManager.RunningModsListForReading
-                .Where(mod => !string.IsNullOrWhiteSpace(mod.PackageIdPlayerFacing) &&
-                    !string.IsNullOrWhiteSpace(mod.RootDir))
-                .GroupBy(mod => mod.PackageIdPlayerFacing, StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(group => group.Key, group => Path.GetFullPath(group.First().RootDir),
-                    StringComparer.OrdinalIgnoreCase);
-            BeginIndex();
+            CaptureLoadedSources(out List<BridgeAdapterSourceRecord> sources,
+                out HashSet<string> packages);
+            BeginIndex(sources, packages);
         }
 
         internal static BridgeResult Reindex()
         {
-            bool started = BeginIndex();
+            CaptureLoadedSources(out List<BridgeAdapterSourceRecord> sources,
+                out HashSet<string> packages);
+            bool started = BeginIndex(sources, packages);
             return BridgeResult.Ok("core.adapterReindex")
                 .Add("started", started)
                 .Add("state", State)
                 .Add("note", "Manifest parsing and hashing run off the game thread.");
         }
 
-        private static bool BeginIndex()
+        private static bool BeginIndex(IReadOnlyList<BridgeAdapterSourceRecord> sources,
+            IReadOnlyCollection<string> packages)
+        {
+            long generation;
+            lock (Gate)
+            {
+                indexing = true;
+                state = "indexing";
+                generation = ++indexGeneration;
+                sourceRecords = sources == null ? new List<BridgeAdapterSourceRecord>() : sources.ToList();
+            }
+            IndexContext context = new IndexContext(generation, sourceRecords,
+                new HashSet<string>(packages ?? Enumerable.Empty<string>(), StringComparer.OrdinalIgnoreCase));
+            ThreadPool.QueueUserWorkItem(_ => IndexWorker(context, true, 0));
+            return true;
+        }
+
+        internal static void InvalidateIndexing()
         {
             lock (Gate)
             {
-                if (indexing) return false;
-                indexing = true;
-                state = "indexing";
+                ++indexGeneration;
+                indexing = false;
+                state = "dormant";
             }
-            ThreadPool.QueueUserWorkItem(_ => IndexWorker(true));
-            return true;
+        }
+
+        private static void CaptureLoadedSources(out List<BridgeAdapterSourceRecord> sources,
+            out HashSet<string> packages)
+        {
+            long generation = Interlocked.Increment(ref sourceGeneration);
+            List<BridgeAdapterSourceRecord> captured = new List<BridgeAdapterSourceRecord>();
+            packages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (ModContentPack mod in LoadedModManager.RunningModsListForReading ??
+                Enumerable.Empty<ModContentPack>())
+            {
+                string packageId = mod?.PackageIdPlayerFacing;
+                if (string.IsNullOrWhiteSpace(packageId) || string.IsNullOrWhiteSpace(mod.RootDir)) continue;
+                string root;
+                try { root = Path.GetFullPath(mod.RootDir); }
+                catch { continue; }
+                packages.Add(packageId);
+                captured.Add(new BridgeAdapterSourceRecord(BridgeAdapterSourceKind.OwnerMod, packageId,
+                    ReadLoadedModVersion(mod), root, "owner:" + packageId + "/DevTools/BridgeAdapters",
+                    generation, CaptureLoadedModules(packageId, root)));
+            }
+
+            string legacyRoot = Path.GetFullPath(BridgePaths.AdapterPath);
+            captured.Add(new BridgeAdapterSourceRecord(BridgeAdapterSourceKind.LegacyDevelopment,
+                "Lan.RimWorldDevBridge", "legacy", legacyRoot, "legacy:DevTools/HotAdapters", generation,
+                Array.Empty<BridgeLoadedModuleRecord>()));
+            sources = captured
+                .GroupBy(item => item.SourceKind + "|" + item.PackageId + "|" + item.DirectoryPath,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .OrderBy(item => item.SourceKind)
+                .ThenBy(item => item.PackageId, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => item.DirectoryPath, StringComparer.OrdinalIgnoreCase)
+                .Take(MaximumAdapterSources)
+                .ToList();
+        }
+
+        private static string ReadLoadedModVersion(ModContentPack mod)
+        {
+            try
+            {
+                object metadata = mod.GetType().GetProperty("ModMetaData",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(mod, null);
+                object version = metadata?.GetType().GetProperty("ModVersion",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(metadata, null);
+                return string.IsNullOrWhiteSpace(version?.ToString()) ? "unknown" : version.ToString();
+            }
+            catch { return "unknown"; }
+        }
+
+        private static IReadOnlyList<BridgeLoadedModuleRecord> CaptureLoadedModules(string packageId, string root)
+        {
+            List<BridgeLoadedModuleRecord> modules = new List<BridgeLoadedModuleRecord>();
+            string prefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                string path = LoadedAssemblyPath(assembly);
+                if (string.IsNullOrWhiteSpace(path) || !IsWithin(path, root) || !File.Exists(path)) continue;
+                try
+                {
+                    AssemblyName name = assembly.GetName();
+                    modules.Add(new BridgeLoadedModuleRecord(packageId,
+                        path.Substring(prefix.Length).Replace(Path.AltDirectorySeparatorChar,
+                            Path.DirectorySeparatorChar), path, name.FullName,
+                        assembly.ManifestModule.ModuleVersionId, new FileInfo(path).Length));
+                }
+                catch { }
+            }
+            return modules.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static bool IsWithin(string path, string root)
+        {
+            try
+            {
+                string fullPath = Path.GetFullPath(path);
+                string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar,
+                    Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         internal static BridgeCommandDescriptor Describe(string command)
@@ -154,13 +264,16 @@ namespace RimWorldDevBridge
                         (!Guid.TryParse(generation.Manifest.moduleMvid, out Guid expectedMvid) ||
                         preparedAssembly.ManifestModule.ModuleVersionId != expectedMvid))
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_mvid_mismatch");
-                    if (!loadedPackageRoots.TryGetValue(generation.Manifest.modulePackageId,
-                        out string packageRoot))
+                    if (generation.Source == null || generation.Source.SourceKind != BridgeAdapterSourceKind.OwnerMod ||
+                        !string.Equals(generation.Source.PackageId, generation.Manifest.modulePackageId,
+                            StringComparison.OrdinalIgnoreCase))
                         return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "loaded_adapter_package_missing",
                             generation.Manifest.modulePackageId);
-                    string root = Path.GetFullPath(packageRoot) + Path.DirectorySeparatorChar;
-                    assemblyPath = Path.GetFullPath(Path.Combine(root, generation.Manifest.moduleRelativePath));
-                    if (!assemblyPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(assemblyPath))
+                    string root = Path.GetFullPath(generation.Source.OwnerRootPath) + Path.DirectorySeparatorChar;
+                    assemblyPath = Path.GetFullPath(Path.Combine(root,
+                        generation.Manifest.moduleRelativePath.Replace('/', Path.DirectorySeparatorChar)));
+                    if (!IsWithin(assemblyPath, generation.Source.OwnerRootPath) ||
+                        !IsSafeFile(assemblyPath, generation.Source.OwnerRootPath) || !File.Exists(assemblyPath))
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_module_missing");
                     string loadedOrigin = LoadedAssemblyPath(preparedAssembly);
                     if (!string.IsNullOrEmpty(loadedOrigin) && !string.Equals(loadedOrigin, assemblyPath,
@@ -360,7 +473,10 @@ namespace RimWorldDevBridge
                         BridgeText.Clean(item.Verification ?? "manifest-only") + " contract:" +
                         (string.Equals(item.Manifest.executionContract, "cooperative-v1", StringComparison.OrdinalIgnoreCase)
                             ? "cooperative-v1" : "legacy-sync-non-cooperative") + " seriousOverruns:" +
-                        item.SeriousOverruns);
+                        item.SeriousOverruns + " sourceKind:" +
+                        (item.Source == null ? "unknown" : item.Source.SourceKind.ToString()) + " sourcePackage:" +
+                        BridgeText.Clean(item.Source == null ? "none" : item.Source.PackageId) + " sourceIdentity:" +
+                        BridgeText.Clean(item.Source == null ? "unknown" : item.Source.DisplayIdentity));
                 }
                 foreach (string error in IndexErrors.Take(20)) result.Warn(error);
                 int threshold = RimWorldDevBridgeMod.Settings?.RetainedAdapterRestartThreshold ?? 8;
@@ -369,7 +485,52 @@ namespace RimWorldDevBridge
             return result;
         }
 
+        internal static void AddAgentContext(BridgeResult result, string packageId)
+        {
+            if (result == null) return;
+            lock (Gate)
+            {
+                result.Add("adapterIndex", state).Add("adapterFingerprint", fingerprint)
+                    .Add("adapterRestartRequired", RestartRequired);
+                List<AdapterGeneration> owned = All.Where(item => item.Source != null &&
+                    string.Equals(item.Source.PackageId, packageId, StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(item => item.Manifest.adapterId, StringComparer.OrdinalIgnoreCase)
+                    .ThenByDescending(item => item.BuildUtc).ToList();
+                result.Add("selectedAdapterCount", owned.Count(item => item.Selected && item.Compatible))
+                    .Add("supersededAdapterCount", owned.Count(item => !item.Selected && item.Compatible))
+                    .Add("conflictingAdapterCount", owned.Count(item => item.State == "quarantined-conflict"))
+                    .Add("quarantinedAdapterCount", owned.Count(item => item.State.StartsWith("quarantined",
+                        StringComparison.OrdinalIgnoreCase)))
+                    .Add("incompatibleAdapterCount", owned.Count(item => !item.Compatible));
+                foreach (AdapterGeneration item in owned.Take(32))
+                {
+                    result.AddLine("adapter=id:" + BridgeText.Clean(item.Manifest.adapterId) +
+                        " owner:" + BridgeText.Clean(item.Source.PackageId) + " generation:" +
+                        BridgeText.Clean(item.Manifest.generation) + " sourceKind:" + item.Source.SourceKind +
+                        " sourceIdentity:" + BridgeText.Clean(item.Source.DisplayIdentity) +
+                        " fingerprint:" + FingerprintFor(item.Manifest) + " state:" + item.State +
+                        " selected:" + item.Selected + " compatible:" + item.Compatible +
+                        " health:" + BridgeText.Clean(item.Reason ?? item.LastFailure ?? "none") +
+                        " contract:" + (string.Equals(item.Manifest.executionContract, "cooperative-v1",
+                            StringComparison.OrdinalIgnoreCase) ? "cooperative-v1" : "legacy-sync-non-cooperative"));
+                }
+                if (owned.Count > 32) result.Warn("adapter context was bounded to 32 generations");
+            }
+        }
+
         internal static void IndexSynchronouslyForTests(IEnumerable<string> packageIds)
+        {
+            string legacyRoot = Path.GetFullPath(BridgePaths.AdapterPath);
+            IndexSynchronouslyForTests(packageIds, new[]
+            {
+                new BridgeAdapterSourceRecord(BridgeAdapterSourceKind.LegacyDevelopment,
+                    "Lan.RimWorldDevBridge", "legacy", legacyRoot, "legacy:DevTools/HotAdapters",
+                    Interlocked.Increment(ref sourceGeneration), Array.Empty<BridgeLoadedModuleRecord>())
+            });
+        }
+
+        internal static void IndexSynchronouslyForTests(IEnumerable<string> packageIds,
+            IEnumerable<BridgeAdapterSourceRecord> sources)
         {
             loadedPackages = new HashSet<string>(packageIds ?? Enumerable.Empty<string>(),
                 StringComparer.OrdinalIgnoreCase);
@@ -379,37 +540,73 @@ namespace RimWorldDevBridge
                 indexing = true;
                 state = "indexing";
             }
-            IndexWorker(false);
+            IndexContext context = new IndexContext(Interlocked.Increment(ref indexGeneration),
+                (sources ?? Enumerable.Empty<BridgeAdapterSourceRecord>()).ToList(), loadedPackages);
+            IndexWorker(context, false, 0);
         }
 
-        private static void IndexWorker(bool refreshStatus)
+        internal static void IndexAsynchronouslyForTests(IEnumerable<string> packageIds,
+            IEnumerable<BridgeAdapterSourceRecord> sources, int delayMs)
         {
+            loadedPackages = new HashSet<string>(packageIds ?? Enumerable.Empty<string>(),
+                StringComparer.OrdinalIgnoreCase);
+            lock (Gate)
+            {
+                indexing = true;
+                state = "indexing";
+            }
+            IndexContext context = new IndexContext(Interlocked.Increment(ref indexGeneration),
+                (sources ?? Enumerable.Empty<BridgeAdapterSourceRecord>()).ToList(), loadedPackages);
+            ThreadPool.QueueUserWorkItem(_ => IndexWorker(context, false, Math.Max(0, delayMs)));
+        }
+
+        private static void IndexWorker(IndexContext context, bool refreshStatus, int testDelayMs)
+        {
+            Volatile.Write(ref lastIndexThreadId, Thread.CurrentThread.ManagedThreadId);
             long indexStart = Stopwatch.GetTimestamp();
             List<AdapterGeneration> indexed = new List<AdapterGeneration>();
             List<string> errors = new List<string>();
             int ignored = 0;
             try
             {
-                Directory.CreateDirectory(BridgePaths.AdapterPath);
-                foreach (string path in Directory.GetFiles(BridgePaths.AdapterPath, "*.manifest.json")
-                    .OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+                if (testDelayMs > 0) Thread.Sleep(testDelayMs);
+                foreach (BridgeAdapterSourceRecord source in context.Sources)
                 {
-                    try
+                    if (!Directory.Exists(source.DirectoryPath)) continue;
+                    DirectoryInfo sourceInfo = new DirectoryInfo(source.DirectoryPath);
+                    if ((sourceInfo.Attributes & FileAttributes.ReparsePoint) != 0)
                     {
-                        AdapterManifest manifest = ReadManifest(path);
-                        AdapterGeneration generation = Validate(manifest, path);
-                        indexed.Add(generation);
+                        errors.Add(source.DisplayIdentity + ": source directory is a reparse point");
+                        continue;
                     }
-                    catch (Exception exception)
+                    string[] manifests = Directory.GetFiles(source.DirectoryPath, "*.manifest.json",
+                        SearchOption.TopDirectoryOnly).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+                    if (manifests.Length > MaximumManifestsPerSource)
                     {
-                        errors.Add(Path.GetFileName(path) + ": " + exception.GetBaseException().Message);
+                        errors.Add(source.DisplayIdentity + ": manifest limit exceeded");
+                        manifests = manifests.Take(MaximumManifestsPerSource).ToArray();
                     }
+                    foreach (string path in manifests)
+                    {
+                        try
+                        {
+                            AdapterManifest manifest = ReadManifest(path);
+                            AdapterGeneration generation = Validate(manifest, path, source, context);
+                            indexed.Add(generation);
+                        }
+                        catch (Exception exception)
+                        {
+                            errors.Add(source.DisplayIdentity + "/" + Path.GetFileName(path) + ": " +
+                                exception.GetBaseException().Message);
+                        }
+                    }
+                    string[] dlls = Directory.GetFiles(source.DirectoryPath, "*.dll", SearchOption.TopDirectoryOnly);
+                    HashSet<string> published = new HashSet<string>(indexed.Where(item => item.Source == source)
+                        .Select(item => Path.GetFileName(item.AssemblyPath)), StringComparer.OrdinalIgnoreCase);
+                    ignored += dlls.Count(path => !published.Contains(Path.GetFileName(path)));
                 }
+                ResolveDuplicates(indexed, errors);
                 SelectActive(indexed, errors);
-                HashSet<string> published = new HashSet<string>(indexed.Select(item =>
-                    Path.GetFileName(item.AssemblyPath)), StringComparer.OrdinalIgnoreCase);
-                ignored = Directory.GetFiles(BridgePaths.AdapterPath, "*.dll")
-                    .Count(path => !published.Contains(Path.GetFileName(path)));
             }
             catch (Exception exception)
             {
@@ -417,6 +614,8 @@ namespace RimWorldDevBridge
             }
             lock (Gate)
             {
+                if (context.IndexGeneration != indexGeneration)
+                    return;
                 MergeLoadedGenerations(indexed, errors);
                 All.Clear();
                 All.AddRange(indexed);
@@ -432,6 +631,107 @@ namespace RimWorldDevBridge
             if (refreshStatus) BridgeRuntime.PostToMainThread(BridgeRuntime.RefreshStatus);
         }
 
+        private static bool IsSafeFile(string path, string root)
+        {
+            try
+            {
+                FileInfo info = new FileInfo(path);
+                if ((info.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                DirectoryInfo directory = info.Directory;
+                while (directory != null && !string.Equals(directory.FullName,
+                    Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    if ((directory.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                    directory = directory.Parent;
+                }
+                return directory != null && IsWithin(info.FullName, root);
+            }
+            catch { return false; }
+        }
+
+        private static bool IsSafeRelativePath(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || Path.IsPathRooted(value) || value.Contains(":") ||
+                value.IndexOf('\0') >= 0) return false;
+            string[] parts = value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)
+                .Split(new[] { Path.DirectorySeparatorChar }, StringSplitOptions.None);
+            return parts.Length > 0 && parts.All(part => part.Length > 0 && part != "." && part != "..");
+        }
+
+        private static bool IsSafeAssemblyFileName(string value)
+        {
+            return IsSafeRelativePath(value) && value.IndexOf(Path.DirectorySeparatorChar) < 0 &&
+                value.IndexOf(Path.AltDirectorySeparatorChar) < 0 &&
+                value.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
+                !value.EndsWith(".tmp.dll", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string HashFile(string path, long length)
+        {
+            if (length <= 0 || length > MaximumAdapterBytes) throw new InvalidDataException("adapter size is invalid");
+            using (SHA256 algorithm = SHA256.Create())
+            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) algorithm.TransformBlock(buffer, 0, read, buffer, 0);
+                algorithm.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                return string.Concat(algorithm.Hash.Select(value => value.ToString("X2")));
+            }
+        }
+
+        private static string RelativePath(string root, string path)
+        {
+            string prefix = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            return Path.GetFullPath(path).Substring(prefix.Length).Replace(Path.AltDirectorySeparatorChar,
+                Path.DirectorySeparatorChar);
+        }
+
+        private static void ResolveDuplicates(List<AdapterGeneration> indexed, List<string> errors)
+        {
+            foreach (IGrouping<string, AdapterGeneration> group in indexed.GroupBy(item =>
+                item.Manifest.adapterId + "\n" + item.Manifest.generation, StringComparer.OrdinalIgnoreCase))
+            {
+                List<AdapterGeneration> ordered = group.OrderBy(item => item.Source.SourceKind)
+                    .ThenBy(item => item.Source.PackageId, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(item => item.ManifestPath, StringComparer.OrdinalIgnoreCase).ToList();
+                List<string> bindings = ordered.Select(BindingFingerprint).Distinct(StringComparer.Ordinal).ToList();
+                if (bindings.Count > 1)
+                {
+                    foreach (AdapterGeneration item in ordered)
+                    {
+                        item.Compatible = false;
+                        item.Selected = false;
+                        item.State = "quarantined-conflict";
+                        item.Reason = "conflicting immutable generation binding";
+                    }
+                    errors.Add(group.First().Manifest.adapterId + ": generation " +
+                        group.First().Manifest.generation + " has conflicting immutable bindings");
+                    continue;
+                }
+                AdapterGeneration preferred = ordered.FirstOrDefault(item =>
+                    item.Source.SourceKind == BridgeAdapterSourceKind.OwnerMod) ?? ordered.FirstOrDefault();
+                foreach (AdapterGeneration duplicate in ordered.Where(item => item != preferred))
+                {
+                    duplicate.Compatible = false;
+                    duplicate.Selected = false;
+                    duplicate.State = preferred.Source.SourceKind == BridgeAdapterSourceKind.OwnerMod &&
+                        duplicate.Source.SourceKind == BridgeAdapterSourceKind.LegacyDevelopment
+                        ? "migration-duplicate" : "duplicate";
+                    duplicate.Reason = preferred.Source.SourceKind == BridgeAdapterSourceKind.OwnerMod &&
+                        duplicate.Source.SourceKind == BridgeAdapterSourceKind.LegacyDevelopment
+                        ? "owner copy preferred over legacy copy" : "identical generation duplicate";
+                }
+            }
+        }
+
+        private static string BindingFingerprint(AdapterGeneration item)
+        {
+            return ManifestFingerprint(item.Manifest);
+        }
+
         private static AdapterManifest ReadManifest(string path)
         {
             FileInfo info = new FileInfo(path);
@@ -441,9 +741,12 @@ namespace RimWorldDevBridge
                 return (AdapterManifest)new DataContractJsonSerializer(typeof(AdapterManifest)).ReadObject(stream);
         }
 
-        private static AdapterGeneration Validate(AdapterManifest manifest, string manifestPath)
+        private static AdapterGeneration Validate(AdapterManifest manifest, string manifestPath,
+            BridgeAdapterSourceRecord source, IndexContext context)
         {
             if (manifest == null) throw new InvalidDataException("Manifest is empty.");
+            if (!IsSafeFile(manifestPath, source.DirectoryPath))
+                throw new InvalidDataException("manifest is outside its declared source or is a reparse point");
             if (manifest.manifestVersion != 1 && manifest.manifestVersion != 2)
                 throw new InvalidDataException("Unsupported manifestVersion.");
             RequireName(manifest.adapterId, "adapterId");
@@ -454,7 +757,7 @@ namespace RimWorldDevBridge
                 System.Globalization.DateTimeStyles.AdjustToUniversal, out DateTime buildUtc))
                 throw new InvalidDataException("buildUtc is invalid.");
             if (manifest.protocolMin > BridgeProtocol.ProtocolVersion || manifest.protocolMax < BridgeProtocol.ProtocolVersion)
-                return NewGeneration(manifest, manifestPath, buildUtc, false, "protocol incompatible");
+                return NewGeneration(manifest, manifestPath, source, buildUtc, false, "protocol incompatible");
             if (string.IsNullOrWhiteSpace(manifest.providerType)) throw new InvalidDataException("providerType is required.");
             bool loadedAssembly = string.Equals(manifest.assemblySource, "loaded", StringComparison.OrdinalIgnoreCase);
             if (!loadedAssembly && !string.IsNullOrEmpty(manifest.assemblySource) &&
@@ -465,12 +768,17 @@ namespace RimWorldDevBridge
                 throw new InvalidDataException("assemblyFile is required.");
             if (loadedAssembly && string.IsNullOrWhiteSpace(manifest.assemblyIdentity))
                 throw new InvalidDataException("assemblyIdentity is required for a loaded adapter.");
-            if (loadedAssembly && (string.IsNullOrWhiteSpace(manifest.modulePackageId) ||
-                string.IsNullOrWhiteSpace(manifest.moduleRelativePath) ||
-                Path.IsPathRooted(manifest.moduleRelativePath) || manifest.moduleRelativePath.Split(
-                    new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
-                    StringSplitOptions.RemoveEmptyEntries).Any(part => part == "..")))
-                throw new InvalidDataException("Loaded adapter module package/path is invalid.");
+            if (source.SourceKind == BridgeAdapterSourceKind.OwnerMod &&
+                !(manifest.requiredPackageIds ?? new List<string>()).Any(package =>
+                    string.Equals(package, source.PackageId, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidDataException("owner package must be required by the manifest");
+            if (loadedAssembly && source.SourceKind != BridgeAdapterSourceKind.OwnerMod)
+                throw new InvalidDataException("loaded adapters must be discovered from their owner mod");
+            if (loadedAssembly && !string.Equals(manifest.modulePackageId, source.PackageId,
+                StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("loaded adapter module package does not match its owner");
+            if (loadedAssembly && !IsSafeRelativePath(manifest.moduleRelativePath))
+                throw new InvalidDataException("Loaded adapter module path is invalid.");
             if (loadedAssembly && manifest.manifestVersion >= 2 && !Guid.TryParse(manifest.moduleMvid, out _))
                 throw new InvalidDataException("Loaded adapter moduleMvid is invalid.");
             if (loadedAssembly && !(manifest.requiredPackageIds ?? new List<string>()).Any(package =>
@@ -480,17 +788,48 @@ namespace RimWorldDevBridge
             string assemblyPath = null;
             if (!loadedAssembly)
             {
+                if (!IsSafeAssemblyFileName(manifest.assemblyFile))
+                    throw new InvalidDataException("assemblyFile is unsafe.");
                 assemblyPath = Path.GetFullPath(Path.Combine(directory, manifest.assemblyFile));
-                if (!assemblyPath.StartsWith(Path.GetFullPath(BridgePaths.AdapterPath) + Path.DirectorySeparatorChar,
-                    StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("assemblyFile escaped adapter directory.");
-                if (manifest.assemblyFile.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) || !File.Exists(assemblyPath))
+                if (!string.Equals(Path.GetFullPath(directory), Path.GetFullPath(source.DirectoryPath),
+                    StringComparison.OrdinalIgnoreCase) || !IsSafeFile(assemblyPath, source.DirectoryPath) ||
+                    !File.Exists(assemblyPath))
                     throw new InvalidDataException("assemblyFile is missing or partial.");
                 long actualBytes = new FileInfo(assemblyPath).Length;
                 if (manifest.assemblyBytes <= 0 || manifest.assemblyBytes != actualBytes)
                     throw new InvalidDataException("assemblyBytes does not match the published file.");
+                if (!string.Equals(HashFile(assemblyPath, actualBytes), manifest.contentHash,
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("adapter hash does not match its published file.");
+                AssemblyName assemblyName = AssemblyName.GetAssemblyName(assemblyPath);
+                if (!string.Equals(assemblyName.FullName, manifest.assemblyIdentity, StringComparison.Ordinal))
+                    throw new InvalidDataException("adapter assembly identity does not match its published file.");
             }
-            else if (manifest.assemblyBytes <= 0)
-                throw new InvalidDataException("assemblyBytes is required.");
+            else
+            {
+                string relative = manifest.moduleRelativePath.Replace('/', Path.DirectorySeparatorChar)
+                    .Replace('\\', Path.DirectorySeparatorChar);
+                assemblyPath = Path.GetFullPath(Path.Combine(source.OwnerRootPath, relative));
+                if (!IsWithin(assemblyPath, source.OwnerRootPath) || !IsSafeFile(assemblyPath, source.OwnerRootPath) ||
+                    !File.Exists(assemblyPath))
+                    throw new InvalidDataException("loaded adapter module is missing or escaped its owner.");
+                BridgeLoadedModuleRecord loaded = source.LoadedModules.FirstOrDefault(item =>
+                    string.Equals(item.RelativePath.Replace('/', Path.DirectorySeparatorChar), relative,
+                        StringComparison.OrdinalIgnoreCase));
+                if (loaded == null) throw new InvalidDataException("loaded adapter module is not loaded by its owner.");
+                if (!string.Equals(Path.GetFullPath(loaded.FullPath), assemblyPath, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("loaded adapter origin does not match its owner module.");
+                if (!string.Equals(loaded.AssemblyIdentity, manifest.assemblyIdentity, StringComparison.Ordinal))
+                    throw new InvalidDataException("loaded adapter assembly identity mismatch.");
+                if (manifest.manifestVersion >= 2 && loaded.ModuleMvid != Guid.Parse(manifest.moduleMvid))
+                    throw new InvalidDataException("loaded adapter MVID mismatch.");
+                long actualBytes = new FileInfo(assemblyPath).Length;
+                if (manifest.assemblyBytes <= 0 || actualBytes != manifest.assemblyBytes || actualBytes != loaded.Length)
+                    throw new InvalidDataException("loaded adapter byte length mismatch.");
+                if (!string.Equals(HashFile(assemblyPath, actualBytes), manifest.contentHash,
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("loaded adapter hash mismatch.");
+            }
             if (string.IsNullOrWhiteSpace(manifest.contentHash) || manifest.contentHash.Length != 64)
                 throw new InvalidDataException("contentHash must be SHA-256 hex.");
             if (manifest.commands == null || manifest.commands.Count == 0)
@@ -515,20 +854,23 @@ namespace RimWorldDevBridge
                 command.cost = parsedCost.ToString();
             }
             string missing = (manifest.requiredPackageIds ?? new List<string>())
-                .FirstOrDefault(package => !loadedPackages.Contains(package));
-            return NewGeneration(manifest, manifestPath, buildUtc, missing == null,
+                .FirstOrDefault(package => !context.LoadedPackages.Contains(package));
+            return NewGeneration(manifest, manifestPath, source, buildUtc, missing == null,
                 missing == null ? null : "missing package " + missing);
         }
 
         private static AdapterGeneration NewGeneration(AdapterManifest manifest, string manifestPath,
-            DateTime buildUtc, bool compatible, string reason)
+            BridgeAdapterSourceRecord source, DateTime buildUtc, bool compatible, string reason)
         {
             return new AdapterGeneration
             {
                 Manifest = manifest,
                 ManifestPath = manifestPath,
+                Source = source,
                 AssemblyPath = string.Equals(manifest.assemblySource, "loaded", StringComparison.OrdinalIgnoreCase)
-                    ? null : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(manifestPath), manifest.assemblyFile)),
+                    ? Path.GetFullPath(Path.Combine(source.OwnerRootPath,
+                        manifest.moduleRelativePath.Replace('/', Path.DirectorySeparatorChar)))
+                    : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(manifestPath), manifest.assemblyFile)),
                 BuildUtc = buildUtc,
                 Compatible = compatible,
                 Reason = reason,
@@ -590,36 +932,41 @@ namespace RimWorldDevBridge
 
         private static bool SameManifestBinding(AdapterManifest current, AdapterManifest previous)
         {
-            if (!string.Equals(current.version, previous.version, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(current.assemblySource, previous.assemblySource, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(current.assemblyFile, previous.assemblyFile, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(current.assemblyIdentity, previous.assemblyIdentity, StringComparison.Ordinal) ||
-                current.assemblyBytes != previous.assemblyBytes ||
-                !string.Equals(current.contentHash, previous.contentHash, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(current.providerType, previous.providerType, StringComparison.Ordinal) ||
-                !string.Equals(current.modulePackageId, previous.modulePackageId, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(current.moduleRelativePath, previous.moduleRelativePath, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(current.moduleMvid, previous.moduleMvid, StringComparison.OrdinalIgnoreCase)) return false;
-            if ((current.commands?.Count ?? 0) != (previous.commands?.Count ?? 0)) return false;
-            foreach (AdapterCommandManifest command in current.commands ?? new List<AdapterCommandManifest>())
-            {
-                AdapterCommandManifest prior = previous.commands.FirstOrDefault(item =>
-                    string.Equals(item.name, command.name, StringComparison.OrdinalIgnoreCase));
-                if (prior == null || !SameCommandContract(command, prior)) return false;
-            }
-            return true;
+            return string.Equals(ManifestFingerprint(current), ManifestFingerprint(previous), StringComparison.Ordinal);
         }
 
-        private static bool SameCommandContract(AdapterCommandManifest current, AdapterCommandManifest previous)
+        private static string ManifestFingerprint(AdapterManifest manifest)
         {
-            return string.Equals(current.mode, previous.mode, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(current.cost, previous.cost, StringComparison.OrdinalIgnoreCase) &&
-                current.requiresMap == previous.requiresMap &&
-                string.Equals(current.argumentSchema, previous.argumentSchema, StringComparison.Ordinal) &&
-                string.Equals(current.resultSchema, previous.resultSchema, StringComparison.Ordinal) &&
-                current.schemaVersion == previous.schemaVersion &&
-                current.minimumExecutionBudgetMs == previous.minimumExecutionBudgetMs &&
-                string.Equals(current.providerCommand, previous.providerCommand, StringComparison.OrdinalIgnoreCase);
+            StringBuilder value = new StringBuilder();
+            value.Append(manifest.manifestVersion).Append('|').Append(manifest.adapterId).Append('|')
+                .Append(manifest.displayName).Append('|').Append(manifest.version).Append('|')
+                .Append(manifest.generation).Append('|').Append(manifest.buildUtc).Append('|')
+                .Append(manifest.protocolMin).Append('|').Append(manifest.protocolMax).Append('|')
+                .Append(manifest.assemblySource).Append('|').Append(manifest.assemblyFile).Append('|')
+                .Append(manifest.assemblyIdentity).Append('|').Append(manifest.modulePackageId).Append('|')
+                .Append(manifest.moduleRelativePath).Append('|').Append(manifest.moduleMvid).Append('|')
+                .Append(manifest.assemblyBytes).Append('|').Append(manifest.contentHash).Append('|')
+                .Append(manifest.providerType).Append('|').Append(manifest.executionContract).Append('|')
+                .Append(manifest.changeSummary);
+            foreach (string package in (manifest.requiredPackageIds ?? new List<string>())
+                .OrderBy(package => package, StringComparer.OrdinalIgnoreCase)) value.Append("|required:").Append(package);
+            foreach (string package in (manifest.optionalPackageIds ?? new List<string>())
+                .OrderBy(package => package, StringComparer.OrdinalIgnoreCase)) value.Append("|optional:").Append(package);
+            foreach (AdapterCommandManifest command in (manifest.commands ?? new List<AdapterCommandManifest>())
+                .OrderBy(command => command.name, StringComparer.OrdinalIgnoreCase))
+                value.Append('|').Append(command.name).Append('|').Append(command.description).Append('|')
+                    .Append(command.providerCommand).Append('|').Append(command.mode).Append('|')
+                    .Append(command.cost).Append('|').Append(command.requiresMap).Append('|')
+                    .Append(command.argumentSchema).Append('|').Append(command.resultSchema).Append('|')
+                    .Append(command.schemaVersion).Append('|').Append(command.minimumExecutionBudgetMs);
+            return value.ToString();
+        }
+
+        private static string FingerprintFor(AdapterManifest manifest)
+        {
+            using (SHA256 algorithm = SHA256.Create())
+                return string.Concat(algorithm.ComputeHash(Encoding.UTF8.GetBytes(ManifestFingerprint(manifest)))
+                    .Take(12).Select(value => value.ToString("x2")));
         }
 
         private static void RebuildCommandIndex(List<string> errors)
@@ -834,6 +1181,7 @@ namespace RimWorldDevBridge
             internal readonly object LoadGate = new object();
             internal AdapterManifest Manifest;
             internal string ManifestPath;
+            internal BridgeAdapterSourceRecord Source;
             internal string AssemblyPath;
             internal DateTime BuildUtc;
             internal bool Compatible;
@@ -878,6 +1226,76 @@ namespace RimWorldDevBridge
                 SeriousOverruns = previous.SeriousOverruns;
                 if (Assembly != null) State = "loaded";
             }
+        }
+    }
+
+    internal enum BridgeAdapterSourceKind
+    {
+        OwnerMod = 0,
+        LegacyDevelopment = 1
+    }
+
+    internal sealed class BridgeLoadedModuleRecord
+    {
+        internal readonly string PackageId;
+        internal readonly string RelativePath;
+        internal readonly string FullPath;
+        internal readonly string AssemblyIdentity;
+        internal readonly Guid ModuleMvid;
+        internal readonly long Length;
+
+        internal BridgeLoadedModuleRecord(string packageId, string relativePath, string fullPath,
+            string assemblyIdentity, Guid moduleMvid, long length)
+        {
+            PackageId = packageId;
+            RelativePath = relativePath;
+            FullPath = fullPath;
+            AssemblyIdentity = assemblyIdentity;
+            ModuleMvid = moduleMvid;
+            Length = length;
+        }
+    }
+
+    internal sealed class BridgeAdapterSourceRecord
+    {
+        internal readonly BridgeAdapterSourceKind SourceKind;
+        internal readonly string PackageId;
+        internal readonly string LoadedVersion;
+        internal readonly string OwnerRootPath;
+        internal readonly string DirectoryPath;
+        internal readonly string DisplayIdentity;
+        internal readonly long SourceGeneration;
+        internal readonly IReadOnlyList<BridgeLoadedModuleRecord> LoadedModules;
+
+        internal BridgeAdapterSourceRecord(BridgeAdapterSourceKind sourceKind, string packageId,
+            string loadedVersion, string ownerRootPath, string displayIdentity, long sourceGeneration,
+            IReadOnlyList<BridgeLoadedModuleRecord> loadedModules)
+        {
+            SourceKind = sourceKind;
+            PackageId = packageId;
+            LoadedVersion = loadedVersion;
+            OwnerRootPath = Path.GetFullPath(ownerRootPath);
+            DirectoryPath = sourceKind == BridgeAdapterSourceKind.OwnerMod
+                ? Path.Combine(OwnerRootPath, "DevTools", "BridgeAdapters") : OwnerRootPath;
+            DisplayIdentity = displayIdentity;
+            SourceGeneration = sourceGeneration;
+            LoadedModules = (loadedModules ?? Array.Empty<BridgeLoadedModuleRecord>()).ToList().AsReadOnly();
+        }
+    }
+
+    internal sealed class IndexContext
+    {
+        internal readonly long IndexGeneration;
+        internal readonly IReadOnlyList<BridgeAdapterSourceRecord> Sources;
+        internal readonly IReadOnlyCollection<string> LoadedPackages;
+
+        internal IndexContext(long indexGeneration, IReadOnlyList<BridgeAdapterSourceRecord> sources,
+            IReadOnlyCollection<string> loadedPackages)
+        {
+            IndexGeneration = indexGeneration;
+            Sources = (sources ?? Array.Empty<BridgeAdapterSourceRecord>()).ToList().AsReadOnly();
+            LoadedPackages = new HashSet<string>(loadedPackages ?? Array.Empty<string>(),
+                StringComparer.OrdinalIgnoreCase);
         }
     }
 

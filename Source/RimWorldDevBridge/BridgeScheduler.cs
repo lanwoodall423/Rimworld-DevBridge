@@ -2,16 +2,24 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 
 namespace RimWorldDevBridge
 {
     internal sealed class BridgeScheduler
     {
+        private const int MaximumPerAgentQueue = 32;
         private readonly object gate = new object();
-        private readonly List<BridgeRequest> queue = new List<BridgeRequest>();
+        private readonly Dictionary<string, Queue<BridgeRequest>> agentQueues =
+            new Dictionary<string, Queue<BridgeRequest>>(StringComparer.Ordinal);
+        private readonly Queue<string> agentRoundRobin = new Queue<string>();
         private readonly Dictionary<string, BridgeRequest> running =
             new Dictionary<string, BridgeRequest>(StringComparer.Ordinal);
+        private readonly Dictionary<string, AgentMetric> agentMetrics =
+            new Dictionary<string, AgentMetric>(StringComparer.Ordinal);
+        private static long nextBarrierId;
         private readonly Func<BridgeRequest, BridgeResult> executor;
         private readonly Action<BridgeRequest, BridgeResult> completed;
         private SynchronizationContext mainContext;
@@ -21,6 +29,9 @@ namespace RimWorldDevBridge
         private bool drainPosted;
         private long executed;
         private long rejected;
+        private int queuedCount;
+        private long drainBarrierId;
+        private bool draining;
         private double totalQueueMs;
         private double totalExecutionMs;
         private double slowestMs;
@@ -42,6 +53,8 @@ namespace RimWorldDevBridge
                 sessionId = activeSessionId;
                 capacity = Math.Max(8, Math.Min(256, queueCapacity));
                 budgetMs = Math.Max(1, Math.Min(12, mainThreadBudgetMs));
+                draining = false;
+                drainBarrierId = 0;
             }
         }
 
@@ -63,7 +76,65 @@ namespace RimWorldDevBridge
                 // requests retain their session, cancellation, and execution state.
                 capacity = Math.Max(8, Math.Min(256, queueCapacity));
                 budgetMs = Math.Max(1, Math.Min(12, mainThreadBudgetMs));
-                if (queue.Count > 0) PostDrainLocked();
+                if (queuedCount > 0) PostDrainLocked();
+            }
+        }
+
+        internal int PerAgentQueueCapacity => MaximumPerAgentQueue;
+
+        internal long BeginDrain()
+        {
+            lock (gate)
+            {
+                if (!draining)
+                {
+                    draining = true;
+                    drainBarrierId = Math.Max(1L, Interlocked.Increment(ref nextBarrierId));
+                }
+                return drainBarrierId;
+            }
+        }
+
+        internal bool IsDraining
+        {
+            get { lock (gate) return draining; }
+        }
+
+        internal long DrainBarrierId
+        {
+            get { lock (gate) return drainBarrierId; }
+        }
+
+        internal bool IsDrainComplete(BridgeRequest statusRequest = null)
+        {
+            lock (gate)
+            {
+                if (!draining) return false;
+                foreach (Queue<BridgeRequest> pending in agentQueues.Values)
+                    if (pending.Any(request => request.QueueBarrierId < drainBarrierId)) return false;
+                foreach (BridgeRequest request in running.Values)
+                    if (request != statusRequest && request.QueueBarrierId < drainBarrierId) return false;
+                return true;
+            }
+        }
+
+        internal BridgeResult DrainStatus(BridgeRequest statusRequest = null)
+        {
+            lock (gate)
+            {
+                bool complete = draining && IsDrainComplete(statusRequest);
+                int preBarrierQueued = agentQueues.Values.SelectMany(items => items)
+                    .Count(request => !draining || request.QueueBarrierId < drainBarrierId);
+                int preBarrierRunning = running.Values.Count(request => request != statusRequest &&
+                    (!draining || request.QueueBarrierId < drainBarrierId));
+                return BridgeResult.Ok("core.restartDrainStatus")
+                    .Add("draining", draining)
+                    .Add("barrierId", drainBarrierId)
+                    .Add("drained", complete)
+                    .Add("preBarrierQueued", preBarrierQueued)
+                    .Add("preBarrierRunning", preBarrierRunning)
+                    .Add("queueDepth", queuedCount)
+                    .Add("retry", complete ? "restart_ready_to_stop" : "restart_status");
             }
         }
 
@@ -77,16 +148,33 @@ namespace RimWorldDevBridge
                     return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "stale_session");
                 if (request.Expired)
                     return BridgeResult.Fail(BridgeStatus.TIMEOUT, "queue_deadline_expired");
-                if (queue.Any(item => item.RequestId == request.RequestId) ||
+                bool coordinatorRequest = IsCoordinatorRequest(request);
+                if (draining && !coordinatorRequest)
+                    return BridgeResult.Fail(BridgeStatus.BUSY, "restart_pending")
+                        .Add("barrierId", drainBarrierId).Add("retry", "restart_status");
+                if (agentQueues.Values.Any(items => items.Any(item => item.RequestId == request.RequestId)) ||
                     running.ContainsKey(request.RequestId))
                     return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "duplicate_request_id");
-                if (queue.Count >= capacity)
+                if (queuedCount >= capacity)
                 {
                     rejected++;
                     return BridgeResult.Fail(BridgeStatus.BUSY, "operation_queue_full")
-                        .Add("queueDepth", queue.Count).Add("capacity", capacity);
+                        .Add("queueDepth", queuedCount).Add("capacity", capacity);
                 }
-                queue.Add(request);
+                string agentKey = AgentKey(request.AgentId);
+                if (!agentQueues.TryGetValue(agentKey, out Queue<BridgeRequest> agentQueue))
+                {
+                    agentQueue = new Queue<BridgeRequest>();
+                    agentQueues[agentKey] = agentQueue;
+                    agentRoundRobin.Enqueue(agentKey);
+                }
+                if (agentQueue.Count >= Math.Min(MaximumPerAgentQueue, capacity))
+                    return BridgeResult.Fail(BridgeStatus.BUSY, "agent_queue_full")
+                        .Add("agentQueueDepth", agentQueue.Count)
+                        .Add("agentQueueCapacity", Math.Min(MaximumPerAgentQueue, capacity));
+                request.QueueBarrierId = draining ? drainBarrierId : 0;
+                agentQueue.Enqueue(request);
+                queuedCount++;
                 PostDrainLocked();
                 return null;
             }
@@ -94,11 +182,25 @@ namespace RimWorldDevBridge
 
         internal bool Cancel(string requestId)
         {
+            return Cancel(requestId, null);
+        }
+
+        internal bool Cancel(string requestId, string agentId)
+        {
             lock (gate)
             {
-                BridgeRequest request = queue.FirstOrDefault(item => item.RequestId == requestId);
+                BridgeRequest request = null;
+                if (request == null)
+                {
+                    foreach (Queue<BridgeRequest> pending in agentQueues.Values)
+                    {
+                        request = pending.FirstOrDefault(item => item.RequestId == requestId);
+                        if (request != null) break;
+                    }
+                }
                 if (request == null) running.TryGetValue(requestId ?? string.Empty, out request);
-                if (request == null) return false;
+                if (request == null || (agentId != null &&
+                    !string.Equals(request.AgentId, agentId, StringComparison.Ordinal))) return false;
                 request.Cancelled = true;
                 return true;
             }
@@ -110,8 +212,12 @@ namespace RimWorldDevBridge
             lock (gate)
             {
                 sessionId = newSessionId;
-                stale = queue.ToList();
-                queue.Clear();
+                stale = agentQueues.Values.SelectMany(items => items).ToList();
+                agentQueues.Clear();
+                agentRoundRobin.Clear();
+                queuedCount = 0;
+                draining = false;
+                drainBarrierId = 0;
                 foreach (BridgeRequest request in running.Values) request.Cancelled = true;
             }
             foreach (BridgeRequest request in stale)
@@ -122,9 +228,10 @@ namespace RimWorldDevBridge
         {
             lock (gate)
             {
-                DateTime? oldest = queue.Count == 0 ? (DateTime?)null : queue.Min(item => item.EnqueuedUtc);
-                return BridgeResult.Ok("core.schedulerMetrics")
-                    .Add("queueDepth", queue.Count)
+                DateTime? oldest = queuedCount == 0 ? (DateTime?)null :
+                    agentQueues.Values.SelectMany(items => items).Min(item => item.EnqueuedUtc);
+                BridgeResult result = BridgeResult.Ok("core.schedulerMetrics")
+                    .Add("queueDepth", queuedCount)
                     .Add("capacity", capacity)
                     .Add("oldestMs", oldest.HasValue ? (DateTime.UtcNow - oldest.Value).TotalMilliseconds : 0d)
                     .Add("executed", executed)
@@ -133,7 +240,19 @@ namespace RimWorldDevBridge
                     .Add("meanExecutionMs", executed > 0 ? totalExecutionMs / executed : 0d)
                     .Add("slowestMs", slowestMs)
                     .Add("slowestCommand", slowestCommand)
-                    .Add("budgetMs", budgetMs);
+                    .Add("budgetMs", budgetMs)
+                    .Add("perAgentQueueCapacity", MaximumPerAgentQueue)
+                    .Add("draining", draining)
+                    .Add("barrierId", drainBarrierId);
+                foreach (KeyValuePair<string, AgentMetric> pair in agentMetrics.OrderBy(item => item.Key,
+                    StringComparer.Ordinal).Take(32))
+                {
+                    AgentMetric metric = pair.Value;
+                    result.AddLine("agent=" + RedactAgent(pair.Key) + " calls:" + metric.Calls +
+                        " meanMs:" + (metric.Calls == 0 ? 0d : metric.TotalMs / metric.Calls) +
+                        " maxMs:" + metric.MaxMs + " lastStatus:" + metric.LastStatus);
+                }
+                return result;
             }
         }
 
@@ -167,7 +286,6 @@ namespace RimWorldDevBridge
                         drainPosted = false;
                         return;
                     }
-                    queue.Remove(request);
                     running[request.RequestId] = request;
                 }
                 if (request.Cancelled)
@@ -189,14 +307,27 @@ namespace RimWorldDevBridge
             lock (gate)
             {
                 drainPosted = false;
-                if (queue.Count > 0) PostDrainLocked(yielded);
+                if (queuedCount > 0) PostDrainLocked(yielded);
             }
         }
 
         private BridgeRequest NextLocked()
         {
-            return queue.OrderBy(item => item.Cancelled || item.ClientDisconnected ? -2 : (int)item.Cost)
-                .ThenBy(item => item.EnqueuedUtc).FirstOrDefault();
+            while (agentRoundRobin.Count > 0)
+            {
+                string agentKey = agentRoundRobin.Dequeue();
+                if (!agentQueues.TryGetValue(agentKey, out Queue<BridgeRequest> pending) || pending.Count == 0)
+                {
+                    agentQueues.Remove(agentKey);
+                    continue;
+                }
+                BridgeRequest request = pending.Dequeue();
+                queuedCount--;
+                if (pending.Count > 0) agentRoundRobin.Enqueue(agentKey);
+                else agentQueues.Remove(agentKey);
+                return request;
+            }
+            return null;
         }
 
         private bool Execute(BridgeRequest request)
@@ -249,7 +380,7 @@ namespace RimWorldDevBridge
                     bool stale = request.Cancelled || request.ClientDisconnected || request.Expired ||
                         request.SessionId != sessionId;
                     running.Remove(request.RequestId);
-                    if (!stale) queue.Add(request);
+                    if (!stale) AddQueuedLocked(request);
                 }
                 if (request.Cancelled || request.ClientDisconnected || request.Expired || request.SessionId != sessionId)
                 {
@@ -300,6 +431,16 @@ namespace RimWorldDevBridge
                     slowestMs = executionMs;
                     slowestCommand = request.Command;
                 }
+                string agentKey = AgentKey(request.AgentId);
+                if (!agentMetrics.TryGetValue(agentKey, out AgentMetric metric))
+                {
+                    metric = new AgentMetric();
+                    agentMetrics[agentKey] = metric;
+                }
+                metric.Calls++;
+                metric.TotalMs += executionMs;
+                metric.MaxMs = Math.Max(metric.MaxMs, executionMs);
+                metric.LastStatus = result.Status.ToString();
             }
             request.Done.Set();
             return false;
@@ -315,6 +456,46 @@ namespace RimWorldDevBridge
         private bool IsStaleSession(BridgeRequest request)
         {
             lock (gate) return request.SessionId != sessionId;
+        }
+
+        private void AddQueuedLocked(BridgeRequest request)
+        {
+            string agentKey = AgentKey(request.AgentId);
+            if (!agentQueues.TryGetValue(agentKey, out Queue<BridgeRequest> pending))
+            {
+                pending = new Queue<BridgeRequest>();
+                agentQueues[agentKey] = pending;
+                agentRoundRobin.Enqueue(agentKey);
+            }
+            pending.Enqueue(request);
+            queuedCount++;
+        }
+
+        private static string AgentKey(string agentId)
+        {
+            return string.IsNullOrWhiteSpace(agentId) ? string.Empty : agentId;
+        }
+
+        private static string RedactAgent(string agentId)
+        {
+            if (string.IsNullOrEmpty(agentId)) return "anonymous";
+            using (SHA256 sha = SHA256.Create())
+                return "agent-" + BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(agentId)))
+                    .Replace("-", string.Empty).Substring(0, 12).ToLowerInvariant();
+        }
+
+        private static bool IsCoordinatorRequest(BridgeRequest request)
+        {
+            return request != null && (request.Command == "RESTART_DRAIN" ||
+                request.Command == "RESTART_DRAIN_STATUS" || request.Command == "RESTART_HEARTBEAT");
+        }
+
+        private sealed class AgentMetric
+        {
+            internal long Calls;
+            internal double TotalMs;
+            internal double MaxMs;
+            internal string LastStatus = "none";
         }
     }
 }

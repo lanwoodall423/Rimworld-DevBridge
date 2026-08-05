@@ -1,0 +1,12 @@
+# RimWorld Dev Bridge
+
+- Package ID: `Lan.RimWorldDevBridge`.
+- Generic adapter discovery scans a loaded owner's `DevTools/BridgeAdapters`; the legacy `DevTools/HotAdapters` source is development-only.
+- Build: `dotnet build Source\RimWorldDevBridge\RimWorldDevBridge.csproj -c Release`.
+- Coordinator build: `dotnet build DevTools\RestartCoordinator\RimWorldDevBridge.RestartCoordinator.csproj -c Release`.
+- Validate: `DevTools\Test-BridgeSourceInvariants.ps1`, `DevTools\Package-RimWorldDevBridge.ps1 -Build`.
+- Before runtime tests, query live context with `DevTools\devbridge.ps1 discover --json` and `context --package-id Lan.RimWorldDevBridge --json`.
+- Adapter-only changes use `adapter publish` then `adapter reload`; gameplay assemblies, defs, Harmony patches, serialized types, or core changes require a full restart.
+- Restart automation may control only an explicitly coordinator-owned sandbox; attached or live processes require a person or external orchestrator.
+- Dev Bridge owns contracts, discovery, validation, execution, safety, and diagnostics. Integrations and adapter distribution remain owner-controlled; Dev Bridge is optional.
+- Full workflow: `DevTools/DEVBRIDGE_AGENT.md`.

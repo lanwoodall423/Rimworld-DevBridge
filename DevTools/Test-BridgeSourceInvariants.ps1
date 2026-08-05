@@ -23,8 +23,8 @@ if ($diagnostics -notmatch "SnapshotProjectionOperation|currentCount") {
     throw "Cooperative paged query projection is missing."
 }
 Assert-Absent $allSource "\.GetTypes\(\)|PatchAll\(" "bridge source"
-if ([regex]::Matches($allSource, "AppDomain\.CurrentDomain\.GetAssemblies").Count -gt 1) {
-    throw "Only one explicit lazy loaded-assembly identity lookup is allowed."
+if ([regex]::Matches($allSource, "AppDomain\.CurrentDomain\.GetAssemblies").Count -gt 2) {
+    throw "Loaded assembly inspection exceeded the capture and execution binding seams."
 }
 
 if ($bootstrap -notmatch "EnsureUpdatePatch\(\)") { throw "Main-thread bootstrap update hook is missing." }
@@ -35,8 +35,10 @@ $wakeEnd = $runtime.IndexOf("private static void ProcessPendingFileSignals", $wa
 if ($wakeStart -lt 0 -or $wakeEnd -le $wakeStart) { throw "Wake callback boundaries were not found." }
 $wakeCallback = $runtime.Substring($wakeStart, $wakeEnd - $wakeStart)
 Assert-Absent $wakeCallback "StartTransport|StopTransport|Harmony|BridgePaths\." "wake callback"
-if ($allSource -notmatch 'GetFiles\(BridgePaths\.AdapterPath, "\*\.manifest\.json"\)') {
-    throw "Manifest-only adapter indexing is missing."
+if ($allSource -notmatch 'DevTools.*BridgeAdapters' -or
+    $allSource -notmatch 'SearchOption\.TopDirectoryOnly') {
+    throw "Owner-mod nonrecursive adapter indexing is missing."
 }
+Assert-Absent $allSource 'SearchOption\.AllDirectories' "adapter indexing"
 
 Write-Output "sourceInvariants=PASS dormantTickWork:false bootstrapHook:lightweight appDomainTypeScan:false eagerAdapters:false"

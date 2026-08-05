@@ -39,6 +39,8 @@ namespace RimWorldDevBridge
             BridgeRequest child = new BridgeRequest
             {
                 RequestId = parent.RequestId,
+                AgentId = parent.AgentId,
+                WorkspaceId = parent.WorkspaceId,
                 SessionId = parent.SessionId,
                 Command = BridgeText.NormalizeCommand(command),
                 Argument = argument ?? string.Empty,
@@ -83,6 +85,8 @@ namespace RimWorldDevBridge
             BridgeRequest cleanup = new BridgeRequest
             {
                 RequestId = source.RequestId,
+                AgentId = source.AgentId,
+                WorkspaceId = source.WorkspaceId,
                 SessionId = source.SessionId,
                 Command = source.Command,
                 Argument = source.Argument,

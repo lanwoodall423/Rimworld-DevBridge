@@ -25,6 +25,7 @@ internal static class Program
         BridgePaths.SetUserRootForTests(HarnessUserRoot);
         Run("legacy request", LegacyRequest);
         Run("structured request", StructuredRequest);
+        Run("agent identity isolation", AgentIdentityIsolation);
         Run("invalid timeout rejected", InvalidTimeoutRejected);
         Run("out of range timeout rejected", OutOfRangeTimeoutRejected);
         Run("malformed option rejected", MalformedOptionRejected);
@@ -47,6 +48,9 @@ internal static class Program
         Run("expired queued request never executes", ExpiredQueuedRequest);
         Run("scheduler stale session", SchedulerStaleSession);
         Run("scheduler queue capacity", SchedulerQueueCapacity);
+        Run("fair per-agent scheduler", FairPerAgentScheduler);
+        Run("restart drain barrier", RestartDrainBarrier);
+        Run("restart coordinator state machine", RestartCoordinatorStateMachineTest);
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
@@ -68,6 +72,10 @@ internal static class Program
         Run("pre-execution failure not cached", PreExecutionFailureNotCached);
         Run("idempotency copy preserves bounds", IdempotencyCopyPreservesBounds);
         Run("manifest adapter lifecycle", ManifestAdapterLifecycle);
+        Run("owner adapter discovery and duplicate resolution", OwnerAdapterDiscoveryAndDuplicateResolution);
+        string ownerAdapters = Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_OWNER_ADAPTERS");
+        if (!string.IsNullOrWhiteSpace(ownerAdapters))
+            Run("owner packaged adapter integration", () => OwnerPackagedAdapterIntegration(ownerAdapters));
         Run("missing feature prerequisite blocked", MissingFeaturePrerequisiteBlocked);
         Run("typed feature assertions", TypedFeatureAssertions);
         Run("batch derives transitive write mode", BatchDerivesWriteMode);
@@ -100,6 +108,47 @@ internal static class Program
         Equal("json", request.OutputFormat, "json");
         Check(request.AllowExpensive, "expensive");
         Check(request.DeadlineUtc > DateTime.UtcNow.AddMilliseconds(700), "deadline");
+    }
+
+    private static void AgentIdentityIsolation()
+    {
+        Check(BridgeProtocol.TryParse("x|STATUS||agentId=agent-a&workspaceId=workspace-a", "s1",
+            out BridgeRequest parsed, out _), "agent request parse");
+        Equal("agent-a", parsed.AgentId, "agent id");
+        Equal("workspace-a", parsed.WorkspaceId, "workspace id");
+        Check(BridgeCommands.Describe("AGENT_CONTEXT") != null, "agent context command missing");
+
+        BridgeAuthorization authorization = new BridgeAuthorization();
+        authorization.RotateSession("agent-session");
+        BridgeResult acquired = authorization.Acquire("sandbox", true, "agent-a");
+        string token = FieldValue(acquired, "lease");
+        BridgeCommandDescriptor descriptor = new BridgeCommandDescriptor
+        {
+            Name = "AGENT_TEST_MUTATION",
+            Mode = BridgeCommandMode.Reversible
+        };
+        BridgeRequest other = Request("agent-b", "agent-session");
+        other.AgentId = "agent-b";
+        other.AuthToken = token;
+        other.IdempotencyKey = "agent-b-write";
+        Check(authorization.Authorize(other, descriptor, token, true)?.Status == BridgeStatus.FORBIDDEN,
+            "another agent used the lease");
+        Check(authorization.Renew(token, true, "agent-b").Status == BridgeStatus.FORBIDDEN,
+            "another agent renewed the lease");
+        Check(authorization.Revoke(token, "agent-b").Status == BridgeStatus.FORBIDDEN,
+            "another agent revoked the lease");
+        Check(authorization.Renew(token, true, "agent-a").Status == BridgeStatus.OK,
+            "owner agent could not renew the lease");
+
+        QueuedContext context = new QueuedContext();
+        BridgeScheduler scheduler = new BridgeScheduler(_ => BridgeResult.Ok("agent.test"),
+            (_, __) => { });
+        scheduler.Configure(context, "agent-session", 8, 3);
+        BridgeRequest queued = Request("agent-cancel", "agent-session");
+        queued.AgentId = "agent-a";
+        Check(scheduler.Enqueue(queued) == null, "agent request was not queued");
+        Check(!scheduler.Cancel(queued.RequestId, "agent-b"), "another agent cancelled a request");
+        Check(scheduler.Cancel(queued.RequestId, "agent-a"), "owner agent could not cancel its request");
     }
 
     private static void InvalidTimeoutRejected()
@@ -400,6 +449,110 @@ internal static class Program
         scheduler.Configure(new QueuedContext(), "s", 8, 3);
         for (int i = 0; i < 8; i++) Check(scheduler.Enqueue(Request(i.ToString(), "s")) == null, "fill " + i);
         Equal(BridgeStatus.BUSY, scheduler.Enqueue(Request("overflow", "s")).Status, "queue bound");
+    }
+
+    private static void FairPerAgentScheduler()
+    {
+        QueuedContext context = new QueuedContext();
+        List<string> order = new List<string>();
+        BridgeScheduler scheduler = new BridgeScheduler(request =>
+        {
+            order.Add(request.AgentId);
+            return BridgeResult.Ok("fair.test");
+        });
+        scheduler.Configure(context, "fair-session", 8, 12);
+        for (int index = 0; index < 3; index++)
+        {
+            BridgeRequest first = Request("fair-a-" + index, "fair-session");
+            first.AgentId = "agent-a";
+            BridgeRequest second = Request("fair-b-" + index, "fair-session");
+            second.AgentId = "agent-b";
+            Check(scheduler.Enqueue(first) == null, "agent-a request was rejected");
+            Check(scheduler.Enqueue(second) == null, "agent-b request was rejected");
+        }
+        context.Drain();
+        Equal(6, order.Count, "fair request count");
+        Equal("agent-a", order[0], "round robin first");
+        Equal("agent-b", order[1], "round robin second");
+        Equal("agent-a", order[2], "round robin third");
+        Equal("agent-b", order[3], "round robin fourth");
+        Equal("agent-a", order[4], "round robin fifth");
+        Equal("agent-b", order[5], "round robin sixth");
+        Check(scheduler.Metrics().Lines.Any(line => line.Contains("agent-")), "redacted agent metrics missing");
+
+        QueuedContext boundedContext = new QueuedContext();
+        BridgeScheduler bounded = new BridgeScheduler(_ => BridgeResult.Ok("bounded.test"));
+        bounded.Configure(boundedContext, "bounded-session", 64, 12);
+        for (int index = 0; index < bounded.PerAgentQueueCapacity; index++)
+        {
+            BridgeRequest request = Request("bounded-" + index, "bounded-session");
+            request.AgentId = "single-agent";
+            Check(bounded.Enqueue(request) == null, "per-agent queue rejected within bound");
+        }
+        BridgeRequest overflow = Request("bounded-overflow", "bounded-session");
+        overflow.AgentId = "single-agent";
+        BridgeResult rejected = bounded.Enqueue(overflow);
+        Check(rejected != null && rejected.Status == BridgeStatus.BUSY &&
+            FieldValue(rejected, "error") == "agent_queue_full", "per-agent queue limit missing");
+        bounded.RotateSession("bounded-next");
+    }
+
+    private static void RestartDrainBarrier()
+    {
+        QueuedContext context = new QueuedContext();
+        BridgeScheduler scheduler = new BridgeScheduler(_ => BridgeResult.Ok("barrier.test"));
+        scheduler.Configure(context, "barrier-session", 8, 12);
+        BridgeRequest before = Request("barrier-before", "barrier-session");
+        before.AgentId = "agent-a";
+        Check(scheduler.Enqueue(before) == null, "pre-barrier request rejected");
+        long barrier = scheduler.BeginDrain();
+        Check(barrier > 0 && scheduler.IsDraining, "drain barrier was not established");
+        BridgeRequest after = Request("barrier-after", "barrier-session");
+        after.AgentId = "agent-b";
+        Check(scheduler.Enqueue(after)?.Status == BridgeStatus.BUSY, "ordinary post-barrier work accepted");
+        BridgeRequest heartbeat = Request("barrier-heartbeat", "barrier-session");
+        heartbeat.Command = "RESTART_HEARTBEAT";
+        Check(scheduler.Enqueue(heartbeat) == null, "coordinator heartbeat rejected");
+        context.Drain();
+        Check(scheduler.IsDrainComplete(), "pre-barrier work did not drain");
+        Check(scheduler.DrainStatus().Status == BridgeStatus.OK, "drain status failed");
+    }
+
+    private static void RestartCoordinatorStateMachineTest()
+    {
+        BridgeRestartCoordinatorStateMachine machine = new BridgeRestartCoordinatorStateMachine();
+        BridgeRestartTicketRecord first = machine.Request("agent-a", "owner.a", "gameplay change",
+            "game", "none", "core-a", "adapter-a", false, false);
+        BridgeRestartTicketRecord second = machine.Request("agent-b", "owner.b", "adapter change",
+            "bridge", "none", "core-a", "adapter-a", false, false);
+        Equal(first.CycleId, second.CycleId, "compatible restart requests were not coalesced");
+        BridgeRestartTicketRecord incompatible = machine.Request("agent-c", "owner.c", "different core",
+            "game", "none", "core-b", "adapter-a", false, false);
+        Check(incompatible.CycleId != first.CycleId, "incompatible fingerprint joined existing cycle");
+        BridgeRestartTicketRecord checkpoint = machine.Request("agent-c", "owner.c", "checkpoint",
+            "game", "development-copy", "core-a", "adapter-a", true, false);
+        Check(checkpoint.CycleId != first.CycleId, "incompatible save policy joined existing cycle");
+        BridgeRestartTicketRecord live = machine.Request("agent-d", "owner.d", "live test",
+            "game", "none", "core-a", "adapter-a", false, false, true);
+        Equal(BridgeRestartPhase.FAILED.ToString(), live.Phase, "unauthorized live restart accepted");
+        machine.SetPhase(first.CycleId, BridgeRestartPhase.DRAINING, "barrier");
+        machine.SetPhase(first.CycleId, BridgeRestartPhase.DRAINED, "drained");
+        machine.SetPhase(first.CycleId, BridgeRestartPhase.USER_RESTART_REQUIRED, "attached");
+        Equal(BridgeRestartPhase.USER_RESTART_REQUIRED.ToString(), machine.Ticket(first.Ticket).Phase,
+            "attached process did not require user restart");
+
+        string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeCoordinatorTest-" + Guid.NewGuid().ToString("N"));
+        string statePath = Path.Combine(root, "state.json");
+        string secretPath = Path.Combine(root, "secret.txt");
+        try
+        {
+            BridgeRestartCoordinatorStateMachine.WriteAtomic(statePath, machine.Snapshot);
+            BridgeRestartCoordinatorState restored = BridgeRestartCoordinatorStateMachine.Read(statePath);
+            Check(restored != null && restored.Tickets.Count >= 4, "coordinator state was not recoverable");
+            Check(!string.IsNullOrEmpty(BridgeRestartCoordinatorStateMachine.Secret(secretPath)),
+                "coordinator secret was not created");
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
     }
 
     private static void SessionContextTransitions()
@@ -1314,6 +1467,270 @@ internal static class Program
         }
     }
 
+    private static void OwnerAdapterDiscoveryAndDuplicateResolution()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeOwner-" + Guid.NewGuid().ToString("N"));
+        string ownerRoot = Path.Combine(root, "OwnerMod");
+        string secondOwnerRoot = Path.Combine(root, "SecondOwner");
+        string legacyRoot = Path.Combine(root, "DevTools", "HotAdapters");
+        string ownerDirectory = Path.Combine(ownerRoot, "DevTools", "BridgeAdapters");
+        string secondDirectory = Path.Combine(secondOwnerRoot, "DevTools", "BridgeAdapters");
+        Directory.CreateDirectory(ownerDirectory);
+        Directory.CreateDirectory(secondDirectory);
+        Directory.CreateDirectory(legacyRoot);
+        try
+        {
+            string built = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BridgeFixtureAdapter.dll");
+            if (!File.Exists(built))
+                built = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                    "..", "..", "..", "FixtureAdapter", "bin", "Release", "net472", "BridgeFixtureAdapter.dll"));
+            Check(File.Exists(built), "fixture adapter was not built for owner discovery");
+            byte[] bytes = File.ReadAllBytes(built);
+            string identity = AssemblyName.GetAssemblyName(built).FullName;
+            string hash = Sha256(bytes);
+            string ownerId = "owner.mod." + Guid.NewGuid().ToString("N");
+            string secondId = "second.owner." + Guid.NewGuid().ToString("N");
+            string ownerAdapter = "OWNER_DISCOVERY_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+
+            WriteGeneration(ownerDirectory, bytes, identity, hash, "1", "2026-07-01T00:00:00Z", ownerAdapter,
+                1, 10, adapterId: ownerAdapter.ToLowerInvariant(), requiredPackageId: ownerId);
+            WriteGeneration(legacyRoot, bytes, identity, hash, "1", "2026-07-01T00:00:00Z", ownerAdapter,
+                1, 10, adapterId: ownerAdapter.ToLowerInvariant(), requiredPackageId: ownerId);
+
+            BridgeAdapterSourceRecord ownerSource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.OwnerMod, ownerId, "1.0", ownerRoot, "owner:" + ownerId,
+                1, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterSourceRecord legacySource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.LegacyDevelopment, "Lan.RimWorldDevBridge", "legacy", legacyRoot,
+                "legacy:DevTools/HotAdapters", 1, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(new[] { ownerId },
+                new[] { legacySource, ownerSource });
+            Check(BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, ownerAdapter, StringComparison.OrdinalIgnoreCase)),
+                "owner file adapter was not selected");
+            BridgeResult health = BridgeAdapterCatalog.Health();
+            Check(health.Lines.Any(line => line.Contains("sourceKind:OwnerMod") && line.Contains("sourcePackage:" + ownerId)),
+                "owner source provenance was not reported");
+            Check(health.Lines.Any(line => line.Contains("migration-duplicate") && line.Contains("owner copy preferred")),
+                "identical owner/legacy migration duplicate was not reported");
+            BridgeAdapterCatalog.IndexAsynchronouslyForTests(new[] { ownerId }, new[] { ownerSource }, 0);
+            DateTime ownerWaitUntil = DateTime.UtcNow.AddSeconds(5);
+            while (BridgeAdapterCatalog.Indexing && DateTime.UtcNow < ownerWaitUntil) Thread.Sleep(10);
+            Check(BridgeAdapterCatalog.LastIndexThreadIdForTests != Thread.CurrentThread.ManagedThreadId,
+                "adapter indexing unexpectedly ran on the harness thread");
+
+            string loadedAdapter = "LOADED_DISCOVERY_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string loadedModulePath = Path.Combine(ownerRoot, "Framework.dll");
+            File.Copy(built, loadedModulePath, true);
+            Guid moduleMvid = Assembly.LoadFrom(built).ManifestModule.ModuleVersionId;
+            WriteGeneration(ownerDirectory, bytes, identity, hash, "1", "2026-07-01T00:00:01Z", loadedAdapter,
+                1, 10, adapterId: loadedAdapter.ToLowerInvariant(), requiredPackageId: ownerId);
+            string loadedManifestPath = Path.Combine(ownerDirectory, loadedAdapter.ToLowerInvariant() + ".1.manifest.json");
+            AdapterManifest loadedManifest = ReadManifest(loadedManifestPath);
+            string generatedFile = Path.Combine(ownerDirectory, loadedAdapter.ToLowerInvariant() + ".1.dll");
+            if (File.Exists(generatedFile)) File.Delete(generatedFile);
+            loadedManifest.assemblySource = "loaded";
+            loadedManifest.assemblyFile = null;
+            loadedManifest.modulePackageId = ownerId;
+            loadedManifest.moduleRelativePath = "Framework.dll";
+            loadedManifest.moduleMvid = moduleMvid.ToString("D");
+            WriteManifest(loadedManifestPath, loadedManifest);
+            BridgeLoadedModuleRecord loadedModule = new BridgeLoadedModuleRecord(ownerId, "Framework.dll",
+                loadedModulePath, identity, moduleMvid, bytes.Length);
+            BridgeAdapterSourceRecord loadedSource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.OwnerMod, ownerId, "1.0", ownerRoot, "owner:" + ownerId,
+                2, new[] { loadedModule });
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(new[] { ownerId }, new[] { loadedSource });
+            Check(BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, loadedAdapter, StringComparison.OrdinalIgnoreCase)),
+                "owner loaded-assembly adapter was not selected");
+
+            string missingOwner = "missing.owner." + Guid.NewGuid().ToString("N");
+            string missingRoot = Path.Combine(root, "MissingOwner");
+            string missingDirectory = Path.Combine(missingRoot, "DevTools", "BridgeAdapters");
+            Directory.CreateDirectory(missingDirectory);
+            string missingAdapter = "MISSING_OWNER_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            WriteGeneration(missingDirectory, bytes, identity, hash, "1", "2026-07-01T00:00:00Z", missingAdapter,
+                1, 10, adapterId: missingAdapter.ToLowerInvariant(), requiredPackageId: missingOwner);
+            BridgeAdapterSourceRecord missingSource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.OwnerMod, missingOwner, "1.0", missingRoot, "owner:" + missingOwner,
+                2, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(Array.Empty<string>(), new[] { missingSource });
+            Check(!BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, missingAdapter, StringComparison.OrdinalIgnoreCase)),
+                "unloaded owner adapter was accepted");
+            BridgeResult missingHealth = BridgeAdapterCatalog.Health();
+            Check(missingHealth.Lines.Any(value => value.Contains("missing package")) ||
+                missingHealth.Warnings.Any(value => value.Contains("missing package")),
+                "missing owner package was not diagnosed: " + string.Join(";", missingHealth.Lines));
+
+            string unsafeAdapter = "UNSAFE_OWNER_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            WriteGeneration(ownerDirectory, bytes, identity, hash, "1", "2026-07-02T00:00:00Z", unsafeAdapter,
+                1, 10, adapterId: unsafeAdapter.ToLowerInvariant(), requiredPackageId: ownerId);
+            string unsafeManifest = Path.Combine(ownerDirectory, unsafeAdapter.ToLowerInvariant() + ".1.manifest.json");
+            AdapterManifest unsafeValue = ReadManifest(unsafeManifest);
+            unsafeValue.assemblyFile = "../outside.dll";
+            WriteManifest(unsafeManifest, unsafeValue);
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(new[] { ownerId }, new[] { ownerSource });
+            Check(!BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, unsafeAdapter, StringComparison.OrdinalIgnoreCase)),
+                "traversal adapter was accepted");
+            Check(BridgeAdapterCatalog.Health().Warnings.Any(value => value.Contains(unsafeAdapter.ToLowerInvariant())),
+                "traversal adapter was not diagnosed");
+
+            string conflictAdapter = "CONFLICT_OWNER_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            WriteGeneration(ownerDirectory, bytes, identity, hash, "1", "2026-07-03T00:00:00Z", conflictAdapter,
+                1, 10, adapterId: conflictAdapter.ToLowerInvariant(), providerType: "Owner.Provider",
+                requiredPackageId: ownerId);
+            WriteGeneration(secondDirectory, bytes, identity, hash, "1", "2026-07-03T00:00:00Z", conflictAdapter,
+                1, 10, adapterId: conflictAdapter.ToLowerInvariant(), providerType: "Second.Provider",
+                requiredPackageId: secondId);
+            BridgeAdapterSourceRecord secondSource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.OwnerMod, secondId, "1.0", secondOwnerRoot, "owner:" + secondId,
+                3, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(new[] { ownerId, secondId },
+                new[] { ownerSource, secondSource });
+            Check(!BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, conflictAdapter, StringComparison.OrdinalIgnoreCase)),
+                "conflicting generation was selected");
+            Check(BridgeAdapterCatalog.Health().Warnings.Any(value => value.Contains("conflicting immutable bindings")),
+                "conflicting generation was not diagnosed");
+
+            string collisionAdapterA = "COLLISION_A_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string collisionAdapterB = "COLLISION_B_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            WriteGeneration(ownerDirectory, bytes, identity, hash, "1", "2026-07-04T00:00:00Z", "OWNER_COLLISION",
+                1, 10, adapterId: collisionAdapterA.ToLowerInvariant(), requiredPackageId: ownerId);
+            WriteGeneration(secondDirectory, bytes, identity, hash, "1", "2026-07-04T00:00:00Z", "OWNER_COLLISION",
+                1, 10, adapterId: collisionAdapterB.ToLowerInvariant(), requiredPackageId: secondId);
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(new[] { ownerId, secondId },
+                new[] { ownerSource, secondSource });
+            Check(BridgeAdapterCatalog.Health().Warnings.Any(value => value.Contains("command collision OWNER_COLLISION")),
+                "owner command collision was not diagnosed");
+
+            string raceOldRoot = Path.Combine(root, "RaceOldOwner");
+            string raceNewRoot = Path.Combine(root, "RaceNewOwner");
+            string raceOldDirectory = Path.Combine(raceOldRoot, "DevTools", "BridgeAdapters");
+            string raceNewDirectory = Path.Combine(raceNewRoot, "DevTools", "BridgeAdapters");
+            Directory.CreateDirectory(raceOldDirectory);
+            Directory.CreateDirectory(raceNewDirectory);
+            string oldCommand = "RACE_OLD_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string newCommand = "RACE_NEW_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string raceOldId = "race.old." + Guid.NewGuid().ToString("N");
+            string raceNewId = "race.new." + Guid.NewGuid().ToString("N");
+            WriteGeneration(raceOldDirectory, bytes, identity, hash, "1", "2026-07-05T00:00:00Z", oldCommand,
+                1, 10, adapterId: "race-old-" + raceOldId, requiredPackageId: raceOldId);
+            WriteGeneration(raceNewDirectory, bytes, identity, hash, "2", "2026-07-06T00:00:00Z", newCommand,
+                1, 10, adapterId: "race-new-" + raceNewId, requiredPackageId: raceNewId);
+            BridgeAdapterSourceRecord oldRaceSource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.OwnerMod, raceOldId, "1.0", raceOldRoot, "owner:" + raceOldId,
+                4, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterSourceRecord newRaceSource = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.OwnerMod, raceNewId, "1.0", raceNewRoot, "owner:" + raceNewId,
+                5, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterCatalog.IndexAsynchronouslyForTests(new[] { raceOldId }, new[] { oldRaceSource }, 250);
+            BridgeAdapterCatalog.IndexAsynchronouslyForTests(new[] { raceNewId }, new[] { newRaceSource }, 0);
+            DateTime waitUntil = DateTime.UtcNow.AddSeconds(5);
+            while (BridgeAdapterCatalog.Indexing && DateTime.UtcNow < waitUntil) Thread.Sleep(10);
+            Check(BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, newCommand, StringComparison.OrdinalIgnoreCase)),
+                "new adapter index did not commit");
+            Check(!BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, oldCommand, StringComparison.OrdinalIgnoreCase)),
+                "stale adapter index replaced the newer result");
+        }
+        finally
+        {
+            try { RestoreFixtureAdapterCatalog(); } catch { }
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    private static void OwnerPackagedAdapterIntegration(string encodedOwners)
+    {
+        List<BridgeAdapterSourceRecord> sources = new List<BridgeAdapterSourceRecord>();
+        List<string> packages = new List<string>();
+        string[] entries = encodedOwners.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        long sourceGeneration = 1;
+        foreach (string entry in entries)
+        {
+            string[] parts = entry.Split('|');
+            Check(parts.Length == 3, "owner integration entry must contain package, root, and adapter ID: " + entry);
+            string packageId = parts[0];
+            string root = Path.GetFullPath(parts[1]);
+            string expectedAdapterId = parts[2];
+            string directory = Path.Combine(root, "DevTools", "BridgeAdapters");
+            string[] manifests = Directory.Exists(directory)
+                ? Directory.GetFiles(directory, "*.manifest.json", SearchOption.TopDirectoryOnly)
+                : Array.Empty<string>();
+            Check(manifests.Length == 1, packageId + " must publish exactly one current manifest");
+            AdapterManifest manifest = ReadManifest(manifests[0]);
+            Equal(expectedAdapterId, manifest.adapterId, packageId + " adapter ID");
+            Check(manifest.requiredPackageIds != null && manifest.requiredPackageIds.Contains(packageId),
+                packageId + " owner package declaration");
+            packages.Add(packageId);
+            List<BridgeLoadedModuleRecord> modules = new List<BridgeLoadedModuleRecord>();
+            if (string.Equals(manifest.assemblySource, "loaded", StringComparison.OrdinalIgnoreCase))
+            {
+                Equal(packageId, manifest.modulePackageId, packageId + " loaded module package");
+                string relative = (manifest.moduleRelativePath ?? string.Empty).Replace('/', Path.DirectorySeparatorChar);
+                string modulePath = Path.GetFullPath(Path.Combine(root, relative));
+                Check(File.Exists(modulePath), packageId + " loaded module exists");
+                AssemblyName assemblyName = AssemblyName.GetAssemblyName(modulePath);
+                Guid mvid = Assembly.ReflectionOnlyLoadFrom(modulePath).ManifestModule.ModuleVersionId;
+                string hash = Sha256(File.ReadAllBytes(modulePath));
+                Equal(assemblyName.FullName, manifest.assemblyIdentity, packageId + " loaded module identity");
+                Equal(mvid.ToString("D"), manifest.moduleMvid, packageId + " loaded module MVID");
+                Equal(hash, manifest.contentHash, packageId + " loaded module hash");
+                modules.Add(new BridgeLoadedModuleRecord(packageId, manifest.moduleRelativePath, modulePath,
+                    assemblyName.FullName, mvid, new FileInfo(modulePath).Length));
+            }
+            sources.Add(new BridgeAdapterSourceRecord(BridgeAdapterSourceKind.OwnerMod, packageId,
+                manifest.version, root, "owner:" + packageId, sourceGeneration++, modules));
+        }
+
+        try
+        {
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(packages, sources);
+            foreach (BridgeAdapterSourceRecord source in sources)
+            {
+                string manifestPath = Directory.GetFiles(source.DirectoryPath, "*.manifest.json",
+                    SearchOption.TopDirectoryOnly).Single();
+                AdapterManifest manifest = ReadManifest(manifestPath);
+                Check(BridgeAdapterCatalog.Health().Lines.Any(line =>
+                    line.Contains("sourcePackage:" + source.PackageId) &&
+                    line.Contains("sourceKind:OwnerMod")),
+                    source.PackageId + " provenance health");
+                IEnumerable<AdapterCommandManifest> commands = manifest.commands ??
+                    new List<AdapterCommandManifest>();
+                foreach (AdapterCommandManifest command in commands)
+                    Check(BridgeAdapterCatalog.Commands.Any(item =>
+                        string.Equals(item.Name, command.name, StringComparison.OrdinalIgnoreCase)),
+                        source.PackageId + " command " + command.name);
+            }
+
+            BridgeAdapterSourceRecord disabledSource = sources[0];
+            string disabledManifestPath = Directory.GetFiles(disabledSource.DirectoryPath,
+                "*.manifest.json", SearchOption.TopDirectoryOnly).Single();
+            AdapterManifest disabledManifest = ReadManifest(disabledManifestPath);
+            string disabledCommand = (disabledManifest.commands ?? new List<AdapterCommandManifest>())
+                .Select(command => command.name).FirstOrDefault();
+            List<BridgeAdapterSourceRecord> enabledAfterDisable = sources
+                .Where(source => !string.Equals(source.PackageId, disabledSource.PackageId,
+                    StringComparison.OrdinalIgnoreCase)).ToList();
+            List<string> packagesAfterDisable = packages
+                .Where(package => !string.Equals(package, disabledSource.PackageId,
+                    StringComparison.OrdinalIgnoreCase)).ToList();
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(packagesAfterDisable, enabledAfterDisable);
+            Check(!BridgeAdapterCatalog.Commands.Any(item =>
+                string.Equals(item.Name, disabledCommand, StringComparison.OrdinalIgnoreCase)),
+                disabledSource.PackageId + " disabled owner remained indexed");
+        }
+        finally
+        {
+            RestoreFixtureAdapterCatalog();
+        }
+    }
+
     private static void SlowLegacyAdapterCircuitBreaker()
     {
         string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeLegacy-" + Guid.NewGuid().ToString("N"));
@@ -1537,10 +1954,43 @@ internal static class Program
         BridgeOrchestration.Reload();
         try { Directory.Delete(root, true); } catch { }
     }
+    private static AdapterManifest ReadManifest(string path)
+    {
+        using (FileStream stream = File.OpenRead(path))
+        {
+            return (AdapterManifest)new DataContractJsonSerializer(typeof(AdapterManifest)).ReadObject(stream);
+        }
+    }
+
+    private static void WriteManifest(string path, AdapterManifest manifest)
+    {
+        using (FileStream stream = File.Create(path))
+        {
+            new DataContractJsonSerializer(typeof(AdapterManifest)).WriteObject(stream, manifest);
+        }
+    }
+
+    private static void RestoreFixtureAdapterCatalog()
+    {
+        string built = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BridgeFixtureAdapter.dll");
+        if (!File.Exists(built))
+            built = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                "..", "..", "..", "FixtureAdapter", "bin", "Release", "net472", "BridgeFixtureAdapter.dll"));
+        byte[] bytes = File.ReadAllBytes(built);
+        string adapters = Path.Combine(HarnessUserRoot, "DevTools", "HotAdapters");
+        Directory.CreateDirectory(adapters);
+        foreach (string existing in Directory.GetFiles(adapters))
+            File.Delete(existing);
+        WriteGeneration(adapters, bytes, AssemblyName.GetAssemblyName(built).FullName, Sha256(bytes),
+            "restore", "2026-01-01T00:00:00Z", "FIXTURE_ECHO", 1, 10);
+        BridgePaths.Initialize(HarnessUserRoot);
+        BridgeAdapterCatalog.IndexSynchronouslyForTests(Array.Empty<string>());
+    }
+
     private static void WriteGeneration(string directory, byte[] bytes, string identity, string hash,
         string generation, string buildUtc, string command, int protocolMin, int protocolMax,
         string adapterId = "fixture", string providerType = "BridgeFixtureAdapter.FixtureProvider",
-        string commandMode = "PureRead", string executionContract = null)
+        string commandMode = "PureRead", string executionContract = null, string requiredPackageId = null)
     {
         string file = adapterId + "." + generation + ".dll";
         File.WriteAllBytes(Path.Combine(directory, file), bytes);
@@ -1575,7 +2025,8 @@ internal static class Program
                     minimumExecutionBudgetMs = 25
                 }
             },
-            requiredPackageIds = new List<string>(),
+            requiredPackageIds = string.IsNullOrWhiteSpace(requiredPackageId)
+                ? new List<string>() : new List<string> { requiredPackageId },
             optionalPackageIds = new List<string>(),
             changeSummary = "fixture"
         };

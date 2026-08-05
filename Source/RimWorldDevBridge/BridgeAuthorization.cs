@@ -51,7 +51,15 @@ namespace RimWorldDevBridge
             }
         }
 
-        internal BridgeResult Acquire(string requestedContext, bool mutationEnabled)
+        internal void ClearLeases()
+        {
+            lock (gate) leases.Clear();
+        }
+
+        internal BridgeResult Acquire(string requestedContext, bool mutationEnabled) =>
+            Acquire(requestedContext, mutationEnabled, null);
+
+        internal BridgeResult Acquire(string requestedContext, bool mutationEnabled, string agentId)
         {
             if (!mutationEnabled)
                 return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
@@ -64,16 +72,21 @@ namespace RimWorldDevBridge
             lock (gate)
             {
                 DateTime now = DateTime.UtcNow;
+                RemoveExpired(now);
+                WriteLease existing = leases.Values.FirstOrDefault(item => item.ExpiresUtc > now);
+                if (existing != null && !AgentMatches(existing.AgentId, agentId))
+                    return BridgeResult.Fail(BridgeStatus.BUSY, "write_lease_held");
+                if (existing != null) leases.Remove(existing.Token);
                 lease = new WriteLease
                 {
                     Token = Guid.NewGuid().ToString("N"),
                     SessionId = sessionId,
                     Context = normalized,
+                    AgentId = agentId,
                     AcquiredUtc = now,
                     ExpiresUtc = now.AddSeconds(LeaseSeconds)
                 };
                 leases[lease.Token] = lease;
-                RemoveExpired(now);
             }
             return BridgeResult.Ok("core.writeLease")
                 .Add("lease", lease.Token)
@@ -82,7 +95,10 @@ namespace RimWorldDevBridge
                 .Warn(normalized == "live-confirmed" ? "Writes are authorized against a live save." : null);
         }
 
-        internal BridgeResult Renew(string leaseToken, bool mutationEnabled)
+        internal BridgeResult Renew(string leaseToken, bool mutationEnabled) =>
+            Renew(leaseToken, mutationEnabled, null);
+
+        internal BridgeResult Renew(string leaseToken, bool mutationEnabled, string agentId)
         {
             if (!mutationEnabled)
                 return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
@@ -91,7 +107,8 @@ namespace RimWorldDevBridge
                 DateTime now = DateTime.UtcNow;
                 RemoveExpired(now);
                 if (string.IsNullOrWhiteSpace(leaseToken) || !leases.TryGetValue(leaseToken, out WriteLease lease) ||
-                    lease.SessionId != sessionId || lease.ExpiresUtc <= now)
+                    lease.SessionId != sessionId || lease.ExpiresUtc <= now ||
+                    !AgentMatches(lease.AgentId, agentId))
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required");
                 lease.ExpiresUtc = now.AddSeconds(LeaseSeconds);
                 return BridgeResult.Ok("core.writeLeaseRenewed")
@@ -100,12 +117,16 @@ namespace RimWorldDevBridge
             }
         }
 
-        internal BridgeResult Revoke(string leaseToken)
+        internal BridgeResult Revoke(string leaseToken) => Revoke(leaseToken, null);
+
+        internal BridgeResult Revoke(string leaseToken, string agentId)
         {
             lock (gate)
             {
-                if (string.IsNullOrWhiteSpace(leaseToken) || !leases.Remove(leaseToken))
+                if (string.IsNullOrWhiteSpace(leaseToken) || !leases.TryGetValue(leaseToken, out WriteLease lease) ||
+                    !AgentMatches(lease.AgentId, agentId))
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required");
+                leases.Remove(leaseToken);
                 return BridgeResult.Ok("core.writeLeaseRevoked").Add("lease", leaseToken);
             }
         }
@@ -121,7 +142,8 @@ namespace RimWorldDevBridge
             {
                 RemoveExpired();
                 if (string.IsNullOrWhiteSpace(leaseToken) || !leases.TryGetValue(leaseToken, out WriteLease lease) ||
-                    lease.SessionId != sessionId || lease.ExpiresUtc <= DateTime.UtcNow)
+                    lease.SessionId != sessionId || lease.ExpiresUtc <= DateTime.UtcNow ||
+                    !AgentMatches(lease.AgentId, request.AgentId))
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required");
                 if (descriptor.Mode == BridgeCommandMode.PotentiallyDestructive && lease.Context != "sandbox")
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "destructive_write_requires_sandbox");
@@ -222,8 +244,15 @@ namespace RimWorldDevBridge
             internal string Token;
             internal string SessionId;
             internal string Context;
+            internal string AgentId;
             internal DateTime AcquiredUtc;
             internal DateTime ExpiresUtc;
+        }
+
+        private static bool AgentMatches(string leaseAgentId, string requestAgentId)
+        {
+            return (string.IsNullOrEmpty(leaseAgentId) && string.IsNullOrEmpty(requestAgentId)) ||
+                string.Equals(leaseAgentId, requestAgentId, StringComparison.Ordinal);
         }
 
         private sealed class CachedWrite
