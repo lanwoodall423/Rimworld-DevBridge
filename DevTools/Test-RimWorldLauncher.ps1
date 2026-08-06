@@ -12,9 +12,28 @@ if ($errors.Count -ne 0) {
 }
 
 $shell = (Get-Process -Id $PID).Path
-$gameArguments = "/c exit 7"
-$output = & $shell -NoProfile -ExecutionPolicy Bypass -File $launcher -GamePath $env:ComSpec `
-    -NoQuickTest -SkipBuild -GameArguments $gameArguments -StartupTimeoutSeconds $TimeoutSeconds 2>&1
+$gameArguments = "/c ping -n 3 127.0.0.1 >nul & exit 7"
+$testUserRoot = Join-Path ([IO.Path]::GetTempPath()) ("RimWorldDevBridgeLauncherTest-" + [Guid]::NewGuid().ToString("N"))
+[IO.Directory]::CreateDirectory($testUserRoot) | Out-Null
+$output = $null
+try {
+    $client = Join-Path $root "DevTools\devbridge.ps1"
+    & $shell -NoProfile -ExecutionPolicy Bypass -File $client restart authorize-sandbox --bridge-root $root --user-root $testUserRoot `
+        --game-path $env:ComSpec --working-directory (Split-Path -Parent $env:ComSpec) --arguments $gameArguments `
+        --mod-configuration managed-test --confirm-disposable-sandbox --json 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "sandbox authorization failed with exit code $LASTEXITCODE" }
+    $output = & $shell -NoProfile -ExecutionPolicy Bypass -File $launcher -GamePath $env:ComSpec `
+        -UserRoot $testUserRoot -ModConfiguration managed-test -GameProcessName RimWorldLauncherSynthetic `
+        -NoQuickTest -SkipBuild -GameArguments $gameArguments -StartupTimeoutSeconds $TimeoutSeconds 2>&1
+}
+finally {
+    try {
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'RimWorldDevBridge.RestartCoordinator.exe' -and $_.CommandLine -like "*$testUserRoot*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    if (Test-Path -LiteralPath $testUserRoot) { Remove-Item -LiteralPath $testUserRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
 $exitCode = $LASTEXITCODE
 $output | ForEach-Object { Write-Output $_ }
 if ($exitCode -ne 2 -or -not ($output -match "summary=FAIL reason=rimworld_exited_(7|unknown)")) {

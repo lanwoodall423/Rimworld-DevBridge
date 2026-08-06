@@ -51,6 +51,9 @@ pwsh -File .\DevTools\devbridge.ps1 context --package-id Lan.RimWorldDevBridge -
 pwsh -File .\DevTools\devbridge.ps1 describe --package-id Lan.RimWorldDevBridge --json
 pwsh -File .\DevTools\devbridge.ps1 read --command STATUS --json
 pwsh -File .\DevTools\devbridge.ps1 call SYNC --json
+pwsh -File .\DevTools\devbridge.ps1 validate --layout auto --json
+pwsh -File .\DevTools\devbridge.ps1 restart authorize-sandbox --game-path <path> --user-data-root <existing-root> --mod-configuration managed-test --confirm-disposable-sandbox --json
+pwsh -File .\DevTools\devbridge.ps1 restart ensure --readiness bridge --save-policy none --keep-running --json
 ```
 
 Path resolution priority is explicit argument, documented environment variable, local user
@@ -63,6 +66,16 @@ The client writes JSON to stdout and diagnostics to stderr. Typical exit codes a
 2 for invalid request/client errors, 3 for path/configuration errors, 4 for unavailable or stale
 bridge state, and 5 for failed post-restart context handshakes. `Send-RimWorldBridge.ps1` remains a
 temporary compatibility wrapper and delegates to `devbridge.ps1`.
+
+`restart ensure` is for explicitly configured, coordinator-owned managed-test processes. It validates
+the executable, working directory, existing user-data root, arguments, and `managed-test` mod
+configuration, persists the launch profile, and returns a structured ticket/readiness handshake. Run
+`restart authorize-sandbox --confirm-disposable-sandbox` once after a human operator has identified that
+managed-test profile as disposable. The authorization is stored under the user root and is bound to the
+validated executable hash and launch profile; future agents can launch or restart that coordinator-owned
+profile without another prompt. Use `restart revoke-sandbox` to remove it. Authorization does not grant
+mutation authority or acquire a write lease. Attached or live RimWorld processes are never claimed or
+stopped; they return `USER_RESTART_REQUIRED` for human or external-orchestrator action.
 
 Lease and mutation examples:
 
@@ -109,8 +122,9 @@ configuration values are `rimWorldManagedDir` and `harmonyPath`; they must point
 
 Equivalent environment variables are `RIMWORLD_MANAGED_DIR` and `RIMWORLD_HARMONY_PATH`. The
 entrypoint validates Assembly-CSharp, UnityEngine.CoreModule, and 0Harmony identities before
-building. It then builds the core, coordinator, and harness, runs the harness and source
-invariants, creates the release package, and runs package smoke validation.
+building. It then builds the core, coordinator, and harness, runs the harness, source invariants, and
+the coordinator-owned launch/ensure safety test, creates the release package, and runs package smoke
+validation.
 
 The private build never downloads or uploads proprietary dependencies. Portable CI runs
 `DevTools/Test-Portable.ps1` and Bash syntax checks; a self-hosted/private runner with locally
@@ -132,6 +146,11 @@ ignored and must not be committed.
 
 `status_unavailable` or `bridge_not_active` means the process is absent, dormant, stale, or the
 bridge root/user root is wrong. Supply explicit roots and run `wake`, then query fresh context.
+`restart_coordinator_stale` means a coordinator built from a different validated binary owns the
+configured coordinator root; the client replaces only that coordinator process, never an attached game.
+`USER_RESTART_REQUIRED` means a RimWorld process is attached or live and must be handled by a person or
+external orchestrator. `restart ensure` requires an existing user-data root and an explicit game path; it
+does not scan arbitrary installations.
 `RimWorldManagedDir is not configured` or a missing assembly error means the private dependency
 inputs are absent; do not copy those files into this repository. A fingerprint, boot, session, or
 transport mismatch requires discarding cached context, leases, cursors, and handles.

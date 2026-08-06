@@ -9,6 +9,10 @@
 - Validate: `DevTools\Test-BridgeSourceInvariants.ps1`, `DevTools\Package-RimWorldDevBridge.ps1 -Build`.
 - Canonical client: `DevTools\devbridge.ps1`; `Send-RimWorldBridge.ps1` is a temporary delegating wrapper.
 - Client output is JSON on stdout with diagnostics on stderr; use `--agent-id` only for an explicit override.
+- Layout validation: `devbridge.ps1 validate --layout auto|source|package --json`; source validation may report and build a missing coordinator with `--ensure-runtime-tools`.
+- Managed runtime verification: `devbridge.ps1 restart ensure --game-path <path> --user-data-root <existing-root> --mod-configuration managed-test --readiness bridge|game|map --save-policy none|development-copy --json`.
+- One-time sandbox authorization: `devbridge.ps1 restart authorize-sandbox --game-path <path> --user-data-root <existing-root> --mod-configuration managed-test --confirm-disposable-sandbox --json`; revoke with `restart revoke-sandbox`. Authorization is profile/hash-bound and only permits later coordinator-owned managed-test launch/restart.
+- Coordinator workflow test: `DevTools/Test-RestartCoordinator.ps1`; it covers validated launch profiles, ownership, coalescing, stale coordinator replacement, and attached-process refusal.
 - Before runtime tests, query live context with `DevTools\devbridge.ps1 discover --json` and `context --package-id Lan.RimWorldDevBridge --json`.
 - Adapter-only changes use `adapter publish` then `adapter reload`; gameplay assemblies, defs, Harmony patches, serialized types, or core changes require a full restart.
 - Every connected game is live and non-disposable by default. Only the human operator may explicitly identify the current game as a disposable sandbox. A client label, command, naming convention, dev mode, or inference never proves sandbox status.

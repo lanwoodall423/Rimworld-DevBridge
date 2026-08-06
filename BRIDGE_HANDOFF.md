@@ -4,8 +4,7 @@ The bridge location is installation-specific. Supply `--bridge-root`, set
 `RIMWORLD_DEVBRIDGE_BRIDGE_ROOT`, or use the bounded platform discovery performed by the canonical
 client. Do not assume a Steam or RimWorld installation path.
 
-It is a loopback-only, on-demand development bridge. Every connected game is live and
-non-disposable by default. Only the human operator may explicitly identify the currently loaded
+It is a loopback-only, on-demand development bridge. Every connected game is live and non-disposable by default. Only the human operator may explicitly identify the currently loaded
 game as a disposable sandbox. A client label, command name, save name, dev mode, or inference from
 bridge state never proves that a game is disposable.
 
@@ -91,10 +90,42 @@ owner, drains lifecycle work before dormant return, and executes finalization on
 duplicate notifications are discarded.
 
 The canonical client supports `discover`, `wake`, `read`, `context`, `describe`, `call`, `mutate`,
-`cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and `restart request|status|wait`.
+`cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and
+`restart authorize-sandbox|revoke-sandbox|request|status|wait|ensure`.
 It emits JSON on stdout and diagnostics on stderr. Idempotency keys are generated for mutations when
 omitted and are returned in the JSON response; callers should supply the same key for an intentional retry.
 Transport and lease secrets are redacted unless `--unsafe-debug` is explicitly supplied.
+
+Use `validate --layout auto|source|package` to distinguish a source checkout from the strict eleven-file
+release package. Source validation reports coordinator `available`, `buildable`, `missing`, `invalid`, or
+`missing_build_tooling` states; `--ensure-runtime-tools` may build the coordinator into the documented
+source output path. It never treats a missing source-build output as a valid package.
+
+For unattended managed verification, persist and validate a `managed-test` launch profile, then use:
+
+```powershell
+& ".\DevTools\devbridge.ps1" restart ensure `
+  --game-path <validated-executable> --user-data-root <existing-user-root> `
+  --mod-configuration managed-test --readiness bridge --save-policy none --keep-running --json
+```
+
+An operator can authorize that validated profile once for unattended sandbox control:
+
+```powershell
+& ".\DevTools\devbridge.ps1" restart authorize-sandbox `
+  --game-path <validated-executable> --user-data-root <existing-user-root> `
+  --mod-configuration managed-test --confirm-disposable-sandbox --json
+```
+
+The authorization is local to the user root, binds the executable hash and complete launch profile, and
+allows later agents to launch or restart only that coordinator-owned managed-test process. It can be
+removed with `restart revoke-sandbox`; it never authorizes an attached process, mutation, or write lease.
+
+The profile records the executable, working directory, arguments, user-data root, mod configuration, and
+validation time. Ensure coalesces compatible requests by restart cycle, rotates stale coordinator builds,
+and returns ownership, ticket, phase, readiness, and next-action fields. Restart coordination does not
+grant mutation authority and does not acquire a write lease. A manually attached or live RimWorld process
+returns `USER_RESTART_REQUIRED`; no attached process is claimed, stopped, or force-killed.
 
 The game shows a small runtime-only bridge indicator whenever transport is active or a write lease
 exists. Read-only, sandbox, and live-confirmed states are distinct; live-confirmed write access is
@@ -120,8 +151,9 @@ as a disposable sandbox:
   -Command RUN_FEATURE_TESTS -StartupTimeoutSeconds 600
 ```
 
-The launcher never stops an attached process and stops only a process it started unless
-`-KeepRunning` is supplied. Logs are stored at:
+The launcher is read-only when attached. It never stops or claims an attached process, rejects stale
+attached state with `USER_RESTART_REQUIRED`, and stops only a coordinator-owned process it started unless
+`-KeepRunning` is supplied. Supply `-UserRoot` for a pre-existing managed-test user root. Logs are stored at:
 
 `%USERPROFILE%\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\RimWorldDevBridge\LauncherLogs`
 

@@ -25,7 +25,7 @@ function Has-Flag([string[]] $values, [string] $name) {
 }
 
 function Write-JsonResult($value) {
-    $value | ConvertTo-Json -Depth 16 -Compress | Write-Output
+    (Redact-Object $value) | ConvertTo-Json -Depth 16 -Compress | Write-Output
 }
 
 function Write-Diagnostic([string] $message) {
@@ -34,7 +34,7 @@ function Write-Diagnostic([string] $message) {
 
 function New-ErrorResult([string] $reason, [string] $detail = $null) {
     $result = [ordered]@{ available = $false; reason = $reason }
-    if (-not [string]::IsNullOrWhiteSpace($detail)) { $result.detail = $detail }
+    if (-not [string]::IsNullOrWhiteSpace($detail)) { $result.detail = Redact-Text $detail }
     return $result
 }
 
@@ -283,7 +283,8 @@ function Get-BridgeStatus([string] $bridgeRoot, [string] $userRoot, [string] $ag
 
 function Redact-Text([string] $text) {
     if ($script:UnsafeDebug) { return $text }
-    return $text -replace '(?i)(token|lease|secret|password)([=:])[^\s|,&}]+', '$1$2[REDACTED]'
+    $redacted = $text -replace '(?i)(token|lease|secret|password)([=:])[^\s|,&}]+', '$1$2[REDACTED]'
+    return $redacted -replace '(?i)\b[A-Z]:\\[^\s|,&}]+', '[REDACTED_PATH]'
 }
 
 function Get-ResponseSecret($response) {
@@ -305,6 +306,9 @@ function Redact-Object($value) {
             if ($property.Name -match '(?i)^(token|lease|leaseToken|authToken|secret|password)$') {
                 $copy[$property.Name] = "[REDACTED]"
             }
+            elseif ($property.Name -match '(?i)^(path|bridgeRoot|statusPath|coordinatorPath|gamePath|executable|workingDirectory|savePath|userDataRoot|profilePath)$') {
+                $copy[$property.Name] = "[REDACTED_PATH]"
+            }
             else { $copy[$property.Name] = Redact-Object $property.Value }
         }
         return [pscustomobject]$copy
@@ -314,6 +318,9 @@ function Redact-Object($value) {
         foreach ($key in $value.Keys) {
             if ([string]$key -match '(?i)^(token|lease|leaseToken|authToken|secret|password)$') {
                 $copy[$key] = "[REDACTED]"
+            }
+            elseif ([string]$key -match '(?i)^(path|bridgeRoot|statusPath|coordinatorPath|gamePath|executable|workingDirectory|savePath|userDataRoot|profilePath)$') {
+                $copy[$key] = "[REDACTED_PATH]"
             }
             else { $copy[$key] = Redact-Object $value[$key] }
         }
@@ -447,29 +454,188 @@ function Invoke-Help {
             "discover", "wake", "read --command <name>", "call <command>",
             "lease acquire|inspect|renew|release", "mutate --command <name>", "cancel --request-id <id>",
             "context --package-id <id>", "describe --package-id <id>", "repo context", "adapter publish|reload",
-            "restart request|status|wait|register|launch", "validate", "help"
+            "restart authorize-sandbox|revoke-sandbox|request|status|wait|register|launch|ensure",
+            "validate --layout auto|source|package", "help"
         )
         exitCodes = [ordered]@{ success = 0; invalidArguments = 2; pathOrUnavailable = 3; transport = 4; stale = 5; bridgeRejected = 6 }
         secrets = "transport and lease tokens are redacted; use --unsafe-debug only for explicit local debugging"
     }
 }
 
-function Invoke-Validate([string[]] $values) {
-    $config = Get-ClientConfig
-    $root = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
-    if ($null -eq $root) { throw "bridge_root_required: supply --bridge-root or RIMWORLD_DEVBRIDGE_BRIDGE_ROOT" }
-    $required = @(
+function Get-PackageRequiredFiles {
+    return @(
         "About/About.xml", "LoadFolders.xml", "BRIDGE_MANIFEST.txt", "BRIDGE_HANDOFF.md", "LICENSE",
         "AGENTS.md", "1.6/Assemblies/RimWorldDevBridge.dll", "RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe",
         "DevTools/devbridge.ps1", "DevTools/Send-RimWorldBridge.ps1", "DevTools/DEVBRIDGE_AGENT.md"
     )
-    $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $root ($_ -replace '/', '\')) -PathType Leaf) })
-    if ($missing.Count -gt 0) { throw "package_required_file_missing: $($missing -join ',')" }
-    $manifest = Read-BridgeManifest $root
-    if ($manifest.license -ne 'MIT' -or $manifest.licenseFile -ne 'LICENSE') {
-        throw 'package_license_metadata_invalid: expected MIT and LICENSE'
+}
+
+function Get-SourceRequiredFiles {
+    return @(
+        "BRIDGE_MANIFEST.txt", "Directory.Build.props", "Directory.Build.targets",
+        "Source/RimWorldDevBridge/RimWorldDevBridge.csproj",
+        "Source/RimWorldDevBridge/BridgeRestartCoordinator.cs",
+        "DevTools/RestartCoordinator/RimWorldDevBridge.RestartCoordinator.csproj",
+        "DevTools/RestartCoordinator/Program.cs", "DevTools/devbridge.ps1"
+    )
+}
+
+function Get-BridgeLayout([string] $root, [string] $requested = "auto") {
+    $requested = $requested.ToLowerInvariant()
+    if ($requested -notin @("auto", "source", "package")) { throw "layout_invalid: use auto, source, or package" }
+    $packageFiles = Get-PackageRequiredFiles
+    $sourceFiles = Get-SourceRequiredFiles
+    $missingPackage = @($packageFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $root ($_ -replace '/', '\')) -PathType Leaf)
+    })
+    $missingSource = @($sourceFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $root ($_ -replace '/', '\')) -PathType Leaf)
+    })
+    $layout = $requested
+    if ($requested -eq "auto") {
+        if ($missingPackage.Count -eq 0) { $layout = "package" }
+        elseif ($missingSource.Count -eq 0) { $layout = "source" }
+        else { $layout = "unknown" }
     }
-    return [ordered]@{ valid = $true; bridgeRoot = $root; bridge = $manifest.bridge; protocol = $manifest.protocol; schema = $manifest.schema; requiredFiles = $required.Count }
+    $selectedMissing = if ($layout -eq "package") { $missingPackage } elseif ($layout -eq "source") { $missingSource } else { @() }
+    return [ordered]@{
+        requested = $requested
+        layout = $layout
+        packageComplete = $missingPackage.Count -eq 0
+        sourceComplete = $missingSource.Count -eq 0
+        packageMissing = $missingPackage
+        sourceMissing = $missingSource
+        selectedMissing = $selectedMissing
+    }
+}
+
+function Get-CoordinatorIdentity([string] $path) {
+    try {
+        $assemblyName = [Reflection.AssemblyName]::GetAssemblyName($path)
+        return [ordered]@{
+            name = $assemblyName.Name
+            version = [string]$assemblyName.Version
+            sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            bytes = (Get-Item -LiteralPath $path).Length
+        }
+    }
+    catch { return $null }
+}
+
+function Get-CoordinatorInfo([string] $root, $layoutInfo, [string] $explicitPath = $null, [bool] $ensureBuild = $false) {
+    $sourceProject = Join-Path $root "DevTools\RestartCoordinator\RimWorldDevBridge.RestartCoordinator.csproj"
+    $outputPath = Join-Path $root "1.6\Assemblies\RestartCoordinator\net472\RimWorldDevBridge.RestartCoordinator.exe"
+    $configured = $explicitPath
+    if ([string]::IsNullOrWhiteSpace($configured)) {
+        $config = Get-ClientConfig
+        if ($config) { $configured = [string]$config.coordinatorPath }
+    }
+    $candidatePaths = New-Object 'System.Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        [void]$candidatePaths.Add($configured)
+    }
+    else {
+        foreach ($candidate in @(
+            (Join-Path $root "RestartCoordinator\RimWorldDevBridge.RestartCoordinator.exe"),
+            $outputPath,
+            (Join-Path $root "DevTools\RestartCoordinator\bin\Release\net472\RimWorldDevBridge.RestartCoordinator.exe"),
+            (Join-Path $PSScriptRoot "RestartCoordinator\bin\Release\net472\RimWorldDevBridge.RestartCoordinator.exe")
+        )) {
+            if (-not $candidatePaths.Contains($candidate)) { [void]$candidatePaths.Add($candidate) }
+        }
+    }
+    $expectedName = "RimWorldDevBridge.RestartCoordinator"
+    foreach ($candidate in $candidatePaths) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        $identity = Get-CoordinatorIdentity $candidate
+        if ($identity -and $identity.name -eq $expectedName) {
+            return [ordered]@{
+                status = "available"
+                available = $true
+                path = $candidate
+                relativePath = if ($candidate.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                    $candidate.Substring($root.Length).TrimStart('\', '/')
+                } else { "configured" }
+                identity = $identity
+                sourceProject = (Test-Path -LiteralPath $sourceProject -PathType Leaf)
+                buildAttempted = $false
+            }
+        }
+    }
+    if ($ensureBuild -and $layoutInfo.layout -eq "source" -and (Test-Path -LiteralPath $sourceProject -PathType Leaf)) {
+        $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+        if ($null -eq $dotnet) {
+            return [ordered]@{ status = "missing_build_tooling"; available = $false; buildAttempted = $false; sourceProject = $true }
+        }
+        try {
+            $buildOutput = & $dotnet.Source build $sourceProject -c Release --nologo "/p:DevBridgeCoordinatorOutputRoot=$(Split-Path -Parent $outputPath)" 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                return [ordered]@{ status = "build_failed"; available = $false; buildAttempted = $true; sourceProject = $true; detail = Redact-Text $buildOutput }
+            }
+        }
+        catch {
+            return [ordered]@{ status = "build_failed"; available = $false; buildAttempted = $true; sourceProject = $true; detail = Redact-Text $_.Exception.Message }
+        }
+        if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
+            $identity = Get-CoordinatorIdentity $outputPath
+            if ($identity -and $identity.name -eq $expectedName) {
+                return [ordered]@{
+                    status = "available"
+                    available = $true
+                    path = $outputPath
+                    relativePath = $outputPath.Substring($root.Length).TrimStart('\', '/')
+                    identity = $identity
+                    sourceProject = $true
+                    buildAttempted = $true
+                }
+            }
+        }
+        return [ordered]@{ status = "invalid"; available = $false; buildAttempted = $true; sourceProject = $true }
+    }
+    $status = if ($layoutInfo.layout -eq "source" -and $layoutInfo.sourceComplete) { "buildable" } else { "missing" }
+    if (-not [string]::IsNullOrWhiteSpace($configured)) { $status = "invalid" }
+    return [ordered]@{ status = $status; available = $false; buildAttempted = $false; sourceProject = Test-Path -LiteralPath $sourceProject -PathType Leaf }
+}
+
+function Invoke-Validate([string[]] $values) {
+    $config = Get-ClientConfig
+    $root = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
+    if ($null -eq $root) { throw "bridge_root_required: supply --bridge-root or RIMWORLD_DEVBRIDGE_BRIDGE_ROOT" }
+    $manifest = Read-BridgeManifest $root
+    $layoutInfo = Get-BridgeLayout $root (Get-Value $values "--layout" "auto")
+    $coordinator = Get-CoordinatorInfo $root $layoutInfo (Get-Value $values "--coordinator-path") (Has-Flag $values "--ensure-runtime-tools")
+    $packageMetadataValid = $manifest.license -eq 'MIT' -and $manifest.licenseFile -eq 'LICENSE'
+    $valid = $false
+    $reason = $null
+    if ($layoutInfo.layout -eq "package") {
+        $valid = $layoutInfo.packageComplete -and $packageMetadataValid -and $coordinator.status -eq "available"
+        if (-not $layoutInfo.packageComplete) { $reason = "package_required_file_missing" }
+        elseif (-not $packageMetadataValid) { $reason = "package_license_metadata_invalid" }
+        elseif (-not $coordinator.available) { $reason = "coordinator_invalid" }
+    }
+    elseif ($layoutInfo.layout -eq "source") {
+        $valid = $layoutInfo.sourceComplete -and $coordinator.status -ne "invalid"
+        if (-not $layoutInfo.sourceComplete) { $reason = "source_required_file_missing" }
+        elseif ($coordinator.status -eq "invalid") { $reason = "coordinator_invalid" }
+    }
+    else { $reason = "bridge_layout_unrecognized" }
+    if (-not $valid) { $script:ExitCode = 2 }
+    return [ordered]@{
+        valid = $valid
+        reason = $reason
+        layout = $layoutInfo.layout
+        bridge = $manifest.bridge
+        protocol = $manifest.protocol
+        schema = $manifest.schema
+        packageMetadataValid = $packageMetadataValid
+        requiredFiles = (Get-PackageRequiredFiles).Count
+        packageComplete = $layoutInfo.packageComplete
+        sourceComplete = $layoutInfo.sourceComplete
+        packageMissing = $layoutInfo.packageMissing
+        sourceMissing = $layoutInfo.sourceMissing
+        coordinator = $coordinator
+        runtimeToolsReady = $coordinator.available
+    }
 }
 
 function Resolve-GameExecutable([string] $explicit, $config) {
@@ -487,7 +653,285 @@ function Resolve-GameExecutable([string] $explicit, $config) {
     return $null
 }
 
+function Write-JsonAtomic([string] $path, $value) {
+    $temporary = $path + ".tmp." + [Guid]::NewGuid().ToString("N")
+    try {
+        [IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $path -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-ManagedLaunchProfile([string[]] $values, $config, [string] $userRoot) {
+    $profilePath = Get-Value $values "--launch-profile-path"
+    if ([string]::IsNullOrWhiteSpace($profilePath) -and $config) { $profilePath = [string]$config.managedTestLaunchProfilePath }
+    if ([string]::IsNullOrWhiteSpace($profilePath)) { $profilePath = Join-Path $userRoot "RimWorld-DevBridge-ManagedTestLaunch.json" }
+    $existing = if (Test-Path -LiteralPath $profilePath -PathType Leaf) { Read-JsonFile $profilePath } else { $null }
+    $explicitGame = Get-Value $values "--game-path"
+    $executable = if (-not [string]::IsNullOrWhiteSpace($explicitGame)) { Resolve-GameExecutable $explicitGame $config } elseif ($existing) { [string]$existing.executable } else { Resolve-GameExecutable $null $config }
+    if ([string]::IsNullOrWhiteSpace($executable) -or -not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw "managed_test_executable_invalid: supply --game-path" }
+    $working = Get-Value $values "--working-directory"
+    if ([string]::IsNullOrWhiteSpace($working) -and $existing) { $working = [string]$existing.workingDirectory }
+    if ([string]::IsNullOrWhiteSpace($working)) { $working = Split-Path -Parent $executable }
+    $working = Resolve-Directory $working "working_directory"
+    $arguments = Get-Value $values "--arguments"
+    if ($null -eq $arguments) { $arguments = Get-Value $values "--game-arguments" }
+    if ($null -eq $arguments -and $existing) { $arguments = [string]$existing.arguments }
+    if ($null -eq $arguments) { $arguments = "" }
+    $profileUserRoot = Get-Value $values "--profile-user-root"
+    if ([string]::IsNullOrWhiteSpace($profileUserRoot) -and $existing) { $profileUserRoot = [string]$existing.userDataRoot }
+    if ([string]::IsNullOrWhiteSpace($profileUserRoot)) { $profileUserRoot = $userRoot }
+    $profileUserRoot = Resolve-Directory $profileUserRoot "user_data_root"
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($profileUserRoot, $userRoot)) { throw "managed_test_user_root_mismatch" }
+    $modConfiguration = Get-Value $values "--mod-configuration"
+    if ([string]::IsNullOrWhiteSpace($modConfiguration) -and $existing) { $modConfiguration = [string]$existing.modConfiguration }
+    if ([string]::IsNullOrWhiteSpace($modConfiguration) -and $config) { $modConfiguration = [string]$config.managedTestModConfiguration }
+    if ([string]::IsNullOrWhiteSpace($modConfiguration)) { throw "managed_test_mod_configuration_required" }
+    $profile = [ordered]@{
+        profile = "managed-test"
+        executable = [IO.Path]::GetFullPath($executable)
+        workingDirectory = $working
+        arguments = [string]$arguments
+        userDataRoot = $profileUserRoot
+        modConfiguration = [string]$modConfiguration
+        executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+        validatedUtc = [DateTime]::UtcNow.ToString("o")
+    }
+    Write-JsonAtomic $profilePath $profile
+    $profile.profilePath = $profilePath
+    return $profile
+}
+
+function Get-SandboxAuthorizationPath([string[]] $values, $config, [string] $userRoot) {
+    $path = Get-Value $values "--sandbox-authorization-path"
+    if ([string]::IsNullOrWhiteSpace($path) -and $config) { $path = [string]$config.sandboxAuthorizationPath }
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = Join-Path $userRoot "RimWorld-DevBridge-SandboxAuthorization.json" }
+    $fullPath = [IO.Path]::GetFullPath($path)
+    $rootPrefix = [IO.Path]::GetFullPath($userRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "sandbox_authorization_path_invalid: authorization must remain under the user root"
+    }
+    return $fullPath
+}
+
+function Test-SandboxAuthorizationProfile($authorization, $profile, [string] $userRoot) {
+    if ($null -eq $authorization -or $authorization.schema -ne 1 -or
+        $authorization.policy -ne "explicit-operator-disposable-sandbox" -or
+        $authorization.scope -ne "coordinator-owned-managed-test" -or
+        $authorization.profile -ne "managed-test" -or
+        $authorization.operatorConfirmed -ne $true) { return $false }
+    $pathMatches = [StringComparer]::OrdinalIgnoreCase
+    $stringMatches = [StringComparer]::Ordinal
+    return $pathMatches.Equals([IO.Path]::GetFullPath([string]$authorization.userDataRoot), $userRoot) -and
+        $pathMatches.Equals([IO.Path]::GetFullPath([string]$authorization.executable), [IO.Path]::GetFullPath([string]$profile.executable)) -and
+        $pathMatches.Equals([IO.Path]::GetFullPath([string]$authorization.workingDirectory), [IO.Path]::GetFullPath([string]$profile.workingDirectory)) -and
+        $stringMatches.Equals([string]$authorization.arguments, [string]$profile.arguments) -and
+        $stringMatches.Equals([string]$authorization.modConfiguration, [string]$profile.modConfiguration) -and
+        $stringMatches.Equals([string]$authorization.executableSha256, [string]$profile.executableSha256)
+}
+
+function Get-SandboxAuthorization([string[]] $values, $config, [string] $userRoot, $profile) {
+    $path = Get-SandboxAuthorizationPath $values $config $userRoot
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [ordered]@{ authorized = $false; reason = "sandbox_authorization_required"; path = $path }
+    }
+    try { $authorization = Read-JsonFile $path }
+    catch { return [ordered]@{ authorized = $false; reason = "sandbox_authorization_invalid"; path = $path } }
+    try {
+        if (-not (Test-SandboxAuthorizationProfile $authorization $profile $userRoot)) {
+            return [ordered]@{ authorized = $false; reason = "sandbox_authorization_scope_mismatch"; path = $path }
+        }
+    }
+    catch { return [ordered]@{ authorized = $false; reason = "sandbox_authorization_invalid"; path = $path } }
+    return [ordered]@{
+        authorized = $true
+        reason = "sandbox_authorized"
+        path = $path
+        authorizedUtc = [string]$authorization.authorizedUtc
+        scope = [string]$authorization.scope
+    }
+}
+
+function Invoke-SandboxAuthorization([string[]] $values, [bool] $revoke = $false) {
+    $config = Get-ClientConfig
+    $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
+    $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
+    if ($null -eq $bridgeRoot -or $null -eq $userRoot) {
+        $script:ExitCode = 3
+        return New-ErrorResult "configuration_error" "bridge and user roots are required"
+    }
+    try {
+        $path = Get-SandboxAuthorizationPath $values $config $userRoot
+        if ($revoke) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+            return [ordered]@{ ok = $true; status = "REVOKED"; authorizationPersisted = $false; path = $path }
+        }
+        if (-not (Has-Flag $values "--confirm-disposable-sandbox")) {
+            $script:ExitCode = 3
+            return New-ErrorResult "operator_confirmation_required" "Run restart authorize-sandbox with --confirm-disposable-sandbox once for this managed-test sandbox."
+        }
+        $profile = Get-ManagedLaunchProfile $values $config $userRoot
+        $authorization = [ordered]@{
+            schema = 1
+            policy = "explicit-operator-disposable-sandbox"
+            scope = "coordinator-owned-managed-test"
+            operatorConfirmed = $true
+            authorizedUtc = [DateTime]::UtcNow.ToString("o")
+            profile = "managed-test"
+            executable = $profile.executable
+            executableSha256 = $profile.executableSha256
+            workingDirectory = $profile.workingDirectory
+            arguments = $profile.arguments
+            userDataRoot = $profile.userDataRoot
+            modConfiguration = $profile.modConfiguration
+        }
+        Write-JsonAtomic $path $authorization
+        $attached = Get-AttachedGameProcesses $profile.executable
+        return [ordered]@{
+            ok = $true
+            status = "AUTHORIZED"
+            authorizationPersisted = $true
+            path = $path
+            scope = $authorization.scope
+            attachedProcessDetected = $attached.Count -gt 0
+            nextAction = if ($attached.Count -gt 0) { "close the attached process before restart ensure" } else { "use restart ensure" }
+        }
+    }
+    catch {
+        $script:ExitCode = 3
+        return New-ErrorResult "configuration_error" $_.Exception.Message
+    }
+}
+
+function Require-SandboxAuthorization([string[]] $values, $config, [string] $userRoot, $profile) {
+    $authorization = Get-SandboxAuthorization $values $config $userRoot $profile
+    if (-not $authorization.authorized) {
+        $script:ExitCode = 3
+        return New-ErrorResult $authorization.reason "Run restart authorize-sandbox --confirm-disposable-sandbox once for this validated managed-test profile."
+    }
+    return $authorization
+}
+
+function Get-AttachedGameProcesses([string] $gamePath) {
+    try {
+        $processName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFullPath($gamePath))
+        if ($processName -notmatch '^RimWorldWin64(?:Steam)?$') { return @() }
+        return @(Get-Process -Name $processName -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited })
+    }
+    catch { return @() }
+}
+
+function New-RestartEnsureResult([string] $status, [bool] $requested, [bool] $performed,
+    [string] $ownership, [string] $phase, [string] $operatorAction, [string] $nextAction,
+    $details = $null) {
+    $result = [ordered]@{
+        ok = $status -eq "READY"
+        status = $status
+        restartRequested = $requested
+        restartPerformed = $performed
+        ownership = $ownership
+        ticket = $null
+        phase = $phase
+        readiness = $null
+        operatorActionRequired = -not [string]::IsNullOrWhiteSpace($operatorAction)
+        operatorAction = $operatorAction
+        nextAction = $nextAction
+        contextHandshake = $null
+    }
+    if ($details) { $result.details = $details }
+    return $result
+}
+
+function Invoke-RestartEnsure([string[]] $values) {
+    $config = Get-ClientConfig
+    $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
+    $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
+    if ($null -eq $bridgeRoot -or $null -eq $userRoot) {
+        $script:ExitCode = 3
+        return New-ErrorResult "configuration_error" "bridge and user roots are required"
+    }
+    $readiness = Get-Value $values "--readiness" "bridge"
+    if ($readiness -notin @("bridge", "game", "map")) { throw "readiness_invalid: use bridge, game, or map" }
+    $savePolicy = Get-Value $values "--save-policy" "none"
+    if ($savePolicy -notin @("none", "development-copy")) { throw "save_policy_invalid: use none or development-copy" }
+    $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
+    try {
+        $profile = Get-ManagedLaunchProfile $values $config $userRoot
+        $authorization = Get-SandboxAuthorization $values $config $userRoot $profile
+        if ($authorization.authorized -ne $true) {
+            $script:ExitCode = 3
+            $result = New-RestartEnsureResult "SANDBOX_AUTHORIZATION_REQUIRED" $false $false "unauthorized" "CONFIGURATION" `
+                "Run restart authorize-sandbox --confirm-disposable-sandbox once for this validated managed-test profile." `
+                "restart authorize-sandbox --confirm-disposable-sandbox" $authorization
+            return $result
+        }
+        $layout = Get-BridgeLayout $bridgeRoot (Get-Value $values "--layout" "auto")
+    }
+    catch {
+        $script:ExitCode = 3
+        return New-ErrorResult "configuration_error" $_.Exception.Message
+    }
+    $coordinator = Get-CoordinatorInfo $bridgeRoot $layout (Get-Value $values "--coordinator-path") $true
+    if (-not $coordinator.available) {
+        $script:ExitCode = 3
+        return New-ErrorResult ("coordinator_" + $coordinator.status) "A validated coordinator executable is required; use --ensure-runtime-tools or configure --coordinator-path."
+    }
+    $heartbeat = Invoke-Coordinator "heartbeat" $values
+    $ownership = $heartbeat.ownership
+    $attached = Get-AttachedGameProcesses $profile.executable
+    if (($ownership -and $ownership.running -and -not $ownership.owned) -or $attached.Count -gt 0) {
+        $script:ExitCode = 4
+        return New-RestartEnsureResult "USER_RESTART_REQUIRED" $false $false "attached" "USER_RESTART_REQUIRED" "Stop the manually attached RimWorld process, then rerun restart ensure." "rerun restart ensure after human restart" $heartbeat
+    }
+    $launchValues = @(
+        "--bridge-root", $bridgeRoot, "--user-root", $userRoot,
+        "--agent-id", $agent.value, "--game-path", $profile.executable,
+        "--working-directory", $profile.workingDirectory, "--arguments", $profile.arguments,
+        "--user-data-root", $profile.userDataRoot, "--mod-configuration", $profile.modConfiguration,
+        "--launch-profile", "managed-test", "--owned"
+    )
+    if ($null -eq $ownership -or -not $ownership.owned -or -not $ownership.running) {
+        Clear-LeaseState $userRoot
+        $launch = Invoke-Coordinator "launch" $launchValues
+        if (-not $launch.ok) {
+            $script:ExitCode = 4
+            return New-RestartEnsureResult "FAILED" $false $false "none" $launch.phase "Coordinator could not launch the validated profile." "inspect coordinator diagnostics" $launch
+        }
+    }
+    $requestValues = @(
+        "--bridge-root", $bridgeRoot, "--user-root", $userRoot,
+        "--agent-id", $agent.value, "--package-id", (Get-Value $values "--package-id" "Lan.RimWorldDevBridge"),
+        "--readiness", $readiness, "--save-policy", $savePolicy,
+        "--reason", (Get-Value $values "--reason" "runtime-verification"),
+        "--timeout-ms", (Get-Value $values "--timeout-ms" "120000")
+    )
+    if (Has-Flag $values "--keep-running") { $requestValues += "--keep-running" }
+    Clear-LeaseState $userRoot
+    $request = Invoke-Coordinator "request" $requestValues
+    if (-not $request.ok) {
+        $script:ExitCode = 4
+        return New-RestartEnsureResult "FAILED" $false $false "coordinator-owned" $request.phase "Coordinator rejected the restart request." "inspect restart status" $request
+    }
+    $ticket = $request.ticket
+    $waitValues = @($requestValues + @("--ticket", $ticket))
+    $wait = Invoke-Coordinator "wait" $waitValues
+    $result = New-RestartEnsureResult ([string]$wait.phase) $true ($wait.phase -eq "READY") "coordinator-owned" $wait.phase $null "restart status --ticket $ticket" $wait
+    $result.ticket = $ticket
+    $result.readiness = $readiness
+    $result.contextHandshake = if ($wait.contextHandshake) { $wait.contextHandshake } else { $null }
+    if ($wait.phase -ne "READY") { $script:ExitCode = 4 }
+    return $result
+}
+
 function Invoke-Wake([string[]] $values) {
+    if (Has-Flag $values "--start") {
+        $ensureValues = @($values)
+        if (-not ($values -contains "--readiness")) { $ensureValues += @("--readiness", "bridge") }
+        if (-not ($values -contains "--save-policy")) { $ensureValues += @("--save-policy", "none") }
+        return Invoke-RestartEnsure $ensureValues
+    }
     $config = Get-ClientConfig
     $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
     if ($null -eq $userRoot) { $script:ExitCode = 3; return New-ErrorResult "user_root_unavailable" "Supply --user-root or RIMWORLD_DEVBRIDGE_USER_ROOT." }
@@ -497,22 +941,8 @@ function Invoke-Wake([string[]] $values) {
     $status = Read-KeyFile $statusPath
     $started = $false
     if ($status["bridge"] -ne "ON" -and [string]::IsNullOrWhiteSpace($status["processId"])) {
-        if (-not (Has-Flag $values "--start")) {
-            $script:ExitCode = 3
-            return New-ErrorResult "process_not_running" "Use --start with --game-path, RIMWORLD_DEVBRIDGE_GAME_PATH, or configured gamePath."
-        }
-        $game = Resolve-GameExecutable (Get-Value $values "--game-path") $config
-        if ($null -eq $game) {
-            $script:ExitCode = 3
-            return New-ErrorResult "game_path_required" "Supply --game-path or RIMWORLD_DEVBRIDGE_GAME_PATH; no broad installation scan is performed."
-        }
-        $working = Split-Path -Parent $game
-        $gameArguments = Get-Value $values "--game-arguments" ""
-        $parameters = @{ FilePath = $game; WorkingDirectory = $working; PassThru = $true }
-        if (-not [string]::IsNullOrWhiteSpace($gameArguments)) { $parameters.ArgumentList = $gameArguments }
-        $process = Start-Process @parameters
-        $started = $true
-        $status = [ordered]@{ processId = $process.Id }
+        $script:ExitCode = 3
+        return New-ErrorResult "process_not_running" "Use restart ensure for a validated coordinator-owned managed-test launch."
     }
     if ($status["bridge"] -ne "ON") {
         [IO.File]::WriteAllText((Join-Path $userRoot "RimWorld-DevBridge-Wake.request"), "")
@@ -535,24 +965,57 @@ function Invoke-Wake([string[]] $values) {
     return $result
 }
 
-function Invoke-Coordinator([string] $operation, [string[]] $values) {
+function Stop-CoordinatorForRoot([string] $coordinatorRoot) {
+    $stopped = $false
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq 'RimWorldDevBridge.RestartCoordinator.exe' -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+                $_.CommandLine.IndexOf($coordinatorRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0
+            })
+        foreach ($item in $processes) {
+            Stop-Process -Id ([int]$item.ProcessId) -ErrorAction SilentlyContinue
+            $stopped = $true
+        }
+    } catch { return $false }
+    return $stopped
+}
+
+function Invoke-Coordinator([string] $operation, [string[]] $values, [bool] $EnsureRuntimeTools = $true) {
     $config = Get-ClientConfig
     $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
     $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
     if ($null -eq $bridgeRoot -or $null -eq $userRoot) { $script:ExitCode = 3; return New-ErrorResult "path_unavailable" }
+    $layout = Get-BridgeLayout $bridgeRoot (Get-Value $values "--layout" "auto")
+    $coordinator = Get-CoordinatorInfo $bridgeRoot $layout (Get-Value $values "--coordinator-path") $EnsureRuntimeTools
+    if (-not $coordinator.available) {
+        $script:ExitCode = 3
+        $reason = if ($coordinator.status -eq "missing_build_tooling") { "restart_coordinator_missing_build_tooling" } else { "restart_coordinator_unavailable" }
+        return New-ErrorResult $reason "coordinatorStatus=$($coordinator.status); use --ensure-runtime-tools or configure --coordinator-path"
+    }
     $coordinatorRoot = Join-Path $userRoot "RimWorld-DevBridge-Coordinator"
     [IO.Directory]::CreateDirectory($coordinatorRoot) | Out-Null
-    $candidates = @(
-        (Join-Path $bridgeRoot "RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe"),
-        (Join-Path $bridgeRoot "1.6/Assemblies/RestartCoordinator/net472/RimWorldDevBridge.RestartCoordinator.exe"),
-        (Join-Path $bridgeRoot "DevTools/RestartCoordinator/bin/Release/net472/RimWorldDevBridge.RestartCoordinator.exe"),
-        (Join-Path $PSScriptRoot "RestartCoordinator/bin/Release/net472/RimWorldDevBridge.RestartCoordinator.exe")
-    )
-    $exe = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-    if ($null -eq $exe) { $script:ExitCode = 3; return New-ErrorResult "restart_coordinator_unavailable" "Build or package the coordinator executable." }
+    $exe = $coordinator.path
     $commonArguments = @('--root', $coordinatorRoot, '--user-root', $userRoot, '--bridge-root', $bridgeRoot)
     $probeOutput = & $exe heartbeat @commonArguments --timeout-ms 250 2>&1 | Out-String
     $pipeReady = $LASTEXITCODE -eq 0
+    $probeResponse = $null
+    if ($pipeReady) { try { $probeResponse = $probeOutput.Trim() | ConvertFrom-Json } catch { $probeResponse = $null } }
+    $expectedServerIdentity = "$($coordinator.identity.name)|$($coordinator.identity.version)|$($coordinator.identity.sha256)"
+    if ($pipeReady -and ($null -eq $probeResponse -or $probeResponse.CoordinatorIdentity -ne $expectedServerIdentity)) {
+        if (-not (Stop-CoordinatorForRoot $coordinatorRoot)) {
+            $script:ExitCode = 4
+            return New-ErrorResult "restart_coordinator_stale" "A different coordinator build owns the configured coordinator root; stop it explicitly before retrying."
+        }
+        $pipeReady = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(2)
+        do {
+            Start-Sleep -Milliseconds 50
+            & $exe heartbeat @commonArguments --timeout-ms 100 2>&1 | Out-Null
+            $pipeReady = $LASTEXITCODE -eq 0
+        } while ($pipeReady -and [DateTime]::UtcNow -lt $deadline)
+    }
     if (-not $pipeReady) {
         $serverArguments = @('--serve', '--root', $coordinatorRoot, '--user-root', $userRoot, '--bridge-root', $bridgeRoot)
         $quoted = @($serverArguments | ForEach-Object {
@@ -571,7 +1034,10 @@ function Invoke-Coordinator([string] $operation, [string[]] $values) {
     $base = @($operation, "--root", $coordinatorRoot, "--user-root", $userRoot, "--bridge-root", $bridgeRoot)
     for ($index = 0; $index -lt $values.Count; $index++) {
         $value = $values[$index]
-        if ($value -eq "--bridge-root" -or $value -eq "--user-root") { $index++; continue }
+        if ($value -in @("--bridge-root", "--user-root", "--layout", "--coordinator-path", "--launch-profile-path", "--profile-user-root")) { $index++; continue }
+        if ($value -in @("--ensure-runtime-tools", "--keep-running", "--json", "--unsafe-debug", "--confirm-disposable-sandbox")) { continue }
+        if ($value -eq "--sandbox-authorization-path") { $index++; continue }
+        if ($value.StartsWith("--sandbox-authorization-path=", [StringComparison]::OrdinalIgnoreCase)) { continue }
         if ($value -like "--*" -and -not $value.Contains("=")) {
             $base += $value
             if ($index + 1 -lt $values.Count -and -not $values[$index + 1].StartsWith("--")) { $base += $values[$index + 1]; $index++ }
@@ -587,6 +1053,11 @@ function Invoke-Coordinator([string] $operation, [string[]] $values) {
         cycleId = $response.CycleId
         phase = $response.Phase
         error = $response.Error
+        coordinator = [ordered]@{ status = $coordinator.status; identity = $coordinator.identity }
+    }
+    $result.coordinator.serverIdentity = $response.CoordinatorIdentity
+    if (-not [string]::IsNullOrWhiteSpace([string]$response.OwnershipJson)) {
+        try { $result.ownership = $response.OwnershipJson | ConvertFrom-Json } catch { $result.ownership = $null }
     }
     if (-not [string]::IsNullOrWhiteSpace([string]$response.Json)) {
         try { $result.details = $response.Json | ConvertFrom-Json } catch { $result.details = Redact-Text $response.Json }
@@ -693,7 +1164,28 @@ try {
             throw "adapter_operation_invalid: use publish or reload"
         }
         "restart" {
-            if ($args.Count -lt 1) { throw "restart_operation_required: use request, status, wait, register, or launch" }
+            if ($args.Count -lt 1) { throw "restart_operation_required: use authorize-sandbox, revoke-sandbox, request, status, wait, register, launch, or ensure" }
+            if ($args[0] -eq "authorize-sandbox") { $result = Invoke-SandboxAuthorization $args; break }
+            if ($args[0] -eq "revoke-sandbox") { $result = Invoke-SandboxAuthorization $args $true; break }
+            if ($args[0] -eq "ensure") { $result = Invoke-RestartEnsure $args; break }
+            if ($args[0] -eq "launch") {
+                try {
+                    $launchRoot = Resolve-UserRoot (Get-Value $args "--user-root") $config
+                    $launchProfile = Get-ManagedLaunchProfile $args $config $launchRoot
+                    $launchAuthorization = Require-SandboxAuthorization $args $config $launchRoot $launchProfile
+                    if ($launchAuthorization.authorized -ne $true) { $result = $launchAuthorization; break }
+                    if ((Get-AttachedGameProcesses $launchProfile.executable).Count -gt 0) {
+                        $script:ExitCode = 4
+                        $result = New-ErrorResult "attached_process_user_restart_required" "The configured RimWorld process is attached; no process was claimed or stopped."
+                        break
+                    }
+                }
+                catch {
+                    $script:ExitCode = 3
+                    $result = New-ErrorResult "configuration_error" $_.Exception.Message
+                    break
+                }
+            }
             if ($args[0] -eq "request" -and [string]::IsNullOrWhiteSpace((Get-Value $args "--agent-id"))) { throw "agent_id_required: restart request" }
             if (($args[0] -eq "status" -or $args[0] -eq "wait") -and [string]::IsNullOrWhiteSpace((Get-Value $args "--ticket"))) { throw "ticket_required: restart $($args[0])" }
             $result = Invoke-Coordinator $args[0] $args

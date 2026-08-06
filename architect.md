@@ -52,9 +52,23 @@ retry coordination, and large report management. They run only when requested an
 cannot bypass the in-game authorization boundary.
 
 `DevTools/Launch-And-Test-RimWorld.ps1` is the bounded end-to-end operator tool. It
-builds only when no RimWorld process is active, launches `-quicktest` or attaches to
-an existing process, binds readiness to the observed process ID and disk manifest,
-and invokes the normal authenticated client. It only stops a process it launched.
+uses an explicit existing user root and a validated `managed-test` launch profile,
+launches through the external coordinator only when no RimWorld process is active,
+binds readiness to the observed process ID and disk manifest, and invokes the normal
+authenticated client. Attached processes are read-only and stale attached state returns
+`USER_RESTART_REQUIRED`; it only stops a coordinator-owned process it launched.
+
+The canonical client separates source/package validation from runtime readiness. `validate` reports
+layout, missing files, coordinator identity, and build-tool availability without requiring a packaged
+coordinator in a source checkout. `restart ensure` persists executable, working directory, arguments,
+user-data root, mod configuration, and validation time; it starts only a validated coordinator-owned
+profile, detects and replaces a stale coordinator serving the same coordinator root, coalesces compatible
+restart requests, and preserves `keep-running`. Coordinator ownership is not mutation authority: restart
+does not acquire a write lease, and attached/live game processes remain under human or external-orchestrator
+control. A human operator may authorize one validated managed-test profile once with
+`restart authorize-sandbox --confirm-disposable-sandbox`; that profile/hash-bound authorization persists
+under the user root for later coordinator-owned launches and can be revoked without authorizing attached
+processes or gameplay mutation.
 
 ## Selected architecture
 
