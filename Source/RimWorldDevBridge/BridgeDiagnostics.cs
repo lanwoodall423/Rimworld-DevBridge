@@ -5,8 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Security.Cryptography;
-using System.Text;
 using System.Threading;
 using HarmonyLib;
 using RimWorld;
@@ -22,133 +20,28 @@ namespace RimWorldDevBridge
         private const int MaximumScannedObjects = BridgeQuerySnapshotStore.DefaultMaximumRows;
         private static DateTime previousPerformanceUtc;
         private static int previousPerformanceTick = -1;
-        private static int lastProjectionMaxItems;
-        private static double lastProjectionMaxStepMs;
-
-        internal static int LastProjectionMaxItemsForTests => Volatile.Read(ref lastProjectionMaxItems);
-        internal static double LastProjectionMaxStepMsForTests => Volatile.Read(ref lastProjectionMaxStepMs);
+        internal static int LastProjectionMaxItemsForTests => BridgeSnapshotProjection.LastMaxItemsForTests;
+        internal static double LastProjectionMaxStepMsForTests => BridgeSnapshotProjection.LastMaxStepMsForTests;
 
         internal static void ResetProjectionMetricsForTests()
         {
-            Interlocked.Exchange(ref lastProjectionMaxItems, 0);
-            Volatile.Write(ref lastProjectionMaxStepMs, 0d);
+            BridgeSnapshotProjection.ResetMetricsForTests();
         }
         internal delegate void RegisterCommand(string name, string description, BridgeCommandMode mode,
             BridgeCostClass cost, bool requiresMap, string argumentSchema);
 
-        internal static void Register(RegisterCommand register)
-        {
-            register("PAWNS", "Stable paged pawn summaries.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor,fields");
-            register("PAWN", "Inspect one session/map-scoped pawn reference.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "[session:map:]thingId");
-            register("THINGS", "Stable paged thing summaries.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor,fields");
-            register("THING", "Inspect one session/map-scoped thing reference.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "[session:map:]thingId");
-            register("DEFS", "Stable paged definition summaries.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "kind,filter,limit,cursor,fields");
-            register("COMPONENTS", "Stable paged map, game, and world component types.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "scope,filter,limit,cursor");
-            register("COMPONENT", "Inspect bounded primitive fields on one component.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "scope:index|type-filter");
-            register("JOBS", "Stable paged active pawn jobs.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor");
-            register("DESIGNATIONS", "Stable paged map designations.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor");
-            register("SELECTED", "Inspect current selection without generic reflection.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Trivial, false, "none");
-            register("UI_STATE", "Current windows, rectangles, resolution, scale, and clipping flags.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "limit,cursor");
-            register("SELECT", "Select and focus one thing by scoped reference.", BridgeCommandMode.UiOnly,
-                BridgeCostClass.Trivial, true, "[session:map:]thingId");
-            register("JUMP", "Jump to a bounded current-map cell.", BridgeCommandMode.UiOnly,
-                BridgeCostClass.Trivial, true, "x,z");
-            register("SCREENSHOT", "Write a full-screen PNG under bridge user data.", BridgeCommandMode.UiOnly,
-                BridgeCostClass.Expensive, false, "name");
-            register("SCREENSHOT_REGION", "Write a bounded screen region PNG under bridge user data.",
-                BridgeCommandMode.UiOnly, BridgeCostClass.Expensive, false,
-                "x=<px>&y=<bottom-px>&width=<px>&height=<px>&name=<name>");
-            register("REFRESH_CELL", "Mark one map cell mesh dirty for a narrow visual refresh.",
-                BridgeCommandMode.Reversible, BridgeCostClass.Trivial, true, "x,z");
-            register("LOG_DELTA", "Stable paged RimWorld log messages.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "filter,limit,cursor");
-            register("DEF_ERRORS", "Definition/configuration errors from the bounded log queue.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "filter,limit,cursor");
-            register("PATCH_ERRORS", "Harmony/patch errors from the bounded log queue.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "filter,limit,cursor");
-            register("HARMONY_PATCHES", "Paged Harmony ownership for filtered patched methods.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Expensive, false, "filter,limit,cursor");
-            register("COMPATIBILITY_REPORT", "Loaded packages, bridge protocol, adapters, and error counts.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "none");
-            register("CAPTURE_STATE", "Write a bounded semantic game-state capture outside live memory.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Expensive, false, "name");
-            register("DIFF_STATE", "Compare two stored semantic captures.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Expensive, false, "before=<name>&after=<name>&limit=<n>");
-            register("EVENTS", "Paged bridge lifecycle and command events.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Trivial, false, "filter,limit,cursor");
-            register("PERFORMANCE", "On-demand process, GC, scheduler, and bridge-resource metrics.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "none");
-            register("BENCHMARK", "Bounded repeated current-map summary benchmark.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Expensive, true, "iterations=1..100");
-            register("SAVE_GAME", "Save the current game to an explicit development copy.",
-                BridgeCommandMode.PersistentMutation, BridgeCostClass.Expensive, false, "name");
-            register("LOAD_GAME", "Load an explicit development save and rotate the bridge session.",
-                BridgeCommandMode.PotentiallyDestructive, BridgeCostClass.Simulation, false, "name");
-        }
+        internal static void Register(RegisterCommand register) => BridgeDiagnosticCommands.Register(register);
 
-        internal static BridgeResult Execute(BridgeExecutionContext context)
-        {
-            switch (context.Request.Command)
-            {
-                case "PAWNS": return Pawns(context);
-                case "PAWN": return Pawn(context);
-                case "THINGS": return Things(context);
-                case "THING": return Thing(context);
-                case "DEFS": return Defs(context);
-                case "COMPONENTS": return Components(context);
-                case "COMPONENT": return Component(context);
-                case "JOBS": return Jobs(context);
-                case "DESIGNATIONS": return Designations(context);
-                case "SELECTED": return Selected();
-                case "UI_STATE": return UiState(context);
-                case "SELECT": return Select(context);
-                case "JUMP": return Jump(context);
-                case "SCREENSHOT": return Screenshot(context);
-                case "SCREENSHOT_REGION": return ScreenshotRegion(context);
-                case "REFRESH_CELL": return RefreshCell(context);
-                case "LOG_DELTA": return Logs(context, null);
-                case "DEF_ERRORS": return Logs(context, "def");
-                case "PATCH_ERRORS": return Logs(context, "patch");
-                case "HARMONY_PATCHES": return HarmonyPatches(context);
-                case "COMPATIBILITY_REPORT": return CompatibilityReport();
-                case "CAPTURE_STATE": return CaptureState(context);
-                case "DIFF_STATE": return context.Request.PreparedPayload as BridgeResult ??
-                    DiffState(context.Request);
-                case "EVENTS": return BridgeEventJournal.Report(context.Request);
-                case "PERFORMANCE": return Performance();
-                case "BENCHMARK": return Benchmark(context);
-                case "SAVE_GAME": return SaveGame(context.Request.Argument);
-                case "LOAD_GAME": return LoadGame(context.Request.Argument);
-                default: return null;
-            }
-        }
+        internal static BridgeResult Execute(BridgeExecutionContext context) => BridgeDiagnosticCommands.Execute(context);
 
-        internal static BridgeResult Prepare(BridgeRequest request)
-        {
-            if (request?.Command != "DIFF_STATE") return null;
-            BridgeResult result = DiffState(request);
-            if (!result.IsSuccess) return result;
-            request.PreparedPayload = result;
-            return null;
-        }
+        internal static BridgeResult Prepare(BridgeRequest request) => BridgeDiagnosticCommands.Prepare(request);
 
-        private static BridgeResult Pawns(BridgeExecutionContext context)
+        internal static BridgeResult Pawns(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            SnapshotProjectionOperation<Pawn> pending = context.Request.CooperativeState as
-                SnapshotProjectionOperation<Pawn>;
+            BridgeSnapshotProjection.Operation<Pawn> pending = context.Request.CooperativeState as
+                BridgeSnapshotProjection.Operation<Pawn>;
             if (pending != null) return pending.Step(context);
             int mapId = context.Map.uniqueID;
             IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned : null;
@@ -163,7 +56,7 @@ namespace RimWorldDevBridge
                     out snapshot, out failure)) return failure;
                 return SnapshotPage("core.pawns", context.Request, query, snapshot);
             }
-            context.Request.CooperativeState = new SnapshotProjectionOperation<Pawn>(context.Request,
+            context.Request.CooperativeState = new BridgeSnapshotProjection.Operation<Pawn>(context.Request,
                 query, mapId, available,
                 index => BridgeGameState.CurrentMap.mapPawns.AllPawnsSpawned[index],
                 () => BridgeGameState.CurrentMap?.mapPawns.AllPawnsSpawned.Count ?? 0,
@@ -172,10 +65,10 @@ namespace RimWorldDevBridge
                     Matches(query.Filter, pawn.def?.defName, pawn.LabelShortCap),
                 pawn => new BridgeQuerySnapshotRow(pawn.thingIDNumber,
                     PawnLine(pawn, context.SessionId, mapId)), "core.pawns");
-            return ((SnapshotProjectionOperation<Pawn>)context.Request.CooperativeState).Step(context);
+            return ((BridgeSnapshotProjection.Operation<Pawn>)context.Request.CooperativeState).Step(context);
         }
 
-        private static BridgeResult Pawn(BridgeExecutionContext context)
+        internal static BridgeResult Pawn(BridgeExecutionContext context)
         {
             if (!TryThingReference(context, context.Request.Argument, out int id, out BridgeResult failure)) return failure;
             Pawn pawn = context.Map.mapPawns.AllPawnsSpawned.FirstOrDefault(value => value.thingIDNumber == id);
@@ -192,12 +85,12 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Things(BridgeExecutionContext context)
+        internal static BridgeResult Things(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            SnapshotProjectionOperation<Thing> pending = context.Request.CooperativeState as
-                SnapshotProjectionOperation<Thing>;
+            BridgeSnapshotProjection.Operation<Thing> pending = context.Request.CooperativeState as
+                BridgeSnapshotProjection.Operation<Thing>;
             if (pending != null) return pending.Step(context);
             int mapId = context.Map.uniqueID;
             IReadOnlyList<Thing> all = query.SnapshotId == null ? context.Map.listerThings.AllThings : null;
@@ -212,7 +105,7 @@ namespace RimWorldDevBridge
                     out snapshot, out failure)) return failure;
                 return SnapshotPage("core.things", context.Request, query, snapshot);
             }
-            context.Request.CooperativeState = new SnapshotProjectionOperation<Thing>(context.Request,
+            context.Request.CooperativeState = new BridgeSnapshotProjection.Operation<Thing>(context.Request,
                 query, mapId, available,
                 index => BridgeGameState.CurrentMap.listerThings.AllThings[index],
                 () => BridgeGameState.CurrentMap?.listerThings.AllThings.Count ?? 0,
@@ -221,10 +114,10 @@ namespace RimWorldDevBridge
                     thing.def?.defName, thing.LabelShortCap, thing.GetType().FullName),
                 thing => new BridgeQuerySnapshotRow(thing.thingIDNumber,
                     ThingLine(thing, context.SessionId, mapId)), "core.things");
-            return ((SnapshotProjectionOperation<Thing>)context.Request.CooperativeState).Step(context);
+            return ((BridgeSnapshotProjection.Operation<Thing>)context.Request.CooperativeState).Step(context);
         }
 
-        private static BridgeResult Thing(BridgeExecutionContext context)
+        internal static BridgeResult Thing(BridgeExecutionContext context)
         {
             if (!TryThingReference(context, context.Request.Argument, out int id, out BridgeResult failure)) return failure;
             Thing thing = context.Map.listerThings.AllThings.FirstOrDefault(value => value.thingIDNumber == id);
@@ -241,7 +134,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Defs(BridgeExecutionContext context)
+        internal static BridgeResult Defs(BridgeExecutionContext context)
         {
             Dictionary<string, string> options = BridgeProtocol.ParseOptions((context.Request.Argument ?? string.Empty).Replace(';', '&'));
             string kind = (BridgeProtocol.Value(options, "kind") ?? "thing").Trim().ToLowerInvariant();
@@ -274,7 +167,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Components(BridgeExecutionContext context)
+        internal static BridgeResult Components(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -290,7 +183,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Component(BridgeExecutionContext context)
+        internal static BridgeResult Component(BridgeExecutionContext context)
         {
             string value = (context.Request.Argument ?? string.Empty).Trim();
             string[] reference = value.Split(':');
@@ -316,12 +209,12 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Jobs(BridgeExecutionContext context)
+        internal static BridgeResult Jobs(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
-            SnapshotProjectionOperation<Pawn> pending = context.Request.CooperativeState as
-                SnapshotProjectionOperation<Pawn>;
+            BridgeSnapshotProjection.Operation<Pawn> pending = context.Request.CooperativeState as
+                BridgeSnapshotProjection.Operation<Pawn>;
             if (pending != null) return pending.Step(context);
             int mapId = context.Map.uniqueID;
             IReadOnlyList<Pawn> all = query.SnapshotId == null ? context.Map.mapPawns.AllPawnsSpawned : null;
@@ -336,7 +229,7 @@ namespace RimWorldDevBridge
                     out snapshot, out failure)) return failure;
                 return SnapshotPage("core.jobs", context.Request, query, snapshot);
             }
-            context.Request.CooperativeState = new SnapshotProjectionOperation<Pawn>(context.Request,
+            context.Request.CooperativeState = new BridgeSnapshotProjection.Operation<Pawn>(context.Request,
                 query, mapId, available,
                 index => BridgeGameState.CurrentMap.mapPawns.AllPawnsSpawned[index],
                 () => BridgeGameState.CurrentMap?.mapPawns.AllPawnsSpawned.Count ?? 0,
@@ -349,10 +242,10 @@ namespace RimWorldDevBridge
                     " def:" + BridgeText.Clean(pawn.CurJobDef?.defName) +
                     " targetA:" + Target(pawn.CurJob.targetA) + " startTick:" + pawn.CurJob.startTick +
                     " playerForced:" + pawn.CurJob.playerForced), "core.jobs");
-            return ((SnapshotProjectionOperation<Pawn>)context.Request.CooperativeState).Step(context);
+            return ((BridgeSnapshotProjection.Operation<Pawn>)context.Request.CooperativeState).Step(context);
         }
 
-        private static BridgeResult Designations(BridgeExecutionContext context)
+        internal static BridgeResult Designations(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -371,7 +264,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Selected()
+        internal static BridgeResult Selected()
         {
             Thing thing = Find.Selector?.SingleSelectedThing;
             if (thing == null) return BridgeResult.Ok("core.selected").Add("selected", "none");
@@ -383,7 +276,7 @@ namespace RimWorldDevBridge
                 .Add("position", thing.Spawned ? Cell(thing.Position) : "unspawned");
         }
 
-        private static BridgeResult UiState(BridgeExecutionContext context)
+        internal static BridgeResult UiState(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -403,7 +296,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Select(BridgeExecutionContext context)
+        internal static BridgeResult Select(BridgeExecutionContext context)
         {
             if (!TryThingReference(context, context.Request.Argument, out int id, out BridgeResult failure)) return failure;
             Thing thing = context.Map.listerThings.AllThings.FirstOrDefault(item => item.thingIDNumber == id);
@@ -415,21 +308,21 @@ namespace RimWorldDevBridge
                 .WithMutation("selected and focused thing " + id);
         }
 
-        private static BridgeResult Jump(BridgeExecutionContext context)
+        internal static BridgeResult Jump(BridgeExecutionContext context)
         {
             if (!TryCell(context.Request.Argument, context.Map, out IntVec3 cell, out BridgeResult failure)) return failure;
             Find.CameraDriver.JumpToCurrentMapLoc(cell);
             return BridgeResult.Ok("core.jump").Add("cell", Cell(cell)).WithMutation("camera jump " + Cell(cell));
         }
 
-        private static BridgeResult Screenshot(BridgeExecutionContext context)
+        internal static BridgeResult Screenshot(BridgeExecutionContext context)
         {
             string name = SafeArtifactName(context.Request.Argument, "screenshot-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff")) + ".png";
             return CaptureScreenshot(new Rect(0f, 0f, Screen.width, Screen.height), Screen.width,
                 Screen.height, name, "core.screenshot");
         }
 
-        private static BridgeResult ScreenshotRegion(BridgeExecutionContext context)
+        internal static BridgeResult ScreenshotRegion(BridgeExecutionContext context)
         {
             Dictionary<string, string> options;
             try { options = BridgeProtocol.ParseOptions((context.Request.Argument ?? string.Empty).Replace(';', '&')); }
@@ -463,13 +356,13 @@ namespace RimWorldDevBridge
                 byte[] bytes = image.EncodeToPNG();
                 File.WriteAllBytes(path, bytes);
                 return BridgeResult.Ok(schema).Add("path", path).Add("bytes", bytes.Length)
-                    .Add("sha256", Sha256(bytes)).Add("width", width).Add("height", height)
+                    .Add("sha256", BridgeDiagnosticArtifacts.Sha256(bytes)).Add("width", width).Add("height", height)
                     .WithMutation("wrote screenshot artifact");
             }
             finally { UnityEngine.Object.Destroy(image); }
         }
 
-        private static BridgeResult RefreshCell(BridgeExecutionContext context)
+        internal static BridgeResult RefreshCell(BridgeExecutionContext context)
         {
             if (!TryCell(context.Request.Argument, context.Map, out IntVec3 cell, out BridgeResult failure)) return failure;
             context.Map.mapDrawer.MapMeshDirty(cell, ulong.MaxValue);
@@ -477,7 +370,7 @@ namespace RimWorldDevBridge
                 .WithMutation("marked map mesh dirty at " + Cell(cell));
         }
 
-        private static BridgeResult Logs(BridgeExecutionContext context, string category)
+        internal static BridgeResult Logs(BridgeExecutionContext context, string category)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -496,7 +389,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult HarmonyPatches(BridgeExecutionContext context)
+        internal static BridgeResult HarmonyPatches(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -517,7 +410,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult CompatibilityReport()
+        internal static BridgeResult CompatibilityReport()
         {
             int errors = (Log.Messages ?? Enumerable.Empty<LogMessage>()).Count(item => item.type == LogMessageType.Error);
             return BridgeResult.Ok("core.compatibilityReport")
@@ -526,58 +419,15 @@ namespace RimWorldDevBridge
                 .Add("loadedMods", LoadedModManager.RunningModsListForReading.Count)
                 .Add("adapterIndex", BridgeAdapterCatalog.State).Add("adapterFingerprint", BridgeAdapterCatalog.Fingerprint)
                 .Add("logErrors", errors).Add("devMode", Prefs.DevMode)
-                .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? true);
+                .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? false);
         }
 
-        private static BridgeResult CaptureState(BridgeExecutionContext context)
-        {
-            string name = SafeArtifactName(context.Request.Argument, "capture-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff"));
-            string path = BridgePaths.SafeOutputPath("Captures", name + ".state");
-            List<string> lines = BuildCapture(context);
-            byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", lines));
-            File.WriteAllBytes(path, bytes);
-            return BridgeResult.Ok("core.captureState").Add("capture", name).Add("path", path)
-                .Add("records", lines.Count).Add("bytes", bytes.Length).Add("sha256", Sha256(bytes));
-        }
+        internal static BridgeResult CaptureState(BridgeExecutionContext context) =>
+            BridgeDiagnosticArtifacts.CaptureState(context);
 
-        private static BridgeResult DiffState(BridgeRequest request)
-        {
-            Dictionary<string, string> options;
-            try { options = BridgeProtocol.ParseOptions((request.Argument ?? string.Empty).Replace(';', '&')); }
-            catch (Exception exception) { return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_diff_options", exception.Message); }
-            string beforeName = SafeArtifactName(BridgeProtocol.Value(options, "before"), null);
-            string afterName = SafeArtifactName(BridgeProtocol.Value(options, "after"), null);
-            if (beforeName == null || afterName == null)
-                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "capture_names_required");
-            string beforePath = BridgePaths.SafeOutputPath("Captures", beforeName + ".state");
-            string afterPath = BridgePaths.SafeOutputPath("Captures", afterName + ".state");
-            if (!File.Exists(beforePath) || !File.Exists(afterPath))
-                return BridgeResult.Fail(BridgeStatus.NOT_FOUND, "capture_not_found")
-                    .Add("beforeExists", File.Exists(beforePath)).Add("afterExists", File.Exists(afterPath));
-            if (new FileInfo(beforePath).Length > 8 * 1024 * 1024 || new FileInfo(afterPath).Length > 8 * 1024 * 1024)
-                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "capture_too_large");
-            Dictionary<string, string> before = CaptureDictionary(beforePath);
-            Dictionary<string, string> after = CaptureDictionary(afterPath);
-            List<string> keys = before.Keys.Union(after.Keys).OrderBy(value => value, StringComparer.Ordinal).ToList();
-            int limit = BridgeProtocol.ParseBoundedInt(BridgeProtocol.Value(options, "limit"), 100, 1, 500);
-            List<string> changes = new List<string>();
-            foreach (string key in keys)
-            {
-                before.TryGetValue(key, out string oldValue);
-                after.TryGetValue(key, out string newValue);
-                if (oldValue == newValue) continue;
-                changes.Add((oldValue == null ? "added" : newValue == null ? "removed" : "changed") +
-                    "=key:" + BridgeText.Clean(key) + " before:" + BridgeText.Clean(oldValue) +
-                    " after:" + BridgeText.Clean(newValue));
-            }
-            BridgeResult result = BridgeResult.Ok("core.stateDiff").Add("before", beforeName).Add("after", afterName)
-                .Add("changes", changes.Count);
-            foreach (string change in changes.Take(limit)) result.AddLine(change);
-            if (changes.Count > limit) { result.Status = BridgeStatus.PARTIAL; result.Truncated = true; }
-            return result;
-        }
+        internal static BridgeResult DiffState(BridgeRequest request) => BridgeDiagnosticArtifacts.DiffState(request);
 
-        private static BridgeResult Performance()
+        internal static BridgeResult Performance()
         {
             Process process = Process.GetCurrentProcess();
             try { process.Refresh(); } catch { }
@@ -625,7 +475,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Benchmark(BridgeExecutionContext context)
+        internal static BridgeResult Benchmark(BridgeExecutionContext context)
         {
             int iterations = BridgeProtocol.ParseBoundedInt((context.Request.Argument ?? string.Empty).Replace("iterations=", ""),
                 20, 1, 100);
@@ -642,7 +492,7 @@ namespace RimWorldDevBridge
                 .Add("meanMs", elapsed / iterations).Add("checksum", checksum);
         }
 
-        private static BridgeResult SaveGame(string argument)
+        internal static BridgeResult SaveGame(string argument)
         {
             string name = SafeSaveName(argument);
             if (name == null) return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_save_name");
@@ -651,7 +501,7 @@ namespace RimWorldDevBridge
             return BridgeResult.Ok("core.saveGame").Add("save", name).WithMutation("saved development copy " + name);
         }
 
-        private static BridgeResult LoadGame(string argument)
+        internal static BridgeResult LoadGame(string argument)
         {
             string name = SafeSaveName(argument);
             if (name == null) return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_save_name");
@@ -659,44 +509,6 @@ namespace RimWorldDevBridge
             if (!File.Exists(path)) return BridgeResult.Fail(BridgeStatus.NOT_FOUND, "save_not_found").Add("save", name);
             GameDataSaveLoader.CheckVersionAndLoadGame(name);
             return BridgeResult.Ok("core.loadGame").Add("save", name).WithMutation("requested load of " + name);
-        }
-
-        private static List<string> BuildCapture(BridgeExecutionContext context)
-        {
-            List<string> lines = new List<string>
-            {
-                "meta/session=" + context.SessionId,
-                "meta/tick=" + context.Tick,
-                "meta/gameVersion=" + VersionControl.CurrentVersionStringWithoutBuild,
-                "meta/adapterFingerprint=" + BridgeAdapterCatalog.Fingerprint,
-                "meta/mapCount=" + (BridgeGameState.Maps?.Count ?? 0)
-            };
-            foreach (Map map in (BridgeGameState.Maps ?? new List<Map>()).OrderBy(value => value.uniqueID))
-            {
-                context.ThrowIfCancellationRequested();
-                lines.Add("map/" + map.uniqueID + "/tile=" + map.Tile);
-                lines.Add("map/" + map.uniqueID + "/things=" + map.listerThings.AllThings.Count);
-                lines.Add("map/" + map.uniqueID + "/pawns=" + map.mapPawns.AllPawnsSpawned.Count);
-                foreach (Thing thing in map.listerThings.AllThings.OrderBy(value => value.thingIDNumber).Take(5000))
-                    lines.Add("thing/" + map.uniqueID + "/" + thing.thingIDNumber + "=" +
-                        BridgeText.Clean(thing.def?.defName) + "|" + (thing.Spawned ? Cell(thing.Position) : "unspawned") +
-                        "|stack:" + thing.stackCount + "|hp:" + (thing.def?.useHitPoints == true ? thing.HitPoints : -1));
-            }
-            foreach (LogMessage message in (Log.Messages ?? Enumerable.Empty<LogMessage>()).Where(item =>
-                item.type == LogMessageType.Error || item.type == LogMessageType.Warning).Take(200))
-                lines.Add("log/" + lines.Count + "=" + message.type + "|" + BridgeText.Clean(message.text));
-            return lines.OrderBy(value => value, StringComparer.Ordinal).ToList();
-        }
-
-        private static Dictionary<string, string> CaptureDictionary(string path)
-        {
-            Dictionary<string, string> result = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (string line in File.ReadAllLines(path))
-            {
-                int split = line.IndexOf('=');
-                if (split > 0) result[line.Substring(0, split)] = line.Substring(split + 1);
-            }
-            return result;
         }
 
         private static List<ComponentRef> ComponentRefs()
@@ -844,7 +656,7 @@ namespace RimWorldDevBridge
             return result.Warn("query snapshot was not created because the bounded scan limit was reached");
         }
 
-        private static BridgeResult SnapshotTimeLimit()
+        internal static BridgeResult SnapshotTimeLimit()
         {
             BridgeResult result = BridgeResult.Fail(BridgeStatus.PARTIAL, "snapshot_time_limit",
                 "The query snapshot exceeded the effective main-thread budget; narrow the filter.");
@@ -852,7 +664,7 @@ namespace RimWorldDevBridge
             return result.Warn("query snapshot was not created within the main-thread budget");
         }
 
-        private static BridgeResult SnapshotMemoryLimit()
+        internal static BridgeResult SnapshotMemoryLimit()
         {
             BridgeResult result = BridgeResult.Fail(BridgeStatus.BUSY, "snapshot_memory_limit",
                 "The query snapshot exceeded the configured memory bound; narrow the filter.");
@@ -860,7 +672,7 @@ namespace RimWorldDevBridge
             return result.Warn("query snapshot was not created within the memory bound");
         }
 
-        private static void AddSnapshotRow(List<BridgeQuerySnapshotRow> rows, BridgeQuerySnapshotRow row,
+        internal static void AddSnapshotRow(List<BridgeQuerySnapshotRow> rows, BridgeQuerySnapshotRow row,
             ref long estimatedBytes)
         {
             estimatedBytes += row.EstimatedBytes;
@@ -869,211 +681,14 @@ namespace RimWorldDevBridge
             rows.Add(row);
         }
 
-        private static void CheckSnapshotBudget(long start)
+        internal static void CheckSnapshotBudget(long start)
         {
             int budgetMs = BridgeRuntime.EffectiveMainThreadBudgetMs;
             if (budgetMs > 0 && BridgeTiming.Milliseconds(start) > budgetMs)
                 throw new SnapshotBudgetExceededException();
         }
 
-        private sealed class SnapshotProjectionOperation<T>
-        {
-            private readonly BridgeRequest request;
-            private readonly BridgeQuery query;
-            private readonly int mapId;
-            private readonly int sourceCount;
-            private readonly Func<int, T> sourceAt;
-            private readonly Func<int> currentCount;
-            private readonly Func<T, int> stableId;
-            private readonly Func<T, bool> matches;
-            private readonly Func<T, BridgeQuerySnapshotRow> project;
-            private readonly string schema;
-            private readonly List<BridgeQuerySnapshotRow> rows = new List<BridgeQuerySnapshotRow>();
-            private readonly List<int> sourceIds = new List<int>();
-            private readonly HashSet<int> stableIds = new HashSet<int>();
-            private int index;
-            private int validationIndex;
-            private long estimatedBytes;
-
-            internal SnapshotProjectionOperation(BridgeRequest request, BridgeQuery query, int mapId,
-                int sourceCount, Func<int, T> sourceAt, Func<int> currentCount, Func<T, int> stableId,
-                Func<T, bool> matches,
-                Func<T, BridgeQuerySnapshotRow> project, string schema)
-            {
-                this.request = request;
-                this.query = query;
-                this.mapId = mapId;
-                this.sourceCount = sourceCount;
-                this.sourceAt = sourceAt ?? throw new ArgumentNullException(nameof(sourceAt));
-                this.currentCount = currentCount ?? throw new ArgumentNullException(nameof(currentCount));
-                this.stableId = stableId ?? throw new ArgumentNullException(nameof(stableId));
-                this.matches = matches ?? throw new ArgumentNullException(nameof(matches));
-                this.project = project ?? throw new ArgumentNullException(nameof(project));
-                this.schema = schema;
-            }
-
-            internal BridgeResult Step(BridgeExecutionContext context)
-            {
-                long stepStart = Stopwatch.GetTimestamp();
-                int stepBudget = Math.Max(1, Math.Min(2, BridgeRuntime.EffectiveMainThreadBudgetMs));
-                int processed = 0;
-                try
-                {
-                    if (!StillValid(context) || currentCount() != sourceCount)
-                        return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                    while (index < sourceCount)
-                    {
-                        context.ThrowIfCancellationRequested();
-                        if (!StillValid(context) || currentCount() != sourceCount)
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        T value;
-                        try
-                        {
-                            value = sourceAt(index++);
-                        }
-                        catch (ArgumentOutOfRangeException)
-                        {
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        }
-                        catch (InvalidOperationException)
-                        {
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        }
-                    sourceIds.Add(value == null ? int.MinValue : stableId(value));
-                    if (value != null && matches(value))
-                        {
-                            BridgeQuerySnapshotRow row = project(value);
-                            if (row != null && !stableIds.Add(row.StableId))
-                                return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                            if (row != null) AddSnapshotRow(rows, row, ref estimatedBytes);
-                        }
-                        processed++;
-                    if (processed >= 32 || BridgeTiming.Milliseconds(stepStart) >= stepBudget) break;
-                    }
-                    context.ThrowIfCancellationRequested();
-                    if (index < sourceCount)
-                    {
-                        request.YieldExecution = true;
-                        return null;
-                    }
-
-                    while (validationIndex < sourceCount)
-                    {
-                        context.ThrowIfCancellationRequested();
-                        if (!StillValid(context) || currentCount() != sourceCount)
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        T value;
-                        try { value = sourceAt(validationIndex); }
-                        catch (ArgumentOutOfRangeException)
-                        {
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        }
-                        catch (InvalidOperationException)
-                        {
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        }
-                        int currentId = value == null ? int.MinValue : stableId(value);
-                        if (currentId != sourceIds[validationIndex])
-                            return Abort(context, "snapshot_source_changed", BridgeStatus.PARTIAL);
-                        validationIndex++;
-                        processed++;
-                        if (processed >= 32 || BridgeTiming.Milliseconds(stepStart) >= stepBudget) break;
-                    }
-                    if (validationIndex < sourceCount)
-                    {
-                        request.YieldExecution = true;
-                        return null;
-                    }
-
-                    CheckSnapshotBudget(stepStart);
-                    BridgeQuerySnapshot snapshot;
-                    BridgeResult failure;
-                    if (!BridgeQuerySnapshotStore.TryCreate(context.SessionId, request.Command,
-                        query.CursorScope, query.Ordering, mapId, sourceCount, false, rows,
-                        out snapshot, out failure))
-                    {
-                        request.CooperativeState = null;
-                        return failure;
-                    }
-                    if (BridgeTiming.Milliseconds(stepStart) > BridgeRuntime.EffectiveMainThreadBudgetMs)
-                    {
-                        BridgeQuerySnapshotStore.Remove(snapshot.Id);
-                        request.CooperativeState = null;
-                        return SnapshotTimeLimit();
-                    }
-                    query.SnapshotId = snapshot.Id;
-                    query.SnapshotExpiryTicks = snapshot.ExpiresUtc.Ticks;
-                    request.CooperativeState = null;
-                    return SnapshotPage(schema, request, query, snapshot);
-                }
-                catch (SnapshotMemoryExceededException)
-                {
-                    request.CooperativeState = null;
-                    return SnapshotMemoryLimit();
-                }
-                catch (SnapshotBudgetExceededException)
-                {
-                    request.CooperativeState = null;
-                    return SnapshotTimeLimit();
-                }
-                catch (OperationCanceledException)
-                {
-                    request.CooperativeState = null;
-                    throw;
-                }
-                catch (Exception exception)
-                {
-                    request.CooperativeState = null;
-                    return BridgeResult.Fail(BridgeStatus.ERROR, "snapshot_projection_failed",
-                        exception.GetBaseException().Message);
-                }
-                finally
-                {
-                    int previousItems;
-                    do
-                    {
-                        previousItems = Volatile.Read(ref lastProjectionMaxItems);
-                        if (processed <= previousItems) break;
-                    }
-                    while (Interlocked.CompareExchange(ref lastProjectionMaxItems, processed,
-                        previousItems) != previousItems);
-
-                    double elapsed = BridgeTiming.Milliseconds(stepStart);
-                    double previousStep;
-                    do
-                    {
-                        previousStep = Volatile.Read(ref lastProjectionMaxStepMs);
-                        if (elapsed <= previousStep) break;
-                    }
-                    while (Interlocked.CompareExchange(ref lastProjectionMaxStepMs, elapsed,
-                        previousStep) != previousStep);
-                }
-            }
-
-            private bool StillValid(BridgeExecutionContext context)
-            {
-                if (!string.Equals(request.SessionId, BridgeRuntime.SessionId, StringComparison.Ordinal))
-                    return false;
-                if (context.Map == null || context.Map.uniqueID != mapId)
-                    return false;
-                Map currentMap = BridgeGameState.CurrentMap;
-                return currentMap != null && currentMap.uniqueID == mapId;
-            }
-
-            private BridgeResult Abort(BridgeExecutionContext context, string code, BridgeStatus status)
-            {
-                request.CooperativeState = null;
-                BridgeResult result = BridgeResult.Fail(status, code);
-                result.Truncated = true;
-                result.Warn("snapshot construction was discarded before a cursor was issued");
-                return result;
-            }
-        }
-
-        private sealed class SnapshotBudgetExceededException : Exception { }
-        private sealed class SnapshotMemoryExceededException : Exception { }
-
-        private static BridgeResult SnapshotPage(string schema, BridgeRequest request, BridgeQuery query,
+        internal static BridgeResult SnapshotPage(string schema, BridgeRequest request, BridgeQuery query,
             BridgeQuerySnapshot snapshot)
         {
             int total = snapshot.Rows.Count;
@@ -1134,7 +749,7 @@ namespace RimWorldDevBridge
         private static bool Contains(string value, string token) => value?.IndexOf(token,
             StringComparison.OrdinalIgnoreCase) >= 0;
         private static string Reference(string session, int mapId, int id) => session + ":" + mapId + ":" + id;
-        private static string Cell(IntVec3 value) => value.x + "," + value.z;
+        internal static string Cell(IntVec3 value) => value.x + "," + value.z;
         private static string RectValue(Rect value) => value.x.ToString("0.##") + "," + value.y.ToString("0.##") +
             "," + value.width.ToString("0.##") + "," + value.height.ToString("0.##");
         private static string Target(LocalTargetInfo target) => target.HasThing ? "thing:" + target.Thing.thingIDNumber :
@@ -1143,7 +758,7 @@ namespace RimWorldDevBridge
             type == typeof(decimal) || type == typeof(IntVec3) || typeof(Def).IsAssignableFrom(type);
         private static string Simple(object value) => value is Def def ? def.defName : BridgeText.Invariant(value);
 
-        private static string SafeArtifactName(string value, string fallback)
+        internal static string SafeArtifactName(string value, string fallback)
         {
             string candidate = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
             if (candidate == null || candidate.Length > 96 || candidate.Any(character =>
@@ -1153,12 +768,6 @@ namespace RimWorldDevBridge
 
         private static string SafeSaveName(string value) => SafeArtifactName(value, null);
 
-        private static string Sha256(byte[] bytes)
-        {
-            using (SHA256 algorithm = SHA256.Create())
-                return string.Concat(algorithm.ComputeHash(bytes).Select(value => value.ToString("x2")));
-        }
-
         private sealed class ComponentRef
         {
             internal string Scope;
@@ -1167,59 +776,4 @@ namespace RimWorldDevBridge
         }
     }
 
-    internal static class BridgeEventJournal
-    {
-        private const int Limit = 512;
-        private static readonly object Gate = new object();
-        private static readonly Queue<EventRecord> Values = new Queue<EventRecord>();
-        private static long sequence;
-
-        internal static void Record(string kind, string detail)
-        {
-            lock (Gate)
-            {
-                Values.Enqueue(new EventRecord
-                {
-                    Sequence = ++sequence,
-                    Utc = DateTime.UtcNow,
-                    Kind = BridgeText.Clean(kind),
-                    Detail = BridgeText.Clean(detail)
-                });
-                while (Values.Count > Limit) Values.Dequeue();
-            }
-        }
-
-        internal static BridgeResult Report(BridgeRequest request)
-        {
-            BridgeQuery query = BridgeQuery.Parse(request.Argument, request.SessionId, request.Command,
-                out BridgeResult failure);
-            if (failure != null) return failure;
-            List<EventRecord> values;
-            lock (Gate) values = Values.Where(item => string.IsNullOrEmpty(query.Filter) ||
-                item.Kind.IndexOf(query.Filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                item.Detail.IndexOf(query.Filter, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
-            BridgeResult result = BridgeResult.Ok("core.events").Add("total", values.Count)
-                .Add("offset", query.Offset).Add("limit", query.Limit);
-            foreach (EventRecord item in values.Skip(query.Offset).Take(query.Limit))
-                result.AddLine("event=seq:" + item.Sequence + " utc:" + item.Utc.ToString("o") +
-                    " kind:" + item.Kind + " detail:" + item.Detail);
-            int next = query.Offset + query.Limit;
-            result.Add("hasMore", next < values.Count);
-            if (next < values.Count)
-            {
-                result.Truncated = true;
-                result.ContinuationCursor = BridgeCursor.Encode(request.SessionId, request.Command,
-                    query.CursorScope, next);
-            }
-            return result;
-        }
-
-        private sealed class EventRecord
-        {
-            internal long Sequence;
-            internal DateTime Utc;
-            internal string Kind;
-            internal string Detail;
-        }
-    }
 }

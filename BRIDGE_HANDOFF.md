@@ -4,9 +4,10 @@ The bridge location is installation-specific. Supply `--bridge-root`, set
 `RIMWORLD_DEVBRIDGE_BRIDGE_ROOT`, or use the bounded platform discovery performed by the canonical
 client. Do not assume a Steam or RimWorld installation path.
 
-It is a loopback-only, on-demand development bridge. Treat the connected game as a test/sandbox
-unless the user explicitly identifies it as live play. Do not infer player preferences or normal
-play patterns from bridge state.
+It is a loopback-only, on-demand development bridge. Every connected game is live and
+non-disposable by default. Only the human operator may explicitly identify the currently loaded
+game as a disposable sandbox. A client label, command name, save name, dev mode, or inference from
+bridge state never proves that a game is disposable.
 
 ## Start Every Session
 
@@ -32,7 +33,8 @@ Remote mutation is disabled by default. Every non-read command requires all of:
 
 - The bridge setting `Allow remote mutation leases (in-game confirmation still required)` enabled.
 - An explicit in-game confirmation for the currently loaded game in the visible bridge warning panel.
-- `WRITE_LEASE sandbox` or `WRITE_LEASE live-confirmed`; the context is intent, not proof that a save is disposable.
+- `WRITE_LEASE sandbox` or `WRITE_LEASE live-confirmed`; the context is client intent only, never proof
+  that the current game is disposable. Only the human operator can make that identification.
 - The returned short-lived token in `lease=<token>`.
 - A stable `idempotency=<key>` for safe retry.
 - `allowExpensive=true` for expensive or simulation commands.
@@ -42,14 +44,21 @@ revoke control. It is bound to the current session and loaded game, resets on sa
 main-menu return, bridge restart, setting disable, and explicit revocation, and clears all leases when
 revoked. No bridge client can create or restore this confirmation.
 
+Mutation audits and status use two separate server-observed identities. `gameIdentity` is a
+process-local identity for the in-memory `Verse.Game`; `saveIdentity` is a versioned SHA-256 digest
+of the loaded-save value observed from `GameInitData.gameToLoad`, or `none` for a new/unsaved game.
+The raw save value, absolute paths, usernames, and credentials are never retained or published.
+The digest is scoped to this process/session binding and is not a stable identity across processes.
+
 Use `RENEW_WRITE_LEASE` with `lease=<token>` to extend an active lease only while confirmation remains
 valid. `REVOKE_WRITE_LEASE` removes an active lease immediately and remains available as a safety
 operation. Both operations update the status file and runtime indicator.
 
-Dev mode and a client label such as `WRITE_LEASE sandbox` never authorize a write. Potentially
-destructive commands require a sandbox lease. Modes are derived transitively for batches, macros, and
-feature tests. Mutations produce a summary and a bounded audit under RimWorld user data. Stable denial
-codes are `remote_mutation_disabled`, `no_game_loaded`, `in_game_confirmation_required`,
+Dev mode and a client label such as `WRITE_LEASE sandbox` never authorize a write. Every connected
+game remains live/non-disposable unless the human operator explicitly identifies it as a disposable
+sandbox; potentially destructive commands still require a sandbox lease. Modes are derived
+transitively for batches, macros, and feature tests. Mutations produce a summary and a bounded audit
+under RimWorld user data. Stable denial codes are `remote_mutation_disabled`, `no_game_loaded`, `in_game_confirmation_required`,
 `write_lease_required`, `write_lease_invalid`, `write_lease_expired`, and
 `write_lease_agent_mismatch`.
 
@@ -75,6 +84,11 @@ threads. `BridgeTransportState` binds clients and resources to one transport gen
 workers cannot publish a newer generation. Request preparation, command execution, status/UI work,
 and every Verse/Unity read run through the owner game thread. Adapter filesystem indexing uses
 immutable main-thread-captured source records and posts status publication back to that thread.
+RimWorld can call `GameComponent.FinalizeInit` from a loading/long-event worker before owner
+adoption. That callback queues inert, sequence-bound lifecycle data and returns without touching
+the game, save, UI, settings, or filesystem. The first authoritative `Root.Update` adopts the
+owner, drains lifecycle work before dormant return, and executes finalization once; stale or
+duplicate notifications are discarded.
 
 The canonical client supports `discover`, `wake`, `read`, `context`, `describe`, `call`, `mutate`,
 `cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and `restart request|status|wait`.
@@ -98,7 +112,8 @@ Build, launch or safely attach, verify the loaded manifest, wake the bridge, and
 & ".\DevTools\Launch-And-Test-RimWorld.ps1"
 ```
 
-Run queued feature tests against a map-ready sandbox:
+Run queued feature tests only against a map-ready game that the human operator explicitly identified
+as a disposable sandbox:
 
 ```powershell
 & ".\DevTools\Launch-And-Test-RimWorld.ps1" `
@@ -128,10 +143,12 @@ Create and verify the distributable package with:
 & "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.1.0.zip"
 ```
 
-Packaging stages ten Dev Bridge-owned files: `About/About.xml`, `AGENTS.md`, `BRIDGE_HANDOFF.md`,
+Packaging stages eleven Dev Bridge-owned files: `About/About.xml`, `AGENTS.md`, `BRIDGE_HANDOFF.md`,
 `LoadFolders.xml`, `BRIDGE_MANIFEST.txt`, the 1.6 core assembly, the external `RestartCoordinator/`
 executable, `DevTools/devbridge.ps1`, its temporary `Send-RimWorldBridge.ps1` compatibility wrapper,
-and `DevTools/DEVBRIDGE_AGENT.md`. It excludes all adapters, external integration files,
+`DevTools/DEVBRIDGE_AGENT.md`, and the repository `LICENSE`. The MIT notice applies only to
+Dev Bridge-owned repository content; it does not grant rights to RimWorld, Unity, Harmony, or
+participating mod content. It excludes all adapters, external integration files,
 harness/build output, game/Unity/Harmony reference assemblies, and test scripts. The package verifier
 validates raw ZIP names before extraction, parses the canonical client, and compares the packaged core
 byte-for-byte and by SHA-256 with the built source DLL.
@@ -151,8 +168,9 @@ New queues, disabled suites, bounded completed history, retry metadata, and late
 `%USERPROFILE%\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\RimWorldDevBridge\FeatureTests`
 
 Existing `DevTools\FeatureTests\Pending` XML migrates lazily. The Dev mode action
-`RimWorld Dev Bridge > Test Features` runs locally; Codex can use `RUN_FEATURE_TESTS` with a sandbox
-lease. Suites support requirements, setup/action/assertion/cleanup phases, random seeds, tick and
+`RimWorld Dev Bridge > Test Features` runs locally; Codex can use `RUN_FEATURE_TESTS` only after the
+human operator has identified the current game as disposable and confirmed the in-game warning.
+Suites support requirements, setup/action/assertion/cleanup phases, random seeds, tick and
 time budgets, retry limits, mutation declarations, status/schema/exact/boolean/numeric/range/count/
 membership/no-exception assertions, and `BLOCKED` prerequisites. Failed suites remain pending.
 

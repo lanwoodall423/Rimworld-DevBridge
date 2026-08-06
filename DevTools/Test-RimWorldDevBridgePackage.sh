@@ -3,6 +3,7 @@ set -euo pipefail
 
 archive=${1:?usage: Test-RimWorldDevBridgePackage.sh archive.zip [source-core.dll]}
 source_core=${2:-}
+source_license=${3:-}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/rimworld-devbridge-package.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
@@ -26,7 +27,7 @@ else
     exit 1
 fi
 
-expected=$'About/About.xml\nAGENTS.md\nBRIDGE_HANDOFF.md\nBRIDGE_MANIFEST.txt\nDevTools/DEVBRIDGE_AGENT.md\nDevTools/Send-RimWorldBridge.ps1\nDevTools/devbridge.ps1\nLoadFolders.xml\n1.6/Assemblies/RimWorldDevBridge.dll\nRestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe'
+expected=$'About/About.xml\nAGENTS.md\nBRIDGE_HANDOFF.md\nBRIDGE_MANIFEST.txt\nLICENSE\nDevTools/DEVBRIDGE_AGENT.md\nDevTools/Send-RimWorldBridge.ps1\nDevTools/devbridge.ps1\nLoadFolders.xml\n1.6/Assemblies/RimWorldDevBridge.dll\nRestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe'
 entries=$("${unzip_command[@]}" -Z1 -- "$archive")
 
 while IFS= read -r entry; do
@@ -56,7 +57,7 @@ expected_sorted=$(printf '%s\n' "$expected" | LC_ALL=C sort)
 
 "${unzip_command[@]}" -q -d "$unzip_destination" "$unzip_archive"
 mapfile -t files < <(cd "$tmp" && find . -type f -printf '%P\n' | LC_ALL=C sort)
-[[ "${#files[@]}" -eq 10 ]] || { echo "unexpected extracted file count" >&2; exit 1; }
+[[ "${#files[@]}" -eq 11 ]] || { echo "unexpected extracted file count" >&2; exit 1; }
 
 core="$tmp/1.6/Assemblies/RimWorldDevBridge.dll"
 [[ -f "$core" ]] || { echo "core DLL is missing after extraction" >&2; exit 1; }
@@ -79,6 +80,8 @@ grep -Fx 'handoff=BRIDGE_HANDOFF.md' "$tmp/BRIDGE_MANIFEST.txt" >/dev/null
 grep -Fx 'client=DevTools/devbridge.ps1' "$tmp/BRIDGE_MANIFEST.txt" >/dev/null
 grep -Fx 'compatibilityWrapper=DevTools/Send-RimWorldBridge.ps1' "$tmp/BRIDGE_MANIFEST.txt" >/dev/null
 grep -Fx 'agentGuide=DevTools/DEVBRIDGE_AGENT.md' "$tmp/BRIDGE_MANIFEST.txt" >/dev/null
+grep -Fx 'license=MIT' "$tmp/BRIDGE_MANIFEST.txt" >/dev/null
+grep -Fx 'licenseFile=LICENSE' "$tmp/BRIDGE_MANIFEST.txt" >/dev/null
 [[ ! -d "$tmp/DevTools/BridgeAdapters" && ! -d "$tmp/DevTools/HotAdapters" ]] || {
     echo "adapter directory was extracted" >&2; exit 1;
 }
@@ -89,4 +92,8 @@ grep -Fx 'agentGuide=DevTools/DEVBRIDGE_AGENT.md' "$tmp/BRIDGE_MANIFEST.txt" >/d
 [[ -f "$tmp/RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe" ]] || {
     echo "restart coordinator is missing after extraction" >&2; exit 1;
 }
-echo "unixPackageVerification=PASS entries=10"
+grep -Fx 'MIT License' "$tmp/LICENSE" >/dev/null
+if [[ -n "$source_license" ]]; then
+    cmp -- "$source_license" "$tmp/LICENSE"
+fi
+echo "unixPackageVerification=PASS entries=11"

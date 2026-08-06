@@ -5,5 +5,8 @@ handoff=BRIDGE_HANDOFF.md
 client=DevTools/devbridge.ps1
 compatibilityWrapper=DevTools/Send-RimWorldBridge.ps1
 agentGuide=DevTools/DEVBRIDGE_AGENT.md
+license=MIT
+licenseFile=LICENSE
 changes=Removed dormant frame work, added authoritative lazy manifests, owner-mod BridgeAdapters discovery, immutable query snapshots, runtime safety indicator, cooperative built-in scheduling, adapter overrun diagnostics, fair agent scheduling, durable external restart coordination, and portable Dev Bridge-only release packaging
 remoteMutation=disabled-by-default; in-game-confirmation-required; client-context-is-intent-only
+mutationIdentity=game-process-local;save=server-observed-save-v1-digest-or-none;raw-save-metadata=never-published

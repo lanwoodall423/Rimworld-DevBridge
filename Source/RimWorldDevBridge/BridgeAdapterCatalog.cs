@@ -5,9 +5,6 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.Serialization;
-using System.Runtime.Serialization.Json;
-using System.Security.Cryptography;
-using System.Text;
 using System.Threading;
 using Verse;
 
@@ -61,14 +58,16 @@ namespace RimWorldDevBridge
 
         internal static void ActivateIndexing()
         {
-            CaptureLoadedSources(out List<BridgeAdapterSourceRecord> sources,
+            BridgeAdapterSourceDiscovery.Capture(Interlocked.Increment(ref sourceGeneration),
+                BridgePaths.AdapterPath, out List<BridgeAdapterSourceRecord> sources,
                 out HashSet<string> packages);
             BeginIndex(sources, packages);
         }
 
         internal static BridgeResult Reindex()
         {
-            CaptureLoadedSources(out List<BridgeAdapterSourceRecord> sources,
+            BridgeAdapterSourceDiscovery.Capture(Interlocked.Increment(ref sourceGeneration),
+                BridgePaths.AdapterPath, out List<BridgeAdapterSourceRecord> sources,
                 out HashSet<string> packages);
             bool started = BeginIndex(sources, packages);
             return BridgeResult.Ok("core.adapterReindex")
@@ -102,88 +101,6 @@ namespace RimWorldDevBridge
                 indexing = false;
                 state = "dormant";
             }
-        }
-
-        private static void CaptureLoadedSources(out List<BridgeAdapterSourceRecord> sources,
-            out HashSet<string> packages)
-        {
-            long generation = Interlocked.Increment(ref sourceGeneration);
-            List<BridgeAdapterSourceRecord> captured = new List<BridgeAdapterSourceRecord>();
-            packages = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (ModContentPack mod in LoadedModManager.RunningModsListForReading ??
-                Enumerable.Empty<ModContentPack>())
-            {
-                string packageId = mod?.PackageIdPlayerFacing;
-                if (string.IsNullOrWhiteSpace(packageId) || string.IsNullOrWhiteSpace(mod.RootDir)) continue;
-                string root;
-                try { root = Path.GetFullPath(mod.RootDir); }
-                catch { continue; }
-                packages.Add(packageId);
-                captured.Add(new BridgeAdapterSourceRecord(BridgeAdapterSourceKind.OwnerMod, packageId,
-                    ReadLoadedModVersion(mod), root, "owner:" + packageId + "/DevTools/BridgeAdapters",
-                    generation, CaptureLoadedModules(packageId, root)));
-            }
-
-            string legacyRoot = Path.GetFullPath(BridgePaths.AdapterPath);
-            captured.Add(new BridgeAdapterSourceRecord(BridgeAdapterSourceKind.LegacyDevelopment,
-                "Lan.RimWorldDevBridge", "legacy", legacyRoot, "legacy:DevTools/HotAdapters", generation,
-                Array.Empty<BridgeLoadedModuleRecord>()));
-            sources = captured
-                .GroupBy(item => item.SourceKind + "|" + item.PackageId + "|" + item.DirectoryPath,
-                    StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
-                .OrderBy(item => item.SourceKind)
-                .ThenBy(item => item.PackageId, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(item => item.DirectoryPath, StringComparer.OrdinalIgnoreCase)
-                .Take(MaximumAdapterSources)
-                .ToList();
-        }
-
-        private static string ReadLoadedModVersion(ModContentPack mod)
-        {
-            try
-            {
-                object metadata = mod.GetType().GetProperty("ModMetaData",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(mod, null);
-                object version = metadata?.GetType().GetProperty("ModVersion",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(metadata, null);
-                return string.IsNullOrWhiteSpace(version?.ToString()) ? "unknown" : version.ToString();
-            }
-            catch { return "unknown"; }
-        }
-
-        private static IReadOnlyList<BridgeLoadedModuleRecord> CaptureLoadedModules(string packageId, string root)
-        {
-            List<BridgeLoadedModuleRecord> modules = new List<BridgeLoadedModuleRecord>();
-            string prefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-                Path.DirectorySeparatorChar;
-            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                string path = LoadedAssemblyPath(assembly);
-                if (string.IsNullOrWhiteSpace(path) || !IsWithin(path, root) || !File.Exists(path)) continue;
-                try
-                {
-                    AssemblyName name = assembly.GetName();
-                    modules.Add(new BridgeLoadedModuleRecord(packageId,
-                        path.Substring(prefix.Length).Replace(Path.AltDirectorySeparatorChar,
-                            Path.DirectorySeparatorChar), path, name.FullName,
-                        assembly.ManifestModule.ModuleVersionId, new FileInfo(path).Length));
-                }
-                catch { }
-            }
-            return modules.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToList();
-        }
-
-        private static bool IsWithin(string path, string root)
-        {
-            try
-            {
-                string fullPath = Path.GetFullPath(path);
-                string fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar,
-                    Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-                return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase);
-            }
-            catch { return false; }
         }
 
         internal static BridgeCommandDescriptor Describe(string command)
@@ -272,22 +189,24 @@ namespace RimWorldDevBridge
                     string root = Path.GetFullPath(generation.Source.OwnerRootPath) + Path.DirectorySeparatorChar;
                     assemblyPath = Path.GetFullPath(Path.Combine(root,
                         generation.Manifest.moduleRelativePath.Replace('/', Path.DirectorySeparatorChar)));
-                    if (!IsWithin(assemblyPath, generation.Source.OwnerRootPath) ||
-                        !IsSafeFile(assemblyPath, generation.Source.OwnerRootPath) || !File.Exists(assemblyPath))
+                    if (!BridgeAdapterAssemblyVerification.IsWithin(assemblyPath, generation.Source.OwnerRootPath) ||
+                        !BridgeAdapterAssemblyVerification.IsSafeFile(assemblyPath, generation.Source.OwnerRootPath) ||
+                        !File.Exists(assemblyPath))
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_module_missing");
-                    string loadedOrigin = LoadedAssemblyPath(preparedAssembly);
+                    string loadedOrigin = BridgeAdapterAssemblyVerification.LoadedAssemblyPath(preparedAssembly);
                     if (!string.IsNullOrEmpty(loadedOrigin) && !string.Equals(loadedOrigin, assemblyPath,
-                        StringComparison.OrdinalIgnoreCase) && !IsPrepatcherShadowPath(loadedOrigin))
+                        StringComparison.OrdinalIgnoreCase) &&
+                        !BridgeAdapterAssemblyVerification.IsPrepatcherShadowPath(loadedOrigin))
                         return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_adapter_origin_mismatch");
                 }
                 byte[] bytes = null;
                 if (!string.IsNullOrWhiteSpace(assemblyPath))
                 {
-                    bytes = ReadAllBytesShared(assemblyPath);
+                    bytes = BridgeAdapterAssemblyVerification.ReadAllBytesShared(assemblyPath);
                     if (bytes.LongLength != generation.Manifest.assemblyBytes)
                         return FailGeneration(generation, BridgeStatus.INCOMPATIBLE,
                             "adapter_size_mismatch");
-                    string hash = Hash(bytes);
+                    string hash = BridgeAdapterAssemblyVerification.Hash(bytes);
                     if (!hash.Equals(generation.Manifest.contentHash, StringComparison.OrdinalIgnoreCase))
                         return FailGeneration(generation, BridgeStatus.INCOMPATIBLE, "adapter_hash_mismatch");
                     generation.Verification = "sha256";
@@ -313,130 +232,8 @@ namespace RimWorldDevBridge
         }
 
         internal static BridgeResult Execute(BridgeExecutionContext context)
-        {
-            AdapterGeneration generation;
-            lock (Gate)
-            {
-                generation = context.Request.PreparedAdapter as AdapterGeneration;
-                if (generation == null) generation = All.FirstOrDefault(item =>
-                    string.Equals(item.Manifest.adapterId, context.Request.PreparedAdapterId,
-                        StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(item.Manifest.generation, context.Request.PreparedAdapterGeneration,
-                        StringComparison.OrdinalIgnoreCase));
-                if (generation == null && !CommandsByName.TryGetValue(context.Request.Command, out generation)) return null;
-                if (generation.QuarantinedUntilUtc > DateTime.UtcNow)
-                    return BridgeResult.Fail(BridgeStatus.UNAVAILABLE, "adapter_circuit_open");
-            }
-            try
-            {
-                EnsureLoaded(generation);
-                long start = Stopwatch.GetTimestamp();
-                BridgeResult result;
-                bool cooperative = generation.TypedProvider is IBridgeCooperativeAdapterProvider &&
-                    string.Equals(generation.Manifest.executionContract, "cooperative-v1",
-                        StringComparison.OrdinalIgnoreCase);
-                if (cooperative)
-                {
-                    IBridgeCooperativeAdapterExecution execution = context.Request.CooperativeState as
-                        IBridgeCooperativeAdapterExecution;
-                    if (execution == null)
-                    {
-                        execution = ((IBridgeCooperativeAdapterProvider)generation.TypedProvider)
-                            .BeginCooperativeExecution(context);
-                        if (execution == null) throw new InvalidOperationException(
-                            "Cooperative adapter returned no execution state.");
-                        context.Request.CooperativeState = execution;
-                    }
-                    result = execution.Step(context);
-                    if (!execution.IsComplete)
-                    {
-                        context.Request.YieldExecution = true;
-                        return null;
-                    }
-                    context.Request.CooperativeState = null;
-                }
-                else if (generation.TypedProvider != null)
-                {
-                    result = generation.TypedProvider.Execute(context);
-                }
-                else
-                {
-                    AdapterCommandManifest command = generation.Manifest.commands.First(item =>
-                        item.name.Equals(context.Request.Command, StringComparison.OrdinalIgnoreCase));
-                    object value = generation.LegacyExecute.Invoke(null,
-                        new object[] { command.providerCommand ?? command.name,
-                            context.Request.Argument ?? string.Empty, context.Map });
-                    result = BridgeResult.FromLegacy(value as IEnumerable<string>);
-                    if (context.Request.Mode != BridgeCommandMode.PureRead &&
-                        string.Equals(result.MutationSummary, "none", StringComparison.Ordinal))
-                        result.MutationSummary = "legacy adapter command completed; no detailed mutation summary supplied";
-                    result.NonCooperativeExecution = true;
-                }
-                double elapsed = BridgeTiming.Milliseconds(start);
-                double totalElapsed = context.Request.CooperativeExecutionMs + elapsed;
-                result.ExecutionMs = totalElapsed;
-                lock (Gate)
-                {
-                    generation.InvocationCount++;
-                    generation.TotalExecutionMs += totalElapsed;
-                    generation.LastExecutionMs = totalElapsed;
-                    generation.LastStatus = result.Status;
-                    if (result.NonCooperativeExecution && totalElapsed >= LegacySeriousOverrunMs)
-                    {
-                        generation.SeriousOverruns++;
-                        generation.State = "quarantined";
-                        generation.QuarantinedUntilUtc = DateTime.UtcNow.AddMinutes(2);
-                        generation.LastFailure = "non-cooperative overrun";
-                    }
-                    if (result.IsSuccess)
-                    {
-                        if (generation.QuarantinedUntilUtc <= DateTime.UtcNow)
-                        {
-                            generation.ConsecutiveFailures = 0;
-                            generation.LastFailure = null;
-                            generation.State = "loaded";
-                        }
-                    }
-                    else
-                    {
-                        generation.FailureCount++;
-                        generation.ConsecutiveFailures++;
-                        generation.LastFailure = result.Status.ToString();
-                        if (generation.ConsecutiveFailures >= CircuitBreakFailures)
-                        {
-                            generation.State = "quarantined";
-                            generation.QuarantinedUntilUtc = DateTime.UtcNow.AddMinutes(2);
-                        }
-                    }
-                }
-                if (result.NonCooperativeExecution)
-                {
-                    result.Warn("legacy adapter execution is synchronous and non-cooperative");
-                    if (totalElapsed >= LegacySeriousOverrunMs)
-                        result.Warn("legacy adapter circuit opened after serious overrun");
-                }
-                if (elapsed >= 50d) result.Warn("slow adapter command: " + elapsed.ToString("0.###") + " ms");
-                return result;
-            }
-            catch (Exception exception)
-            {
-                Exception root = exception.GetBaseException();
-                lock (Gate)
-                {
-                    generation.InvocationCount++;
-                    generation.FailureCount++;
-                    generation.ConsecutiveFailures++;
-                    generation.LastStatus = BridgeStatus.ERROR;
-                    generation.LastFailure = root.GetType().Name + ": " + root.Message;
-                    if (generation.ConsecutiveFailures >= CircuitBreakFailures)
-                    {
-                        generation.State = "quarantined";
-                        generation.QuarantinedUntilUtc = DateTime.UtcNow.AddMinutes(2);
-                    }
-                }
-                return BridgeResult.Fail(BridgeStatus.ERROR, "adapter_failure", root.Message);
-            }
-        }
+            => BridgeAdapterExecution.Execute(context, Gate, All, CommandsByName,
+                CircuitBreakFailures, LegacySeriousOverrunMs);
 
         internal static BridgeResult Health()
         {
@@ -508,7 +305,7 @@ namespace RimWorldDevBridge
                         " owner:" + BridgeText.Clean(item.Source.PackageId) + " generation:" +
                         BridgeText.Clean(item.Manifest.generation) + " sourceKind:" + item.Source.SourceKind +
                         " sourceIdentity:" + BridgeText.Clean(item.Source.DisplayIdentity) +
-                        " fingerprint:" + FingerprintFor(item.Manifest) + " state:" + item.State +
+                        " fingerprint:" + BridgeAdapterGenerationStore.FingerprintFor(item.Manifest) + " state:" + item.State +
                         " selected:" + item.Selected + " compatible:" + item.Compatible +
                         " health:" + BridgeText.Clean(item.Reason ?? item.LastFailure ?? "none") +
                         " contract:" + (string.Equals(item.Manifest.executionContract, "cooperative-v1",
@@ -590,8 +387,9 @@ namespace RimWorldDevBridge
                     {
                         try
                         {
-                            AdapterManifest manifest = ReadManifest(path);
-                            AdapterGeneration generation = Validate(manifest, path, source, context);
+                            AdapterManifest manifest = BridgeAdapterManifestValidation.Read(path);
+                            AdapterGeneration generation = BridgeAdapterManifestValidation.Validate(manifest, path,
+                                source, context);
                             indexed.Add(generation);
                         }
                         catch (Exception exception)
@@ -605,8 +403,8 @@ namespace RimWorldDevBridge
                         .Select(item => Path.GetFileName(item.AssemblyPath)), StringComparer.OrdinalIgnoreCase);
                     ignored += dlls.Count(path => !published.Contains(Path.GetFileName(path)));
                 }
-                ResolveDuplicates(indexed, errors);
-                SelectActive(indexed, errors);
+                BridgeAdapterGenerationStore.ResolveDuplicates(indexed, errors);
+                BridgeAdapterGenerationStore.SelectActive(indexed, errors);
             }
             catch (Exception exception)
             {
@@ -616,425 +414,19 @@ namespace RimWorldDevBridge
             {
                 if (context.IndexGeneration != indexGeneration)
                     return;
-                MergeLoadedGenerations(indexed, errors);
+                BridgeAdapterGenerationStore.MergeLoadedGenerations(All, indexed, errors);
                 All.Clear();
                 All.AddRange(indexed);
-                RebuildCommandIndex(errors);
+                BridgeAdapterGenerationStore.RebuildCommandIndex(All, Active, CommandsByName, errors);
                 IndexErrors.Clear();
                 IndexErrors.AddRange(errors);
                 ignoredAssemblyCount = ignored;
                 indexMs = BridgeTiming.Milliseconds(indexStart);
-                fingerprint = ComputeFingerprint(indexed);
+                fingerprint = BridgeAdapterGenerationStore.ComputeFingerprint(indexed);
                 state = errors.Count > 0 ? "ready-with-errors" : "ready";
                 indexing = false;
             }
             if (refreshStatus) BridgeRuntime.PostToMainThread(BridgeRuntime.RefreshStatus);
-        }
-
-        private static bool IsSafeFile(string path, string root)
-        {
-            try
-            {
-                FileInfo info = new FileInfo(path);
-                if ((info.Attributes & FileAttributes.ReparsePoint) != 0) return false;
-                DirectoryInfo directory = info.Directory;
-                while (directory != null && !string.Equals(directory.FullName,
-                    Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                    StringComparison.OrdinalIgnoreCase))
-                {
-                    if ((directory.Attributes & FileAttributes.ReparsePoint) != 0) return false;
-                    directory = directory.Parent;
-                }
-                return directory != null && IsWithin(info.FullName, root);
-            }
-            catch { return false; }
-        }
-
-        private static bool IsSafeRelativePath(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value) || Path.IsPathRooted(value) || value.Contains(":") ||
-                value.IndexOf('\0') >= 0) return false;
-            string[] parts = value.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)
-                .Split(new[] { Path.DirectorySeparatorChar }, StringSplitOptions.None);
-            return parts.Length > 0 && parts.All(part => part.Length > 0 && part != "." && part != "..");
-        }
-
-        private static bool IsSafeAssemblyFileName(string value)
-        {
-            return IsSafeRelativePath(value) && value.IndexOf(Path.DirectorySeparatorChar) < 0 &&
-                value.IndexOf(Path.AltDirectorySeparatorChar) < 0 &&
-                value.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) &&
-                !value.EndsWith(".tmp.dll", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string HashFile(string path, long length)
-        {
-            if (length <= 0 || length > MaximumAdapterBytes) throw new InvalidDataException("adapter size is invalid");
-            using (SHA256 algorithm = SHA256.Create())
-            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
-            {
-                byte[] buffer = new byte[64 * 1024];
-                int read;
-                while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) algorithm.TransformBlock(buffer, 0, read, buffer, 0);
-                algorithm.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
-                return string.Concat(algorithm.Hash.Select(value => value.ToString("X2")));
-            }
-        }
-
-        private static string RelativePath(string root, string path)
-        {
-            string prefix = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-                Path.DirectorySeparatorChar;
-            return Path.GetFullPath(path).Substring(prefix.Length).Replace(Path.AltDirectorySeparatorChar,
-                Path.DirectorySeparatorChar);
-        }
-
-        private static void ResolveDuplicates(List<AdapterGeneration> indexed, List<string> errors)
-        {
-            foreach (IGrouping<string, AdapterGeneration> group in indexed.GroupBy(item =>
-                item.Manifest.adapterId + "\n" + item.Manifest.generation, StringComparer.OrdinalIgnoreCase))
-            {
-                List<AdapterGeneration> ordered = group.OrderBy(item => item.Source.SourceKind)
-                    .ThenBy(item => item.Source.PackageId, StringComparer.OrdinalIgnoreCase)
-                    .ThenBy(item => item.ManifestPath, StringComparer.OrdinalIgnoreCase).ToList();
-                List<string> bindings = ordered.Select(BindingFingerprint).Distinct(StringComparer.Ordinal).ToList();
-                if (bindings.Count > 1)
-                {
-                    foreach (AdapterGeneration item in ordered)
-                    {
-                        item.Compatible = false;
-                        item.Selected = false;
-                        item.State = "quarantined-conflict";
-                        item.Reason = "conflicting immutable generation binding";
-                    }
-                    errors.Add(group.First().Manifest.adapterId + ": generation " +
-                        group.First().Manifest.generation + " has conflicting immutable bindings");
-                    continue;
-                }
-                AdapterGeneration preferred = ordered.FirstOrDefault(item =>
-                    item.Source.SourceKind == BridgeAdapterSourceKind.OwnerMod) ?? ordered.FirstOrDefault();
-                foreach (AdapterGeneration duplicate in ordered.Where(item => item != preferred))
-                {
-                    duplicate.Compatible = false;
-                    duplicate.Selected = false;
-                    duplicate.State = preferred.Source.SourceKind == BridgeAdapterSourceKind.OwnerMod &&
-                        duplicate.Source.SourceKind == BridgeAdapterSourceKind.LegacyDevelopment
-                        ? "migration-duplicate" : "duplicate";
-                    duplicate.Reason = preferred.Source.SourceKind == BridgeAdapterSourceKind.OwnerMod &&
-                        duplicate.Source.SourceKind == BridgeAdapterSourceKind.LegacyDevelopment
-                        ? "owner copy preferred over legacy copy" : "identical generation duplicate";
-                }
-            }
-        }
-
-        private static string BindingFingerprint(AdapterGeneration item)
-        {
-            return ManifestFingerprint(item.Manifest);
-        }
-
-        private static AdapterManifest ReadManifest(string path)
-        {
-            FileInfo info = new FileInfo(path);
-            if (info.Length <= 0 || info.Length > 1024 * 1024)
-                throw new InvalidDataException("Manifest size is invalid.");
-            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
-                return (AdapterManifest)new DataContractJsonSerializer(typeof(AdapterManifest)).ReadObject(stream);
-        }
-
-        private static AdapterGeneration Validate(AdapterManifest manifest, string manifestPath,
-            BridgeAdapterSourceRecord source, IndexContext context)
-        {
-            if (manifest == null) throw new InvalidDataException("Manifest is empty.");
-            if (!IsSafeFile(manifestPath, source.DirectoryPath))
-                throw new InvalidDataException("manifest is outside its declared source or is a reparse point");
-            if (manifest.manifestVersion != 1 && manifest.manifestVersion != 2)
-                throw new InvalidDataException("Unsupported manifestVersion.");
-            RequireName(manifest.adapterId, "adapterId");
-            if (string.IsNullOrWhiteSpace(manifest.displayName)) throw new InvalidDataException("displayName is required.");
-            if (string.IsNullOrWhiteSpace(manifest.version)) throw new InvalidDataException("version is required.");
-            if (string.IsNullOrWhiteSpace(manifest.generation)) throw new InvalidDataException("generation is required.");
-            if (!DateTime.TryParse(manifest.buildUtc, null,
-                System.Globalization.DateTimeStyles.AdjustToUniversal, out DateTime buildUtc))
-                throw new InvalidDataException("buildUtc is invalid.");
-            if (manifest.protocolMin > BridgeProtocol.ProtocolVersion || manifest.protocolMax < BridgeProtocol.ProtocolVersion)
-                return NewGeneration(manifest, manifestPath, source, buildUtc, false, "protocol incompatible");
-            if (string.IsNullOrWhiteSpace(manifest.providerType)) throw new InvalidDataException("providerType is required.");
-            bool loadedAssembly = string.Equals(manifest.assemblySource, "loaded", StringComparison.OrdinalIgnoreCase);
-            if (!loadedAssembly && !string.IsNullOrEmpty(manifest.assemblySource) &&
-                !string.Equals(manifest.assemblySource, "file", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("assemblySource must be file or loaded.");
-            manifest.assemblySource = loadedAssembly ? "loaded" : "file";
-            if (!loadedAssembly && string.IsNullOrWhiteSpace(manifest.assemblyFile))
-                throw new InvalidDataException("assemblyFile is required.");
-            if (loadedAssembly && string.IsNullOrWhiteSpace(manifest.assemblyIdentity))
-                throw new InvalidDataException("assemblyIdentity is required for a loaded adapter.");
-            if (source.SourceKind == BridgeAdapterSourceKind.OwnerMod &&
-                !(manifest.requiredPackageIds ?? new List<string>()).Any(package =>
-                    string.Equals(package, source.PackageId, StringComparison.OrdinalIgnoreCase)))
-                throw new InvalidDataException("owner package must be required by the manifest");
-            if (loadedAssembly && source.SourceKind != BridgeAdapterSourceKind.OwnerMod)
-                throw new InvalidDataException("loaded adapters must be discovered from their owner mod");
-            if (loadedAssembly && !string.Equals(manifest.modulePackageId, source.PackageId,
-                StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("loaded adapter module package does not match its owner");
-            if (loadedAssembly && !IsSafeRelativePath(manifest.moduleRelativePath))
-                throw new InvalidDataException("Loaded adapter module path is invalid.");
-            if (loadedAssembly && manifest.manifestVersion >= 2 && !Guid.TryParse(manifest.moduleMvid, out _))
-                throw new InvalidDataException("Loaded adapter moduleMvid is invalid.");
-            if (loadedAssembly && !(manifest.requiredPackageIds ?? new List<string>()).Any(package =>
-                string.Equals(package, manifest.modulePackageId, StringComparison.OrdinalIgnoreCase)))
-                throw new InvalidDataException("Loaded adapter module package must be required.");
-            string directory = Path.GetDirectoryName(manifestPath);
-            string assemblyPath = null;
-            if (!loadedAssembly)
-            {
-                if (!IsSafeAssemblyFileName(manifest.assemblyFile))
-                    throw new InvalidDataException("assemblyFile is unsafe.");
-                assemblyPath = Path.GetFullPath(Path.Combine(directory, manifest.assemblyFile));
-                if (!string.Equals(Path.GetFullPath(directory), Path.GetFullPath(source.DirectoryPath),
-                    StringComparison.OrdinalIgnoreCase) || !IsSafeFile(assemblyPath, source.DirectoryPath) ||
-                    !File.Exists(assemblyPath))
-                    throw new InvalidDataException("assemblyFile is missing or partial.");
-                long actualBytes = new FileInfo(assemblyPath).Length;
-                if (manifest.assemblyBytes <= 0 || manifest.assemblyBytes != actualBytes)
-                    throw new InvalidDataException("assemblyBytes does not match the published file.");
-                if (!string.Equals(HashFile(assemblyPath, actualBytes), manifest.contentHash,
-                    StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("adapter hash does not match its published file.");
-                AssemblyName assemblyName = AssemblyName.GetAssemblyName(assemblyPath);
-                if (!string.Equals(assemblyName.FullName, manifest.assemblyIdentity, StringComparison.Ordinal))
-                    throw new InvalidDataException("adapter assembly identity does not match its published file.");
-            }
-            else
-            {
-                string relative = manifest.moduleRelativePath.Replace('/', Path.DirectorySeparatorChar)
-                    .Replace('\\', Path.DirectorySeparatorChar);
-                assemblyPath = Path.GetFullPath(Path.Combine(source.OwnerRootPath, relative));
-                if (!IsWithin(assemblyPath, source.OwnerRootPath) || !IsSafeFile(assemblyPath, source.OwnerRootPath) ||
-                    !File.Exists(assemblyPath))
-                    throw new InvalidDataException("loaded adapter module is missing or escaped its owner.");
-                BridgeLoadedModuleRecord loaded = source.LoadedModules.FirstOrDefault(item =>
-                    string.Equals(item.RelativePath.Replace('/', Path.DirectorySeparatorChar), relative,
-                        StringComparison.OrdinalIgnoreCase));
-                if (loaded == null) throw new InvalidDataException("loaded adapter module is not loaded by its owner.");
-                if (!string.Equals(Path.GetFullPath(loaded.FullPath), assemblyPath, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("loaded adapter origin does not match its owner module.");
-                if (!string.Equals(loaded.AssemblyIdentity, manifest.assemblyIdentity, StringComparison.Ordinal))
-                    throw new InvalidDataException("loaded adapter assembly identity mismatch.");
-                if (manifest.manifestVersion >= 2 && loaded.ModuleMvid != Guid.Parse(manifest.moduleMvid))
-                    throw new InvalidDataException("loaded adapter MVID mismatch.");
-                long actualBytes = new FileInfo(assemblyPath).Length;
-                if (manifest.assemblyBytes <= 0 || actualBytes != manifest.assemblyBytes || actualBytes != loaded.Length)
-                    throw new InvalidDataException("loaded adapter byte length mismatch.");
-                if (!string.Equals(HashFile(assemblyPath, actualBytes), manifest.contentHash,
-                    StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("loaded adapter hash mismatch.");
-            }
-            if (string.IsNullOrWhiteSpace(manifest.contentHash) || manifest.contentHash.Length != 64)
-                throw new InvalidDataException("contentHash must be SHA-256 hex.");
-            if (manifest.commands == null || manifest.commands.Count == 0)
-                throw new InvalidDataException("commands are required.");
-            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (AdapterCommandManifest command in manifest.commands)
-            {
-                RequireName(command.name, "command name");
-                command.name = BridgeText.NormalizeCommand(command.name);
-                command.providerCommand = BridgeText.NormalizeCommand(command.providerCommand ?? command.name);
-                RequireName(command.providerCommand, "provider command name");
-                if (!names.Add(command.name)) throw new InvalidDataException("Duplicate command " + command.name + ".");
-                if (string.Equals(command.mode, "R", StringComparison.OrdinalIgnoreCase))
-                    command.mode = BridgeCommandMode.PureRead.ToString();
-                else if (string.Equals(command.mode, "W", StringComparison.OrdinalIgnoreCase))
-                    command.mode = BridgeCommandMode.PersistentMutation.ToString();
-                else if (!Enum.TryParse(command.mode, true, out BridgeCommandMode parsedMode))
-                    throw new InvalidDataException("Unknown command mode for " + command.name + ".");
-                else command.mode = parsedMode.ToString();
-                if (!Enum.TryParse(command.cost, true, out BridgeCostClass parsedCost))
-                    throw new InvalidDataException("Unknown command cost for " + command.name + ".");
-                command.cost = parsedCost.ToString();
-            }
-            string missing = (manifest.requiredPackageIds ?? new List<string>())
-                .FirstOrDefault(package => !context.LoadedPackages.Contains(package));
-            return NewGeneration(manifest, manifestPath, source, buildUtc, missing == null,
-                missing == null ? null : "missing package " + missing);
-        }
-
-        private static AdapterGeneration NewGeneration(AdapterManifest manifest, string manifestPath,
-            BridgeAdapterSourceRecord source, DateTime buildUtc, bool compatible, string reason)
-        {
-            return new AdapterGeneration
-            {
-                Manifest = manifest,
-                ManifestPath = manifestPath,
-                Source = source,
-                AssemblyPath = string.Equals(manifest.assemblySource, "loaded", StringComparison.OrdinalIgnoreCase)
-                    ? Path.GetFullPath(Path.Combine(source.OwnerRootPath,
-                        manifest.moduleRelativePath.Replace('/', Path.DirectorySeparatorChar)))
-                    : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(manifestPath), manifest.assemblyFile)),
-                BuildUtc = buildUtc,
-                Compatible = compatible,
-                Reason = reason,
-                State = compatible ? "available" : "incompatible"
-            };
-        }
-
-        private static void SelectActive(List<AdapterGeneration> indexed, List<string> errors)
-        {
-            foreach (IGrouping<string, AdapterGeneration> group in indexed.GroupBy(item => item.Manifest.adapterId,
-                StringComparer.OrdinalIgnoreCase))
-            {
-                AdapterGeneration selected = group.Where(item => item.Compatible)
-                    .OrderByDescending(item => item.BuildUtc).ThenByDescending(item => item.Manifest.generation,
-                        StringComparer.OrdinalIgnoreCase).FirstOrDefault();
-                foreach (AdapterGeneration item in group)
-                {
-                    item.Selected = item == selected;
-                    if (item == selected) item.State = "available";
-                    else if (item.Compatible) { item.State = "superseded"; item.Reason = "newer generation selected"; }
-                }
-                if (selected == null) errors.Add(group.Key + ": no compatible generation");
-            }
-        }
-
-        private static void MergeLoadedGenerations(List<AdapterGeneration> indexed, List<string> errors)
-        {
-            foreach (AdapterGeneration retained in All.Where(item => item.RetainedOnly)) indexed.Add(retained);
-            foreach (AdapterGeneration previous in All.Where(item => item.Assembly != null && !item.RetainedOnly))
-            {
-                AdapterGeneration current = indexed.FirstOrDefault(item =>
-                    item.Manifest.adapterId.Equals(previous.Manifest.adapterId, StringComparison.OrdinalIgnoreCase) &&
-                    item.Manifest.generation.Equals(previous.Manifest.generation, StringComparison.OrdinalIgnoreCase));
-                if (current != null && SameManifestBinding(current.Manifest, previous.Manifest))
-                {
-                    current.CopyRuntime(previous);
-                    if (!current.Selected) current.State = "retained-superseded";
-                }
-                else
-                {
-                    previous.Selected = false;
-                    previous.RetainedOnly = true;
-                    previous.State = "retained-superseded";
-                    previous.Reason = current == null ? "manifest generation no longer published" :
-                        "published manifest changed without a new generation";
-                    indexed.Add(previous);
-                    if (current != null)
-                    {
-                        current.Selected = false;
-                        current.Compatible = false;
-                        current.State = "incompatible";
-                        current.Reason = "generation identity was reused with a changed manifest";
-                        errors.Add(current.Manifest.adapterId + ": generation " + current.Manifest.generation +
-                            " changed after load; publish a new generation");
-                    }
-                }
-            }
-        }
-
-        private static bool SameManifestBinding(AdapterManifest current, AdapterManifest previous)
-        {
-            return string.Equals(ManifestFingerprint(current), ManifestFingerprint(previous), StringComparison.Ordinal);
-        }
-
-        private static string ManifestFingerprint(AdapterManifest manifest)
-        {
-            StringBuilder value = new StringBuilder();
-            value.Append(manifest.manifestVersion).Append('|').Append(manifest.adapterId).Append('|')
-                .Append(manifest.displayName).Append('|').Append(manifest.version).Append('|')
-                .Append(manifest.generation).Append('|').Append(manifest.buildUtc).Append('|')
-                .Append(manifest.protocolMin).Append('|').Append(manifest.protocolMax).Append('|')
-                .Append(manifest.assemblySource).Append('|').Append(manifest.assemblyFile).Append('|')
-                .Append(manifest.assemblyIdentity).Append('|').Append(manifest.modulePackageId).Append('|')
-                .Append(manifest.moduleRelativePath).Append('|').Append(manifest.moduleMvid).Append('|')
-                .Append(manifest.assemblyBytes).Append('|').Append(manifest.contentHash).Append('|')
-                .Append(manifest.providerType).Append('|').Append(manifest.executionContract).Append('|')
-                .Append(manifest.changeSummary);
-            foreach (string package in (manifest.requiredPackageIds ?? new List<string>())
-                .OrderBy(package => package, StringComparer.OrdinalIgnoreCase)) value.Append("|required:").Append(package);
-            foreach (string package in (manifest.optionalPackageIds ?? new List<string>())
-                .OrderBy(package => package, StringComparer.OrdinalIgnoreCase)) value.Append("|optional:").Append(package);
-            foreach (AdapterCommandManifest command in (manifest.commands ?? new List<AdapterCommandManifest>())
-                .OrderBy(command => command.name, StringComparer.OrdinalIgnoreCase))
-                value.Append('|').Append(command.name).Append('|').Append(command.description).Append('|')
-                    .Append(command.providerCommand).Append('|').Append(command.mode).Append('|')
-                    .Append(command.cost).Append('|').Append(command.requiresMap).Append('|')
-                    .Append(command.argumentSchema).Append('|').Append(command.resultSchema).Append('|')
-                    .Append(command.schemaVersion).Append('|').Append(command.minimumExecutionBudgetMs);
-            return value.ToString();
-        }
-
-        private static string FingerprintFor(AdapterManifest manifest)
-        {
-            using (SHA256 algorithm = SHA256.Create())
-                return string.Concat(algorithm.ComputeHash(Encoding.UTF8.GetBytes(ManifestFingerprint(manifest)))
-                    .Take(12).Select(value => value.ToString("x2")));
-        }
-
-        private static void RebuildCommandIndex(List<string> errors)
-        {
-            Active.Clear();
-            CommandsByName.Clear();
-            foreach (AdapterGeneration generation in All.Where(item => item.Selected && item.Compatible &&
-                item.State != "failed" && item.State != "quarantined")
-                .OrderBy(item => item.Manifest.adapterId, StringComparer.OrdinalIgnoreCase))
-            {
-                Active[generation.Manifest.adapterId] = generation;
-                bool collision = false;
-                foreach (AdapterCommandManifest command in generation.Manifest.commands)
-                {
-                    if (BridgeCommands.Describe(command.name) != null || CommandsByName.ContainsKey(command.name))
-                    {
-                        collision = true;
-                        errors.Add(generation.Manifest.adapterId + ": command collision " + command.name);
-                        break;
-                    }
-                }
-                if (collision)
-                {
-                    generation.State = "quarantined";
-                    generation.Reason = "command collision";
-                    Active.Remove(generation.Manifest.adapterId);
-                    continue;
-                }
-                foreach (AdapterCommandManifest command in generation.Manifest.commands)
-                    CommandsByName[command.name] = generation;
-            }
-        }
-
-        private static void EnsureLoaded(AdapterGeneration generation)
-        {
-            if (generation.Assembly != null) return;
-            lock (generation.LoadGate)
-            {
-                if (generation.Assembly != null) return;
-                byte[] bytes = generation.PreparedBytes;
-                Assembly preparedAssembly = generation.PreparedAssembly;
-                if (bytes == null && preparedAssembly == null)
-                    throw new InvalidOperationException("Adapter was not prepared off-thread.");
-                long loadStart = Stopwatch.GetTimestamp();
-                Assembly assembly = preparedAssembly ?? Assembly.Load(bytes);
-                if (!string.IsNullOrWhiteSpace(generation.Manifest.assemblyIdentity) &&
-                    !assembly.FullName.Equals(generation.Manifest.assemblyIdentity, StringComparison.Ordinal))
-                    throw new InvalidDataException("Adapter assembly identity does not match its manifest.");
-                Type providerType = assembly.GetType(generation.Manifest.providerType, true, false);
-                if (typeof(IBridgeAdapterProvider).IsAssignableFrom(providerType))
-                {
-                    generation.TypedProvider = (IBridgeAdapterProvider)Activator.CreateInstance(providerType);
-                    ValidateTypedProvider(generation);
-                }
-                else
-                {
-                    generation.LegacyExecute = providerType.GetMethod("ExecuteBridgeCommand",
-                        BindingFlags.Public | BindingFlags.Static, null,
-                        new[] { typeof(string), typeof(string), typeof(Map) }, null);
-                    if (generation.LegacyExecute == null)
-                        throw new MissingMethodException(providerType.FullName, "ExecuteBridgeCommand");
-                }
-                generation.Assembly = assembly;
-                generation.PreparedBytes = null;
-                generation.PreparedAssembly = null;
-                generation.LoadMs = BridgeTiming.Milliseconds(loadStart);
-                generation.State = "loaded";
-            }
         }
 
         private static BridgeCommandDescriptor DescriptorFor(AdapterGeneration generation, string name)
@@ -1070,35 +462,6 @@ namespace RimWorldDevBridge
             request.PreparedAdapter = generation;
         }
 
-        private static void ValidateTypedProvider(AdapterGeneration generation)
-        {
-            BridgeAdapterMetadata metadata = generation.TypedProvider.Metadata ??
-                throw new InvalidDataException("Typed adapter metadata is missing.");
-            if (!string.Equals(metadata.Id, generation.Manifest.adapterId, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(metadata.Version, generation.Manifest.version, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("Typed adapter metadata does not match its manifest.");
-            if (string.Equals(generation.Manifest.executionContract, "cooperative-v1",
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                IBridgeCooperativeAdapterProvider cooperative = generation.TypedProvider as
-                    IBridgeCooperativeAdapterProvider;
-                if (cooperative == null || !string.Equals(cooperative.ExecutionContract, "cooperative-v1",
-                        StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("Manifest requests cooperative-v1 but provider does not implement it.");
-            }
-            Dictionary<string, BridgeCommandDescriptor> declared = (generation.TypedProvider.Commands ??
-                Enumerable.Empty<BridgeCommandDescriptor>()).Where(item => item != null)
-                .ToDictionary(item => BridgeText.NormalizeCommand(item.Name), StringComparer.OrdinalIgnoreCase);
-            foreach (AdapterCommandManifest command in generation.Manifest.commands)
-            {
-                if (!declared.TryGetValue(command.name, out BridgeCommandDescriptor descriptor))
-                    throw new InvalidDataException("Typed provider did not declare " + command.name + ".");
-                Enum.TryParse(command.mode, true, out BridgeCommandMode mode);
-                if (descriptor.Mode != mode)
-                    throw new InvalidDataException("Typed provider mode differs for " + command.name + ".");
-            }
-        }
-
         private static BridgeResult FailGeneration(AdapterGeneration generation, BridgeStatus status, string code,
             string detail = null)
         {
@@ -1111,72 +474,7 @@ namespace RimWorldDevBridge
             return BridgeResult.Fail(status, code, detail);
         }
 
-        private static string ComputeFingerprint(IEnumerable<AdapterGeneration> generations)
-        {
-            string source = BridgeProtocol.CoreSchema + "|" + string.Join("|", generations
-                .Where(item => item.State == "available" || item.State == "loaded" || item.State == "prepared")
-                .OrderBy(item => item.Manifest.adapterId).Select(item => item.Manifest.adapterId + ":" +
-                    item.Manifest.version + ":" + item.Manifest.generation + ":" + item.Manifest.contentHash));
-            using (SHA256 algorithm = SHA256.Create())
-                return string.Concat(algorithm.ComputeHash(Encoding.UTF8.GetBytes(source)).Take(6)
-                    .Select(value => value.ToString("x2")));
-        }
-
-        private static string Hash(byte[] bytes)
-        {
-            using (SHA256 algorithm = SHA256.Create())
-                return string.Concat(algorithm.ComputeHash(bytes).Select(value => value.ToString("X2")));
-        }
-
-        private static byte[] ReadAllBytesShared(string path)
-        {
-            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete))
-            {
-                byte[] bytes = new byte[stream.Length];
-                int offset = 0;
-                while (offset < bytes.Length)
-                {
-                    int read = stream.Read(bytes, offset, bytes.Length - offset);
-                    if (read == 0) throw new EndOfStreamException("Adapter changed while being read.");
-                    offset += read;
-                }
-                return bytes;
-            }
-        }
-
-        private static string LoadedAssemblyPath(Assembly assembly)
-        {
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(assembly.Location)) return Path.GetFullPath(assembly.Location);
-                if (!string.IsNullOrWhiteSpace(assembly.CodeBase) && Uri.TryCreate(assembly.CodeBase,
-                    UriKind.Absolute, out Uri uri) && uri.IsFile) return Path.GetFullPath(uri.LocalPath);
-            }
-            catch { }
-            return null;
-        }
-
-        private static bool IsPrepatcherShadowPath(string path)
-        {
-            try
-            {
-                string fileName = Path.GetFileName(path);
-                string parent = Path.GetFileName(Path.GetDirectoryName(path));
-                return fileName.StartsWith("data-", StringComparison.OrdinalIgnoreCase) &&
-                    parent.Equals("Mods", StringComparison.OrdinalIgnoreCase);
-            }
-            catch { return false; }
-        }
-
-        private static void RequireName(string value, string label)
-        {
-            if (string.IsNullOrWhiteSpace(value) || value.Any(character =>
-                !char.IsLetterOrDigit(character) && character != '_' && character != '-' && character != '.'))
-                throw new InvalidDataException(label + " is invalid.");
-        }
-
-        private sealed class AdapterGeneration
+        internal sealed class AdapterGeneration
         {
             internal readonly object LoadGate = new object();
             internal AdapterManifest Manifest;

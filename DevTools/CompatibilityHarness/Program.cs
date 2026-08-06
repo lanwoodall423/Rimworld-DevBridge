@@ -27,6 +27,9 @@ internal static class Program
         Run("structured request", StructuredRequest);
         Run("agent identity isolation", AgentIdentityIsolation);
         Run("runtime boundary characterization", RuntimeBoundaryCharacterization);
+        Run("finalize init defers before owner adoption", FinalizeInitDefersBeforeOwnerAdoption);
+        Run("diagnostic command registration characterization", DiagnosticCommandRegistrationCharacterization);
+        Run("event journal concurrent access", EventJournalConcurrentAccess);
         Run("invalid timeout rejected", InvalidTimeoutRejected);
         Run("out of range timeout rejected", OutOfRangeTimeoutRejected);
         Run("malformed option rejected", MalformedOptionRejected);
@@ -55,7 +58,12 @@ internal static class Program
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
+        Run("status publication version guard", StatusPublicationVersionGuard);
         Run("remote mutation confirmation security", RemoteMutationConfirmationSecurity);
+        Run("audit projection and redaction", AuditProjectionAndRedaction);
+        Run("remote mutation settings fail closed", RemoteMutationSettingsFailClosed);
+        Run("mutation confirmation prompt stages", MutationConfirmationPromptStages);
+        Run("mutation identity boundaries", MutationIdentityBoundaries);
         Run("production pawn thing job snapshots", ProductionPawnThingJobSnapshots);
         Run("wake signal idempotence", WakeSignalIdempotence);
         Run("main thread dispatch queue", MainThreadDispatchQueue);
@@ -73,6 +81,7 @@ internal static class Program
         Run("idempotency conflict", IdempotencyConflict);
         Run("pre-execution failure not cached", PreExecutionFailureNotCached);
         Run("idempotency copy preserves bounds", IdempotencyCopyPreservesBounds);
+        Run("adapter catalog concurrent readers", AdapterCatalogConcurrentReaders);
         Run("manifest adapter lifecycle", ManifestAdapterLifecycle);
         Run("owner adapter discovery and duplicate resolution", OwnerAdapterDiscoveryAndDuplicateResolution);
         string ownerAdapters = Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_OWNER_ADAPTERS");
@@ -167,6 +176,126 @@ internal static class Program
             "shared confirmation state");
         Equal(BridgeText.Invariant(snapshot.RemoteMutationEnabled),
             FieldValue(context, "remoteMutationEnabled"), "shared mutation setting");
+    }
+
+    private static void FinalizeInitDefersBeforeOwnerAdoption()
+    {
+        int callerThread = Thread.CurrentThread.ManagedThreadId;
+        int deferredBefore = BridgeRuntime.FinalizeInitDeferredCountForTests;
+        long initialSequence = BridgeRuntime.LifecycleSequenceForTests;
+        Exception workerException = null;
+        Thread worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnFinalizeInit(); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "pre-adoption finalize worker did not finish");
+        Check(workerException == null, "pre-adoption finalize escaped an exception");
+        Check(BridgeRuntime.FinalizeInitDeferredCountForTests > deferredBefore,
+            "pre-adoption finalize was not queued");
+        Equal(0, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "pre-adoption finalize touched game state on the worker");
+
+        // Make the queued request stale before the first authoritative Root.Update. Its inert
+        // callback must be discarded while the transition callback remains sequence-aware.
+        worker = new Thread(() => BridgeRuntime.OnGameChanging(null));
+        worker.Start();
+        Check(worker.Join(5000), "pre-adoption transition worker did not finish");
+        Check(BridgeRuntime.LifecycleSequenceForTests > initialSequence,
+            "pre-adoption transition did not advance the lifecycle sequence");
+        BridgeRuntime.OnRootUpdate();
+        Equal(0, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "stale finalize callback executed");
+
+        // A current request is still deferred, then executes exactly once on the owner thread.
+        long currentSequence = BridgeRuntime.LifecycleSequenceForTests;
+        workerException = null;
+        worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnFinalizeInit(); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "current finalize worker did not finish");
+        Check(workerException == null, "current finalize escaped an exception");
+        BridgeRuntime.OnRootUpdate();
+        Equal(callerThread, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "deferred finalize executed off the owner thread");
+        Equal(currentSequence, BridgeRuntime.FinalizedLifecycleSequenceForTests,
+            "current finalize did not publish its lifecycle sequence");
+
+        int executionThread = BridgeRuntime.FinalizeInitExecutionThreadIdForTests;
+        workerException = null;
+        worker = new Thread(() =>
+        {
+            try { BridgeRuntime.OnFinalizeInit(); }
+            catch (Exception exception) { workerException = exception; }
+        });
+        worker.Start();
+        Check(worker.Join(5000), "duplicate finalize worker did not finish");
+        Check(workerException == null, "duplicate finalize escaped an exception");
+        BridgeRuntime.OnRootUpdate();
+        Equal(executionThread, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
+            "duplicate finalize ran more than once");
+    }
+
+    private static void DiagnosticCommandRegistrationCharacterization()
+    {
+        Dictionary<string, string> commands = new Dictionary<string, string>(StringComparer.Ordinal);
+        BridgeDiagnostics.Register((name, description, mode, cost, requiresMap, argumentSchema) =>
+        {
+            Check(!commands.ContainsKey(name), "duplicate diagnostic command " + name);
+            commands[name] = mode + "|" + cost + "|" + requiresMap + "|" + argumentSchema + "|" + description;
+        });
+
+        Equal(28, commands.Count, "diagnostic command count");
+        Check(commands.ContainsKey("PAWNS") && commands.ContainsKey("THINGS") &&
+            commands.ContainsKey("EVENTS") && commands.ContainsKey("LOAD_GAME"),
+            "diagnostic command set changed");
+        Check(commands["PAWNS"].StartsWith("PureRead|Normal|True|filter,limit,cursor,fields|",
+            StringComparison.Ordinal), "paged pawn descriptor changed");
+        Check(commands["SELECT"].StartsWith("UiOnly|Trivial|True|[session:map:]thingId|",
+            StringComparison.Ordinal), "selection descriptor changed");
+        Check(commands["LOAD_GAME"].StartsWith("PotentiallyDestructive|Simulation|False|name|",
+            StringComparison.Ordinal), "load descriptor changed");
+    }
+
+    private static void EventJournalConcurrentAccess()
+    {
+        int failures = 0;
+        Thread[] workers = Enumerable.Range(0, 8).Select(workerIndex => new Thread(() =>
+        {
+            try
+            {
+                for (int index = 0; index < 100; index++)
+                {
+                    BridgeEventJournal.Record("characterization-" + workerIndex,
+                        "detail-" + index + "|secret=should-be-clean");
+                    BridgeRequest request = Request("journal-" + workerIndex + "-" + index,
+                        BridgeRuntime.SessionId);
+                    request.Command = "EVENTS";
+                    request.Argument = "filter=characterization-" + workerIndex + "&limit=8";
+                    BridgeResult report = BridgeEventJournal.Report(request);
+                    Check(report.Status == BridgeStatus.OK, "concurrent event report failed");
+                }
+            }
+            catch { Interlocked.Increment(ref failures); }
+        })).ToArray();
+
+        foreach (Thread worker in workers) worker.Start();
+        foreach (Thread worker in workers) Check(worker.Join(5000), "event journal worker did not finish");
+        Equal(0, failures, "event journal concurrent access failures");
+
+        BridgeRequest finalRequest = Request("journal-final", BridgeRuntime.SessionId);
+        finalRequest.Command = "EVENTS";
+        finalRequest.Argument = "filter=characterization&limit=512";
+        BridgeResult finalReport = BridgeEventJournal.Report(finalRequest);
+        Equal(BridgeStatus.OK, finalReport.Status, "event journal final report status");
+        Check(finalReport.Lines.Count > 0 && finalReport.Lines.All(line => line.Contains("kind:characterization-")),
+            "event journal report lost concurrent records");
+        Check(finalReport.Lines.All(line => !line.Contains("|secret=should-be-clean")),
+            "event journal did not clean record delimiters");
     }
 
     private static void InvalidTimeoutRejected()
@@ -924,6 +1053,20 @@ internal static class Program
         InvokeRotateSession("event-driven-cleanup");
     }
 
+    private static void StatusPublicationVersionGuard()
+    {
+        BridgeRuntime.BridgeRuntimeStateSnapshot snapshot = BridgeRuntime.StateSnapshot;
+        int writes = BridgeRuntime.StatusWriteCountForTests;
+        BridgeStatusPublication publication = new BridgeStatusPublication(snapshot, "DORMANT", null,
+            BridgeRuntime.BootstrapMs, BridgeRuntime.HarmonyMs,
+            BridgeRuntime.FinalizeInitMs, BridgeRuntime.ActivationMs,
+            BridgeRuntime.BootstrapManagedDeltaBytes);
+        Check(!BridgeStatusPublisher.Write(publication, () => snapshot.Version + 1),
+            "stale status snapshot was accepted");
+        Equal(writes, BridgeRuntime.StatusWriteCountForTests,
+            "stale status snapshot changed write metrics");
+    }
+
     private static void RemoteMutationConfirmationSecurity()
     {
         InvokeRotateSession("mutation-security");
@@ -967,6 +1110,7 @@ internal static class Program
             auditRequest.IdempotencyKey = "audit-security-key";
             auditRequest.AuthToken = "secret-token";
             auditRequest.MutationGameIdentity = "game-audit";
+            auditRequest.MutationSaveIdentity = "save-audit";
             auditRequest.MutationGameLoaded = true;
             auditRequest.MutationSettingEnabled = true;
             auditRequest.MutationConfirmationState = "confirmed";
@@ -977,7 +1121,8 @@ internal static class Program
             Thread.Sleep(100);
             string audit = File.Exists(BridgePaths.AuditPath) ? File.ReadAllText(BridgePaths.AuditPath) : string.Empty;
             Check(audit.Contains("gameLoaded=true") && audit.Contains("confirmation=confirmed") &&
-                audit.Contains("leaseContext=sandbox"), "audit omitted server authorization state");
+                audit.Contains("leaseContext=sandbox") && audit.Contains("saveIdentity=save-audit"),
+                "audit omitted server authorization state");
             Check(!audit.Contains("secret-token"), "audit leaked a transport/lease token");
 
             Exception workerError = null;
@@ -1011,6 +1156,129 @@ internal static class Program
             BridgeRuntime.ApplyRemoteMutationSettings();
             InvokeRotateSession("mutation-security-cleanup");
         }
+    }
+
+    private static void RemoteMutationSettingsFailClosed()
+    {
+        BridgeSettings previousSettings = RimWorldDevBridgeMod.Settings;
+        try
+        {
+            RimWorldDevBridgeMod.Settings = null;
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            Check(!BridgeRuntime.StateSnapshot.RemoteMutationEnabled,
+                "unavailable settings enabled remote mutation");
+            Equal("remote_mutation_disabled",
+                FieldValue(BridgeRuntime.AcquireWriteLease("sandbox", "settings-unavailable"), "error"),
+                "unavailable settings lease error");
+
+            RimWorldDevBridgeMod.Settings = new BridgeSettings();
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            Check(!BridgeRuntime.StateSnapshot.RemoteMutationEnabled,
+                "uninitialized settings enabled remote mutation");
+            Equal("remote_mutation_disabled",
+                FieldValue(BridgeRuntime.AcquireWriteLease("sandbox", "settings-uninitialized"), "error"),
+                "uninitialized settings lease error");
+        }
+        finally
+        {
+            RimWorldDevBridgeMod.Settings = previousSettings;
+            BridgeRuntime.ApplyRemoteMutationSettings();
+            InvokeRotateSession("settings-fail-closed-cleanup");
+        }
+    }
+
+    private static void AuditProjectionAndRedaction()
+    {
+        BridgeAuthorization authorization = new BridgeAuthorization();
+        authorization.RotateSession("audit-characterization-session");
+        string marker = "audit-characterization-" + Guid.NewGuid().ToString("N");
+        BridgeRequest request = Request(marker, "audit-characterization-session");
+        request.Command = "AUDIT_PROJECTION";
+        request.Mode = BridgeCommandMode.Reversible;
+        request.IdempotencyKey = marker + "-key";
+        request.AuthToken = "secret-transport-token-" + marker;
+        request.MutationGameLoaded = true;
+        request.MutationGameIdentity = "game|identity\r\n";
+        request.MutationSaveIdentity = "save-digest";
+        request.MutationSettingEnabled = true;
+        request.MutationConfirmationState = "confirmed";
+        request.AuthorizedLeaseContext = "sandbox";
+        request.AuthorizedLeaseExpiresUtc = DateTime.UtcNow.AddMinutes(1);
+        authorization.Audit(request, BridgeResult.Ok().WithMutation("mutation|detail\r\n"));
+
+        string line = null;
+        DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+        while (DateTime.UtcNow < deadline && line == null)
+        {
+            if (File.Exists(BridgePaths.AuditPath))
+                line = File.ReadAllLines(BridgePaths.AuditPath).LastOrDefault(value => value.Contains(marker));
+            if (line == null) Thread.Sleep(10);
+        }
+        Check(line != null, "audit projection was not written");
+        Check(line.Contains("gameIdentity=game/identity  |saveIdentity=save-digest") &&
+            line.Contains("mutation=mutation/detail  ") && line.Contains("leaseContext=sandbox") &&
+            line.Contains("confirmation=confirmed"), "audit authorization projection changed");
+        Check(!line.Contains("secret-transport-token-"), "audit projection leaked a transport token");
+        Check(!line.Contains("AuthToken") && !line.Contains("lease="), "audit projection leaked secret fields");
+    }
+
+    private static void MutationConfirmationPromptStages()
+    {
+        BridgeMutationConfirmationSnapshot unconfirmed = new BridgeMutationConfirmationSnapshot(
+            true, true, false, "missing", "session-prompt", "game-prompt", null, null);
+        BridgeMutationConfirmationSnapshot confirmed = new BridgeMutationConfirmationSnapshot(
+            true, true, true, "confirmed", "session-prompt", "game-prompt", null,
+            DateTime.UtcNow);
+        BridgeMutationConfirmationPrompt prompt = new BridgeMutationConfirmationPrompt();
+        int confirmationCalls = 0;
+
+        Equal(BridgeMutationConfirmation.Warning,
+            "Remote tools may modify or destroy this game.", "confirmation warning text");
+        Check(!prompt.ConfirmSecondStage(() => BridgeResult.Ok()),
+            "confirmation callback ran before the second stage");
+        Check(prompt.BeginSecondStage(unconfirmed) && prompt.IsAwaitingSecondConfirmation,
+            "first confirmation stage did not open the second stage");
+        prompt.CancelFirstStage();
+        Check(!prompt.IsAwaitingSecondConfirmation && confirmationCalls == 0,
+            "first-stage cancellation did not remain inert");
+        Check(prompt.BeginSecondStage(unconfirmed), "second-stage dialog could not reopen");
+        prompt.CancelSecondStage();
+        Check(!prompt.IsAwaitingSecondConfirmation && confirmationCalls == 0,
+            "second-stage cancellation invoked authority");
+        Check(prompt.BeginSecondStage(unconfirmed), "second-stage dialog did not reopen");
+        Check(prompt.ConfirmSecondStage(() => { confirmationCalls++; return BridgeResult.Ok(); }),
+            "second-stage confirmation was not accepted");
+        Check(confirmationCalls == 1 && !prompt.IsAwaitingSecondConfirmation,
+            "confirmation authority was not invoked exactly once");
+        Check(!prompt.BeginSecondStage(confirmed),
+            "already confirmed state opened a second-stage dialog");
+    }
+
+    private static void MutationIdentityBoundaries()
+    {
+        Verse.Game game = (Verse.Game)FormatterServices.GetUninitializedObject(typeof(Verse.Game));
+        string gameIdentity = BridgeMutationConfirmation.IdentityFor(game);
+        Equal(null, BridgeMutationConfirmation.SaveIdentityFor(game),
+            "new game unexpectedly received a save identity");
+
+        object initData = FormatterServices.GetUninitializedObject(typeof(Verse.GameInitData));
+        SetField(initData, "gameToLoad", "Save-A.rws");
+        SetField(game, "initData", initData);
+        string saveA = BridgeMutationConfirmation.SaveIdentityFor(game);
+        Check(!string.IsNullOrWhiteSpace(saveA) && saveA != gameIdentity && !saveA.Contains("Save-A"),
+            "loaded save identity was not independent and redacted");
+
+        BridgeMutationConfirmation confirmation = new BridgeMutationConfirmation();
+        confirmation.BindCurrentGame("session-identity", game);
+        Check(confirmation.Confirm("session-identity", gameIdentity, saveA).Status == BridgeStatus.OK,
+            "loaded save confirmation failed");
+        SetField(initData, "gameToLoad", "Save-B.rws");
+        string saveB = BridgeMutationConfirmation.SaveIdentityFor(game);
+        Check(saveA != saveB && !confirmation.IsConfirmed("session-identity", gameIdentity, saveB),
+            "changing the loaded save retained confirmation");
+        confirmation.BindCurrentGame("session-identity", game);
+        Check(confirmation.Confirm("session-identity", gameIdentity, saveB).Status == BridgeStatus.OK,
+            "new loaded save could not be rebound and confirmed");
     }
 
     private static void WithTestGame(bool remoteMutationEnabled, Action action)
@@ -1529,9 +1797,12 @@ internal static class Program
             Name = request.Command, Provider = "core", ProviderVersion = BridgeProtocol.BridgeVersion,
             Mode = request.Mode, Cost = BridgeCostClass.Trivial
         };
-        MethodInfo complete = typeof(BridgeRuntime).GetMethod("CompleteScheduled",
+        FieldInfo executorField = typeof(BridgeRuntime).GetField("RequestExecutor",
             BindingFlags.Static | BindingFlags.NonPublic);
-        complete.Invoke(null, new object[] { request,
+        object executor = executorField.GetValue(null);
+        MethodInfo complete = executor.GetType().GetMethod("Complete",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        complete.Invoke(executor, new object[] { request,
             BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required") });
         Check(!auth.TryGetCompleted(request, out _), "pre-execution failure poisoned idempotency cache");
     }
@@ -1603,6 +1874,67 @@ internal static class Program
         }
         finally
         {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    private static void AdapterCatalogConcurrentReaders()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeCatalogRace-" + Guid.NewGuid().ToString("N"));
+        string adapters = Path.Combine(root, "DevTools", "HotAdapters");
+        Directory.CreateDirectory(adapters);
+        try
+        {
+            string built = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BridgeFixtureAdapter.dll");
+            if (!File.Exists(built))
+                built = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                    "..", "..", "..", "FixtureAdapter", "bin", "Release", "net472", "BridgeFixtureAdapter.dll"));
+            byte[] bytes = File.ReadAllBytes(built);
+            string command = "CATALOG_RACE_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string adapterId = "catalog-race-" + Guid.NewGuid().ToString("N");
+            WriteGeneration(adapters, bytes, AssemblyName.GetAssemblyName(built).FullName, Sha256(bytes),
+                "1", "2026-08-01T00:00:00Z", command, 1, 10, adapterId);
+            BridgePaths.Initialize(root);
+            BridgeAdapterSourceRecord source = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.LegacyDevelopment, "Lan.RimWorldDevBridge", "legacy", adapters,
+                "legacy:catalog-race", 1, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(Array.Empty<string>(), new[] { source });
+
+            List<Exception> failures = new List<Exception>();
+            object failureGate = new object();
+            Thread[] readers = Enumerable.Range(0, 8).Select(_ => new Thread(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 100; i++)
+                    {
+                        string state = BridgeAdapterCatalog.State;
+                        string fingerprint = BridgeAdapterCatalog.Fingerprint;
+                        List<BridgeCommandDescriptor> commands = BridgeAdapterCatalog.Commands.ToList();
+                        BridgeCommandDescriptor descriptor = BridgeAdapterCatalog.Describe(command);
+                        bool available = BridgeAdapterCatalog.IsAvailable(adapterId);
+                        BridgeResult health = BridgeAdapterCatalog.Health();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    lock (failureGate) failures.Add(exception);
+                }
+            })).ToArray();
+            foreach (Thread reader in readers) reader.Start();
+            for (int i = 0; i < 5; i++)
+                BridgeAdapterCatalog.IndexAsynchronouslyForTests(Array.Empty<string>(), new[] { source }, i == 0 ? 150 : 0);
+            foreach (Thread reader in readers) reader.Join();
+            DateTime waitUntil = DateTime.UtcNow.AddSeconds(5);
+            while (BridgeAdapterCatalog.Indexing && DateTime.UtcNow < waitUntil) Thread.Sleep(10);
+            Check(failures.Count == 0, "concurrent catalog reader failed: " +
+                (failures.Count == 0 ? string.Empty : failures[0].GetBaseException().Message));
+            Check(!BridgeAdapterCatalog.Indexing, "concurrent catalog index did not settle");
+            Check(BridgeAdapterCatalog.Describe(command) != null, "concurrent catalog lost active command");
+        }
+        finally
+        {
+            try { RestoreFixtureAdapterCatalog(); } catch { }
             try { Directory.Delete(root, true); } catch { }
         }
     }

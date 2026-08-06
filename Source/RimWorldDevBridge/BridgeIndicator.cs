@@ -106,6 +106,9 @@ namespace RimWorldDevBridge
     {
         private static BridgeIndicatorState state = BridgeIndicatorState.Create(false, 0, 0, null, false);
         private static BridgeIndicatorWindow window;
+        private static BridgeMutationConfirmationDialog confirmationDialog;
+        private static readonly BridgeMutationConfirmationPrompt confirmationPrompt =
+            new BridgeMutationConfirmationPrompt();
 
         internal static BridgeIndicatorState State => state;
         internal static int RefreshCountForTests => System.Threading.Volatile.Read(ref refreshCount);
@@ -135,6 +138,8 @@ namespace RimWorldDevBridge
             BridgeIndicatorState next = BridgeIndicatorState.Create(transportActive, connectedClients,
                 connectedClientLimit, session, settingVisible, confirmation);
             state = next;
+            if (next.Confirmation == null || !next.Confirmation.Visible || next.Confirmation.Confirmed)
+                CloseConfirmationDialog();
             if (!next.Visible)
             {
                 CloseWindow();
@@ -153,7 +158,28 @@ namespace RimWorldDevBridge
         internal static void Close()
         {
             state = BridgeIndicatorState.Create(false, 0, 0, null, false, null);
+            CloseConfirmationDialog();
             CloseWindow();
+        }
+
+        internal static void OpenConfirmationDialog()
+        {
+            if (confirmationDialog != null || !confirmationPrompt.BeginSecondStage(state.Confirmation)) return;
+            if (Find.WindowStack == null)
+            {
+                confirmationPrompt.CancelSecondStage();
+                return;
+            }
+            confirmationDialog = new BridgeMutationConfirmationDialog(
+                CancelConfirmationDialog,
+                ConfirmConfirmationDialog);
+            Find.WindowStack.Add(confirmationDialog);
+        }
+
+        internal static void CancelConfirmationReview()
+        {
+            confirmationPrompt.CancelFirstStage();
+            CloseConfirmationDialog();
         }
 
         private static int refreshCount;
@@ -163,6 +189,26 @@ namespace RimWorldDevBridge
             if (window == null) return;
             try { window.Close(false); } catch { }
             window = null;
+        }
+
+        private static void CancelConfirmationDialog()
+        {
+            confirmationPrompt.CancelSecondStage();
+            CloseConfirmationDialog();
+        }
+
+        private static void ConfirmConfirmationDialog()
+        {
+            confirmationPrompt.ConfirmSecondStage(() => BridgeRuntime.ConfirmMutationForCurrentGame());
+            CloseConfirmationDialog();
+        }
+
+        private static void CloseConfirmationDialog()
+        {
+            confirmationPrompt.Reset();
+            if (confirmationDialog == null) return;
+            try { confirmationDialog.Close(false); } catch { }
+            confirmationDialog = null;
         }
     }
 
@@ -186,7 +232,7 @@ namespace RimWorldDevBridge
         }
 
         public override Vector2 InitialSize => new Vector2(355f,
-            state != null && state.Confirmation != null && state.Confirmation.Visible ? 106f :
+            state != null && state.Confirmation != null && state.Confirmation.Visible ? 126f :
                 state != null && state.Mode == BridgeIndicatorMode.LiveConfirmed ? 56f : 46f);
 
         internal void SetState(BridgeIndicatorState next, int nextCorner)
@@ -214,24 +260,30 @@ namespace RimWorldDevBridge
                 state.CompactDetails(DateTime.UtcNow));
             if (state.Confirmation != null && state.Confirmation.Visible)
             {
-                Text.Font = GameFont.Small;
+                Text.Font = GameFont.Tiny;
                 GUI.color = new Color(1f, 0.88f, 0.35f);
                 Widgets.Label(new Rect(8f, 42f, inRect.width - 16f, 18f),
-                    state.Confirmation.Confirmed
-                        ? "REMOTE WRITES CONFIRMED FOR THIS GAME"
-                        : "REMOTE WRITES REQUIRE IN-GAME CONFIRMATION");
+                    BridgeMutationConfirmation.Warning);
                 Text.Font = GameFont.Tiny;
                 GUI.color = Color.white;
-                Rect buttonRect = new Rect(8f, 66f, inRect.width - 16f, 26f);
-                string button = state.Confirmation.Confirmed
-                    ? "Revoke remote mutation confirmation"
-                    : "Confirm remote mutation for this game";
-                if (Widgets.ButtonText(buttonRect, button))
+                if (state.Confirmation.Confirmed)
                 {
-                    if (state.Confirmation.Confirmed)
+                    Widgets.Label(new Rect(8f, 62f, inRect.width - 16f, 18f),
+                        "REMOTE WRITES CONFIRMED FOR THIS GAME");
+                    Rect buttonRect = new Rect(8f, 88f, inRect.width - 16f, 26f);
+                    if (Widgets.ButtonText(buttonRect, "Revoke remote mutation confirmation"))
                         BridgeRuntime.RevokeMutationConfirmation();
-                    else
-                        BridgeRuntime.ConfirmMutationForCurrentGame();
+                }
+                else
+                {
+                    Widgets.Label(new Rect(8f, 62f, inRect.width - 16f, 18f),
+                        "REMOTE WRITES REQUIRE IN-GAME CONFIRMATION");
+                    Rect reviewRect = new Rect(8f, 88f, 224f, 26f);
+                    Rect cancelRect = new Rect(240f, 88f, inRect.width - 248f, 26f);
+                    if (Widgets.ButtonText(reviewRect, "Review warning"))
+                        BridgeIndicator.OpenConfirmationDialog();
+                    if (Widgets.ButtonText(cancelRect, "Cancel"))
+                        BridgeIndicator.CancelConfirmationReview();
                 }
             }
             TooltipHandler.TipRegion(new Rect(0f, 0f, inRect.width, inRect.height),

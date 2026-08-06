@@ -62,7 +62,11 @@ and invokes the normal authenticated client. It only stops a process it launched
    - The mod constructor records paths, installs one explicit game-change patch and
      one lightweight `Root.Update` signal/drain hook, creates one save-data wake
      watcher, registers process shutdown, and writes a fixed dormant status.
-     `GameComponent.FinalizeInit` supplies game readiness.
+      `GameComponent.FinalizeInit` supplies game readiness. RimWorld may invoke
+      this callback from a loading/long-event worker before the authoritative
+      Unity thread has been observed; the callback therefore queues inert
+      lifecycle data only. `Root.Update` is the sole owner-adoption point and
+      drains that lifecycle queue before inactive-mode return.
    - Dormant mode performs no provider scan, adapter load, macro/test parse,
      fingerprint, map scan, timer, or TCP work; the permanent update hook only
      checks coalesced file signals and returns.
@@ -104,7 +108,27 @@ and invokes the normal authenticated client. It only stops a process it launched
 - `BridgeRuntime` owns lifecycle, session and transport-generation invalidation,
   the main-thread boundary, shared state publication, status files, and the
   coordinator-facing lifecycle hooks. It is deliberately the composition root,
-  not a second command or adapter implementation.
+  not a second command or adapter implementation. Its lifecycle transition
+  sequence, owner adoption, session rotation, and transport-generation checks
+  remain in this root so no extracted service can publish stale game state.
+- `BridgeLifecycleDispatch` owns deferred `FinalizeInit` delivery, while
+  `BridgeLeaseExpiryScheduler` owns timer-to-owner-thread handoff. Both carry
+  only immutable sequence/session/generation data across the worker boundary;
+  `BridgeRuntime.CompleteFinalizeInit` and the lease callback retain the
+  authoritative rechecks.
+- `BridgeFileActivation` owns the dormant watcher and coalesced wake/input
+  signals. `BridgeLegacyFileProtocol` owns bounded file request parsing,
+  preparation, enqueueing, and atomic response writing. Neither component
+  reads Verse state off-thread.
+- `BridgeRequestPreparation` owns the worker-to-owner preparation handoff and
+  deadline/cancellation checks. `BridgeScheduledRequestExecutor` owns the
+  second authorization, execution, stale-transport, cooperative-yield, audit,
+  and completion boundary. Authentication, lease invalidation, and session
+  rotation remain owned by `BridgeAuthorization` and `BridgeRuntime`.
+- `BridgeStatusPublisher` owns status serialization, consistency checks, status
+  locking, file metrics, and atomic publication. `BridgeFileOperations` owns
+  safe deletion and atomic UTF-8 writes. `BridgeRuntime` supplies snapshots and
+  decides when a publication is valid.
 - `BridgeTransportServer` owns only sockets and worker-side protocol handling.
   It may parse bounded bytes, authenticate, enqueue, wait, and close clients.
   It must never read `Current`, `Find`, `LoadedModManager`, maps, UI, Unity, or
@@ -119,16 +143,54 @@ and invokes the normal authenticated client. It only stops a process it launched
 - `BridgeScheduler`, `BridgeAuthorization`, `BridgeAdapterCatalog`, and
   `BridgeQuerySnapshotStore` remain independently testable owners of scheduling,
   leases, adapter generations, and immutable query snapshots respectively.
+- Adapter responsibilities are split without introducing a provider interface:
+  `BridgeAdapterSourceDiscovery` captures owner-thread source/module snapshots;
+  `BridgeAdapterManifestValidation` validates immutable manifest candidates;
+  `BridgeAdapterAssemblyVerification` performs bounded path, origin, identity,
+  and hash checks; `BridgeAdapterGenerationStore` resolves duplicates, selects
+  and retains generations, rebuilds command ownership, and computes
+  fingerprints; `BridgeAdapterLoader` performs exact lazy provider loading;
+  `BridgeAdapterExecution` runs pinned providers and owns circuit health.
+- Diagnostic responsibilities are split into `BridgeDiagnosticCommands` for
+  the stable 28-command registration/dispatch contract,
+  `BridgeSnapshotProjection` for bounded cooperative collection,
+  `BridgeDiagnosticArtifacts` for capture/diff serialization, and
+  `BridgeEventJournal` for bounded concurrent event storage and paging.
 - All Verse/Unity reads and all command execution occur on the owner game thread.
   Filesystem hashing/indexing and socket work may run off-thread only when their
   inputs are immutable snapshots and their callbacks return through the main
-  thread dispatcher.
+  thread dispatcher. `FinalizeInit` worker callbacks carry only a transition
+  sequence; they never capture or dereference `Current.Game`, settings, save
+  metadata, UI, or paths. The owner thread performs finalization once, drops
+  obsolete sequence callbacks, and treats repeated notifications as harmless.
+
+### Threading contract
+
+Background-thread-safe entry points accept immutable request/source snapshots:
+`BridgeRuntime.OnGameChanging`, `BridgeRequestPreparation.Prepare` when called
+by the transport worker, adapter source capture results after
+`BridgeAdapterSourceDiscovery.Capture`, manifest parsing and validation,
+assembly verification, and status/audit file writes. These paths must not
+dereference `Current.Game`, maps, UI, Unity objects, or mutable loaded-package
+state.
+
+Main-thread-only methods include `BridgeRuntime.OnRootUpdate`, finalize-init
+completion, transport start/stop, lease confirmation/revocation and settings
+application, `BridgeLegacyFileProtocol.Process`, the owner callback inside
+`BridgeRequestPreparation`, `BridgeScheduledRequestExecutor.Execute`, all core
+diagnostic handlers, lazy adapter provider execution, and snapshot projection
+steps. `BridgeMainThreadContext.AdoptOwnerThread` is the sole adoption point;
+ordinary callbacks cannot establish ownership.
 
 4. **Authorization and idempotency**
-   - Remote mutation is disabled by default. A server-controlled, runtime-only
+    - Every connected game is live and non-disposable by default. Only the human
+      operator may explicitly identify the currently loaded game as a disposable
+      sandbox; a client label, command, naming convention, dev mode, or inference
+      never proves sandbox status. Remote mutation is disabled by default. A server-controlled, runtime-only
       confirmation must be made in-game for the currently loaded Game/save before
       a lease can be issued or honored. A client context label is intent only.
-      Confirmation is bound to the session and process-local Game identity, is
+       Confirmation is bound to the session, process-local Game identity, and independent
+       server-observed save identity, is
       visibly revocable, and clears leases on revocation, setting disable, game
       transition, main-menu return, and bridge restart.
    - Writes then require an explicit short-lived agent-owned lease bound to the
@@ -139,8 +201,10 @@ and invokes the normal authenticated client. It only stops a process it launched
      Unknown commands are forbidden rather than implicitly safe.
     - Completed writes are cached by session plus idempotency key. A retry returns
       the original result. A bounded audit records every accepted mutation with
-      server-observed game identity, confirmation state, setting state, lease
-      context, and expiry, never transport or lease tokens.
+       server-observed game identity, independent save identity, confirmation state, setting
+       state, lease context, and expiry, never transport or lease tokens. Game identity is
+       process-local. Save identity is a versioned digest of the loaded-save value or `none`
+       for a new/unsaved game; raw save metadata and paths are not retained or published.
 
 5. **Commands and inspection**
     - Core commands use typed handlers and meaningful statuses. Lists use stable
@@ -234,7 +298,7 @@ Only after all six pass may the superseded host path be deleted or disconnected.
   protocol, boundary characterization, cursors, fair scheduling, cancellation,
   restart barriers, idempotency, leases, mutation confirmation, lifecycle,
   manifests, feature tests, batches, macros, transport, and production queries
-  (60 cases in the current revision).
+   (the reported pass/fail count is authoritative for each build).
 - A source invariant check confirms no dormant update work, AppDomain-wide provider
   scan, eager adapter load, macro parse, or feature-test parse.
 - Final cold launches measured 16.329-21.568 ms construction/bootstrap including
@@ -264,3 +328,35 @@ Only after all six pass may the superseded host path be deleted or disconnected.
   initial v2 implementation to 0.052-0.225 ms after JIT. Sixteen concurrent
   compatibility clients returned isolated successful IDs. Feature-test discovery
   measured 35.244 ms off-thread and 0.673 ms on the game thread.
+
+## Maintainability pass metrics
+
+The pre-refactor measurement was taken before moving any of the remaining
+runtime, catalog, or diagnostics responsibilities. The after measurement is
+the current source tree; generated assemblies are excluded.
+
+| Composition root | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `BridgeRuntime.cs` | 1,266 lines | 862 lines | -404 (-31.9%) |
+| `BridgeAdapterCatalog.cs` | 1,343 lines | 641 lines | -702 (-52.3%) |
+| `BridgeDiagnostics.cs` | 1,225 lines | 779 lines | -446 (-36.4%) |
+| Combined hotspots | 3,834 lines | 2,282 lines | -1,552 (-40.5%) |
+
+The reduction is responsibility movement, not contract removal. The extracted
+runtime services cover lifecycle dispatch, lease expiry, status/file output,
+request preparation/execution, dormant activation, and the legacy file protocol.
+The extracted adapter services cover source discovery, assembly verification,
+manifest validation, generation management, lazy loading, and execution health.
+The extracted diagnostics services cover command routing, cooperative snapshot
+projection, artifact serialization, and the bounded event journal. The current
+compatibility harness reports 69 cases, including the characterization tests
+added before this pass for command registration, concurrent event access,
+audit redaction, and concurrent catalog readers.
+
+The principal migration risks are stale lifecycle callbacks, stale transport
+generations, accidental owner-thread adoption, adapter assembly retention on
+Mono, and accidental wire-format or secret-redaction changes. Regression and
+concurrency evidence must therefore remain green before each logical commit;
+no adapter or runtime extraction is allowed to alter stable status/error codes,
+session rotation, lease invalidation, bounded queue behavior, or snapshot
+consistency.

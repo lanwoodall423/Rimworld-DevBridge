@@ -10,6 +10,7 @@ $sourceProject = Join-Path $modRoot 'Source/RimWorldDevBridge/RimWorldDevBridge.
 $coordinatorProject = Join-Path $modRoot 'DevTools/RestartCoordinator/RimWorldDevBridge.RestartCoordinator.csproj'
 $coreSource = Join-Path $modRoot '1.6/Assemblies/RimWorldDevBridge.dll'
 $coordinatorSource = Join-Path $modRoot '1.6/Assemblies/RestartCoordinator/net472/RimWorldDevBridge.RestartCoordinator.exe'
+$licenseSource = Join-Path $modRoot 'LICENSE'
 $manifestPath = Join-Path $modRoot 'BRIDGE_MANIFEST.txt'
 $verifier = Join-Path $PSScriptRoot 'Test-RimWorldDevBridgePackage.ps1'
 $stagingRoot = [IO.Path]::Combine([IO.Path]::GetTempPath(),
@@ -24,6 +25,7 @@ $packageEntries = @(
     @{ Relative = 'BRIDGE_MANIFEST.txt'; Source = $manifestPath },
     @{ Relative = 'BRIDGE_HANDOFF.md'; Source = (Join-Path $modRoot 'BRIDGE_HANDOFF.md') },
     @{ Relative = 'AGENTS.md'; Source = (Join-Path $modRoot 'AGENTS.md') },
+    @{ Relative = 'LICENSE'; Source = (Join-Path $modRoot 'LICENSE') },
     @{ Relative = '1.6/Assemblies/RimWorldDevBridge.dll'; Source = $coreSource },
     @{ Relative = 'RestartCoordinator/RimWorldDevBridge.RestartCoordinator.exe'; Source = $coordinatorSource },
     @{ Relative = 'DevTools/devbridge.ps1'; Source = (Join-Path $PSScriptRoot 'devbridge.ps1') },
@@ -86,7 +88,7 @@ try {
     foreach ($entry in $packageEntries) { Copy-PackageEntry $entry }
 
     & $verifier -ArtifactPath $artifactRoot -ExpectedBridgeVersion $bridgeVersion -ExpectedProtocol 10 `
-        -ExpectedCorePath $coreSource
+        -ExpectedCorePath $coreSource -ExpectedLicensePath $licenseSource
     if (-not $?) { throw 'Staged package verification failed.' }
 
     [IO.Directory]::CreateDirectory($outputRoot) | Out-Null
@@ -101,7 +103,7 @@ try {
     finally { $archive.Dispose() }
 
     & $verifier -ArtifactPath $zipPath -ExpectedBridgeVersion $bridgeVersion -ExpectedProtocol 10 `
-        -ExpectedCorePath $coreSource
+        -ExpectedCorePath $coreSource -ExpectedLicensePath $licenseSource
     if (-not $?) { throw 'Final ZIP verification failed.' }
 
     $size = (Get-Item -LiteralPath $zipPath).Length

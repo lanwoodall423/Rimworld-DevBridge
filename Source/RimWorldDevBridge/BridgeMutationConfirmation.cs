@@ -1,5 +1,8 @@
 using System;
+using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
 using Verse;
 
 namespace RimWorldDevBridge
@@ -8,6 +11,8 @@ namespace RimWorldDevBridge
     // retained; its process-local identity is bound to the current session and save transition.
     internal sealed class BridgeMutationConfirmation
     {
+        internal const string Warning = "Remote tools may modify or destroy this game.";
+
         private readonly object gate = new object();
         private string sessionId;
         private string gameIdentity;
@@ -57,7 +62,7 @@ namespace RimWorldDevBridge
                     .Add("state", "confirmed")
                     .Add("gameIdentity", gameIdentity)
                     .Add("saveIdentity", saveIdentity)
-                    .Warn("Remote tools may modify or destroy game state.");
+                    .Warn(Warning);
             }
         }
 
@@ -98,7 +103,30 @@ namespace RimWorldDevBridge
 
         internal static string SaveIdentityFor(Game game)
         {
-            return game == null ? null : "save-" + RuntimeHelpers.GetHashCode(game).ToString("X8");
+            if (game == null || game.InitData == null) return null;
+            string loadedSave = null;
+            try
+            {
+                FieldInfo field = game.InitData.GetType().GetField("gameToLoad",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                loadedSave = field?.GetValue(game.InitData) as string;
+            }
+            catch
+            {
+                return null;
+            }
+            if (string.IsNullOrWhiteSpace(loadedSave)) return null;
+
+            // Hash only the server-observed GameInitData.gameToLoad value with a versioned domain.
+            // The raw save name/path is never retained or published; the identity lasts only for
+            // this process/session binding and changes when the loaded-save value changes.
+            string material = "rimworld-devbridge-save-v1\n" + loadedSave.Trim().Replace('\\', '/');
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] digest = sha.ComputeHash(Encoding.UTF8.GetBytes(material));
+                return "save-v1-" + BitConverter.ToString(digest).Replace("-", string.Empty)
+                    .ToLowerInvariant();
+            }
         }
     }
 

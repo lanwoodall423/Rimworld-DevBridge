@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$ArtifactPath,
     [string]$ExpectedBridgeVersion = '2.1.0',
     [int]$ExpectedProtocol = 10,
-    [string]$ExpectedCorePath
+    [string]$ExpectedCorePath,
+    [string]$ExpectedLicensePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +17,7 @@ $expectedFiles = @(
     'BRIDGE_HANDOFF.md',
     'LoadFolders.xml',
     'BRIDGE_MANIFEST.txt',
+    'LICENSE',
     'DevTools/DEVBRIDGE_AGENT.md',
     'DevTools/Send-RimWorldBridge.ps1',
     'DevTools/devbridge.ps1',
@@ -72,6 +74,26 @@ function Compare-Core([string]$Expected, [string]$Actual) {
     $expectedHash = (Get-FileHash -LiteralPath $Expected -Algorithm SHA256).Hash
     $actualHash = (Get-FileHash -LiteralPath $Actual -Algorithm SHA256).Hash
     if ($expectedHash -cne $actualHash) { Add-Error 'Packaged core SHA-256 differs from the source core.' }
+}
+
+function Compare-License([string]$Expected, [string]$Actual) {
+    if ([string]::IsNullOrWhiteSpace($Expected)) { return }
+    if (-not (Test-Path -LiteralPath $Expected -PathType Leaf)) {
+        Add-Error "Expected source license is missing: $Expected"
+        return
+    }
+    $expectedBytes = [IO.File]::ReadAllBytes($Expected)
+    $actualBytes = [IO.File]::ReadAllBytes($Actual)
+    if ($expectedBytes.Length -ne $actualBytes.Length) {
+        Add-Error 'Packaged LICENSE length differs from the source license.'
+        return
+    }
+    for ($index = 0; $index -lt $expectedBytes.Length; $index++) {
+        if ($expectedBytes[$index] -ne $actualBytes[$index]) {
+            Add-Error 'Packaged LICENSE is not byte-identical to the source license.'
+            return
+        }
+    }
 }
 
 try {
@@ -147,7 +169,8 @@ try {
         $values = Read-KeyValueFile $bridgeManifestPath
         if ($values['bridge'] -ne $ExpectedBridgeVersion) { Add-Error "BRIDGE_MANIFEST bridge version is not $ExpectedBridgeVersion." }
         if ([int]$values['protocol'] -ne $ExpectedProtocol) { Add-Error "BRIDGE_MANIFEST protocol is not $ExpectedProtocol." }
-        foreach ($declaredKey in @('handoff', 'client', 'compatibilityWrapper', 'agentGuide')) {
+        if ($values['license'] -ne 'MIT') { Add-Error 'BRIDGE_MANIFEST license is not MIT.' }
+        foreach ($declaredKey in @('handoff', 'client', 'compatibilityWrapper', 'agentGuide', 'licenseFile')) {
             $declared = [string]$values[$declaredKey]
             if ([string]::IsNullOrWhiteSpace($declared)) {
                 Add-Error "BRIDGE_MANIFEST is missing declared file $declaredKey."
@@ -162,6 +185,13 @@ try {
     }
 
     $corePath = Join-Path $root '1.6/Assemblies/RimWorldDevBridge.dll'
+    $licensePath = Join-Path $root 'LICENSE'
+    if (Test-Path -LiteralPath $licensePath -PathType Leaf) {
+        if (([IO.File]::ReadAllLines($licensePath)[0]) -ne 'MIT License') {
+            Add-Error 'LICENSE does not contain the MIT License header.'
+        }
+        Compare-License $ExpectedLicensePath $licensePath
+    }
     if (Test-Path -LiteralPath $corePath) {
         try {
             $identity = [Reflection.AssemblyName]::GetAssemblyName($corePath)
