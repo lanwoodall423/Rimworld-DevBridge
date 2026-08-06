@@ -9,7 +9,7 @@ namespace RimWorldDevBridge
 {
     public static class BridgeProtocol
     {
-        public const string BridgeVersion = "2.1.0";
+        public const string BridgeVersion = "2.2.0";
         public const int ProtocolVersion = 10;
         public const string CoreSchema = "v10.1-typed-core";
         public const int MaxRequestBytes = 32768;

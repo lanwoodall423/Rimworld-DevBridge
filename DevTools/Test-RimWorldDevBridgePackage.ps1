@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$ArtifactPath,
-    [string]$ExpectedBridgeVersion = '2.1.0',
+    [string]$ExpectedBridgeVersion = '2.2.0',
     [int]$ExpectedProtocol = 10,
     [string]$ExpectedCorePath,
     [string]$ExpectedLicensePath

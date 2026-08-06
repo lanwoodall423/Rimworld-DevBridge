@@ -140,7 +140,7 @@ Create and verify the distributable package with:
 
 ```powershell
 & "DevTools\Package-RimWorldDevBridge.ps1" -Build -OutputDirectory "Release"
-& "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.1.0.zip"
+& "DevTools\Test-RimWorldDevBridgePackage.ps1" -ArtifactPath "Release\RimWorldDevBridge-2.2.0.zip"
 ```
 
 Packaging stages eleven Dev Bridge-owned files: `About/About.xml`, `AGENTS.md`, `BRIDGE_HANDOFF.md`,

@@ -161,7 +161,7 @@ try {
     $env:RIMWORLD_HARMONY_PATH = $harmony
     & (Join-Path $PSScriptRoot 'Package-RimWorldDevBridge.ps1') -Build -OutputDirectory $OutputDirectory
     if (-not $?) { throw 'Package creation failed.' }
-    & (Join-Path $PSScriptRoot 'Test-RimWorldDevBridgePackageSmoke.ps1') -ArtifactPath (Join-Path $OutputDirectory 'RimWorldDevBridge-2.1.0.zip')
+    & (Join-Path $PSScriptRoot 'Test-RimWorldDevBridgePackageSmoke.ps1') -ArtifactPath (Join-Path $OutputDirectory 'RimWorldDevBridge-2.2.0.zip')
     if (-not $?) { throw 'Package smoke validation failed.' }
 }
 finally {

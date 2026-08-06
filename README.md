@@ -121,7 +121,7 @@ supplied paths is required for the full mod build.
 ```powershell
 pwsh -File .\DevTools\Package-RimWorldDevBridge.ps1 -Build -OutputDirectory .\Release
 pwsh -File .\DevTools\Test-RimWorldDevBridgePackageSmoke.ps1 `
-  -ArtifactPath .\Release\RimWorldDevBridge-2.1.0.zip
+  -ArtifactPath .\Release\RimWorldDevBridge-2.2.0.zip
 ```
 
 The package verifier checks exact declared entries, raw ZIP paths, core identity and hash,

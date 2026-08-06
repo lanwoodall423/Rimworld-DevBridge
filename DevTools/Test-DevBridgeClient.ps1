@@ -106,7 +106,7 @@ $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
 $listener.Start()
 function Write-Status([string]$state) {
     $token = if ($state -eq 'ON') { 'secret-token' } else { '' }
-    $lines = @("bridge=$state", 'version=2.1.0', 'protocol=10', 'schema=v10.1-typed-core',
+    $lines = @("bridge=$state", 'version=2.2.0', 'protocol=10', 'schema=v10.1-typed-core',
         ("processId={0}" -f $ProcessId), 'bootId=mock-boot', 'session=mock-session',
         'transportGeneration=1', 'host=127.0.0.1', ("port={0}" -f $Port), ("token={0}" -f $token),
         ("coreFingerprint={0}" -f $Mvid), ("statusUtc={0}" -f [DateTime]::UtcNow.ToString('o')))

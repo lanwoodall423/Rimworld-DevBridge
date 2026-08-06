@@ -1,4 +1,4 @@
-bridge=2.1.0
+bridge=2.2.0
 protocol=10
 schema=v10.1-typed-core
 handoff=BRIDGE_HANDOFF.md
@@ -7,6 +7,6 @@ compatibilityWrapper=DevTools/Send-RimWorldBridge.ps1
 agentGuide=DevTools/DEVBRIDGE_AGENT.md
 license=MIT
 licenseFile=LICENSE
-changes=Removed dormant frame work, added authoritative lazy manifests, owner-mod BridgeAdapters discovery, immutable query snapshots, runtime safety indicator, cooperative built-in scheduling, adapter overrun diagnostics, fair agent scheduling, durable external restart coordination, and portable Dev Bridge-only release packaging
+changes=Deferred main-thread FinalizeInit, lifecycle-generation stale-work rejection, remote mutation confirmation hardening, extracted runtime/adapter/diagnostic responsibilities, immutable query snapshots, fair scheduling, and portable Dev Bridge-only release packaging
 remoteMutation=disabled-by-default; in-game-confirmation-required; client-context-is-intent-only
 mutationIdentity=game-process-local;save=server-observed-save-v1-digest-or-none;raw-save-metadata=never-published
