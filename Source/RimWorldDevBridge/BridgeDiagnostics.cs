@@ -5,8 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Security.Cryptography;
-using System.Text;
 using System.Threading;
 using HarmonyLib;
 using RimWorld;
@@ -32,114 +30,13 @@ namespace RimWorldDevBridge
         internal delegate void RegisterCommand(string name, string description, BridgeCommandMode mode,
             BridgeCostClass cost, bool requiresMap, string argumentSchema);
 
-        internal static void Register(RegisterCommand register)
-        {
-            register("PAWNS", "Stable paged pawn summaries.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor,fields");
-            register("PAWN", "Inspect one session/map-scoped pawn reference.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "[session:map:]thingId");
-            register("THINGS", "Stable paged thing summaries.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor,fields");
-            register("THING", "Inspect one session/map-scoped thing reference.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "[session:map:]thingId");
-            register("DEFS", "Stable paged definition summaries.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "kind,filter,limit,cursor,fields");
-            register("COMPONENTS", "Stable paged map, game, and world component types.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "scope,filter,limit,cursor");
-            register("COMPONENT", "Inspect bounded primitive fields on one component.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "scope:index|type-filter");
-            register("JOBS", "Stable paged active pawn jobs.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor");
-            register("DESIGNATIONS", "Stable paged map designations.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, true, "filter,limit,cursor");
-            register("SELECTED", "Inspect current selection without generic reflection.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Trivial, false, "none");
-            register("UI_STATE", "Current windows, rectangles, resolution, scale, and clipping flags.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "limit,cursor");
-            register("SELECT", "Select and focus one thing by scoped reference.", BridgeCommandMode.UiOnly,
-                BridgeCostClass.Trivial, true, "[session:map:]thingId");
-            register("JUMP", "Jump to a bounded current-map cell.", BridgeCommandMode.UiOnly,
-                BridgeCostClass.Trivial, true, "x,z");
-            register("SCREENSHOT", "Write a full-screen PNG under bridge user data.", BridgeCommandMode.UiOnly,
-                BridgeCostClass.Expensive, false, "name");
-            register("SCREENSHOT_REGION", "Write a bounded screen region PNG under bridge user data.",
-                BridgeCommandMode.UiOnly, BridgeCostClass.Expensive, false,
-                "x=<px>&y=<bottom-px>&width=<px>&height=<px>&name=<name>");
-            register("REFRESH_CELL", "Mark one map cell mesh dirty for a narrow visual refresh.",
-                BridgeCommandMode.Reversible, BridgeCostClass.Trivial, true, "x,z");
-            register("LOG_DELTA", "Stable paged RimWorld log messages.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Normal, false, "filter,limit,cursor");
-            register("DEF_ERRORS", "Definition/configuration errors from the bounded log queue.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "filter,limit,cursor");
-            register("PATCH_ERRORS", "Harmony/patch errors from the bounded log queue.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "filter,limit,cursor");
-            register("HARMONY_PATCHES", "Paged Harmony ownership for filtered patched methods.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Expensive, false, "filter,limit,cursor");
-            register("COMPATIBILITY_REPORT", "Loaded packages, bridge protocol, adapters, and error counts.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Normal, false, "none");
-            register("CAPTURE_STATE", "Write a bounded semantic game-state capture outside live memory.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Expensive, false, "name");
-            register("DIFF_STATE", "Compare two stored semantic captures.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Expensive, false, "before=<name>&after=<name>&limit=<n>");
-            register("EVENTS", "Paged bridge lifecycle and command events.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Trivial, false, "filter,limit,cursor");
-            register("PERFORMANCE", "On-demand process, GC, scheduler, and bridge-resource metrics.",
-                BridgeCommandMode.PureRead, BridgeCostClass.Trivial, false, "none");
-            register("BENCHMARK", "Bounded repeated current-map summary benchmark.", BridgeCommandMode.PureRead,
-                BridgeCostClass.Expensive, true, "iterations=1..100");
-            register("SAVE_GAME", "Save the current game to an explicit development copy.",
-                BridgeCommandMode.PersistentMutation, BridgeCostClass.Expensive, false, "name");
-            register("LOAD_GAME", "Load an explicit development save and rotate the bridge session.",
-                BridgeCommandMode.PotentiallyDestructive, BridgeCostClass.Simulation, false, "name");
-        }
+        internal static void Register(RegisterCommand register) => BridgeDiagnosticCommands.Register(register);
 
-        internal static BridgeResult Execute(BridgeExecutionContext context)
-        {
-            switch (context.Request.Command)
-            {
-                case "PAWNS": return Pawns(context);
-                case "PAWN": return Pawn(context);
-                case "THINGS": return Things(context);
-                case "THING": return Thing(context);
-                case "DEFS": return Defs(context);
-                case "COMPONENTS": return Components(context);
-                case "COMPONENT": return Component(context);
-                case "JOBS": return Jobs(context);
-                case "DESIGNATIONS": return Designations(context);
-                case "SELECTED": return Selected();
-                case "UI_STATE": return UiState(context);
-                case "SELECT": return Select(context);
-                case "JUMP": return Jump(context);
-                case "SCREENSHOT": return Screenshot(context);
-                case "SCREENSHOT_REGION": return ScreenshotRegion(context);
-                case "REFRESH_CELL": return RefreshCell(context);
-                case "LOG_DELTA": return Logs(context, null);
-                case "DEF_ERRORS": return Logs(context, "def");
-                case "PATCH_ERRORS": return Logs(context, "patch");
-                case "HARMONY_PATCHES": return HarmonyPatches(context);
-                case "COMPATIBILITY_REPORT": return CompatibilityReport();
-                case "CAPTURE_STATE": return CaptureState(context);
-                case "DIFF_STATE": return context.Request.PreparedPayload as BridgeResult ??
-                    DiffState(context.Request);
-                case "EVENTS": return BridgeEventJournal.Report(context.Request);
-                case "PERFORMANCE": return Performance();
-                case "BENCHMARK": return Benchmark(context);
-                case "SAVE_GAME": return SaveGame(context.Request.Argument);
-                case "LOAD_GAME": return LoadGame(context.Request.Argument);
-                default: return null;
-            }
-        }
+        internal static BridgeResult Execute(BridgeExecutionContext context) => BridgeDiagnosticCommands.Execute(context);
 
-        internal static BridgeResult Prepare(BridgeRequest request)
-        {
-            if (request?.Command != "DIFF_STATE") return null;
-            BridgeResult result = DiffState(request);
-            if (!result.IsSuccess) return result;
-            request.PreparedPayload = result;
-            return null;
-        }
+        internal static BridgeResult Prepare(BridgeRequest request) => BridgeDiagnosticCommands.Prepare(request);
 
-        private static BridgeResult Pawns(BridgeExecutionContext context)
+        internal static BridgeResult Pawns(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -171,7 +68,7 @@ namespace RimWorldDevBridge
             return ((BridgeSnapshotProjection.Operation<Pawn>)context.Request.CooperativeState).Step(context);
         }
 
-        private static BridgeResult Pawn(BridgeExecutionContext context)
+        internal static BridgeResult Pawn(BridgeExecutionContext context)
         {
             if (!TryThingReference(context, context.Request.Argument, out int id, out BridgeResult failure)) return failure;
             Pawn pawn = context.Map.mapPawns.AllPawnsSpawned.FirstOrDefault(value => value.thingIDNumber == id);
@@ -188,7 +85,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Things(BridgeExecutionContext context)
+        internal static BridgeResult Things(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -220,7 +117,7 @@ namespace RimWorldDevBridge
             return ((BridgeSnapshotProjection.Operation<Thing>)context.Request.CooperativeState).Step(context);
         }
 
-        private static BridgeResult Thing(BridgeExecutionContext context)
+        internal static BridgeResult Thing(BridgeExecutionContext context)
         {
             if (!TryThingReference(context, context.Request.Argument, out int id, out BridgeResult failure)) return failure;
             Thing thing = context.Map.listerThings.AllThings.FirstOrDefault(value => value.thingIDNumber == id);
@@ -237,7 +134,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Defs(BridgeExecutionContext context)
+        internal static BridgeResult Defs(BridgeExecutionContext context)
         {
             Dictionary<string, string> options = BridgeProtocol.ParseOptions((context.Request.Argument ?? string.Empty).Replace(';', '&'));
             string kind = (BridgeProtocol.Value(options, "kind") ?? "thing").Trim().ToLowerInvariant();
@@ -270,7 +167,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Components(BridgeExecutionContext context)
+        internal static BridgeResult Components(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -286,7 +183,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Component(BridgeExecutionContext context)
+        internal static BridgeResult Component(BridgeExecutionContext context)
         {
             string value = (context.Request.Argument ?? string.Empty).Trim();
             string[] reference = value.Split(':');
@@ -312,7 +209,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Jobs(BridgeExecutionContext context)
+        internal static BridgeResult Jobs(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -348,7 +245,7 @@ namespace RimWorldDevBridge
             return ((BridgeSnapshotProjection.Operation<Pawn>)context.Request.CooperativeState).Step(context);
         }
 
-        private static BridgeResult Designations(BridgeExecutionContext context)
+        internal static BridgeResult Designations(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -367,7 +264,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Selected()
+        internal static BridgeResult Selected()
         {
             Thing thing = Find.Selector?.SingleSelectedThing;
             if (thing == null) return BridgeResult.Ok("core.selected").Add("selected", "none");
@@ -379,7 +276,7 @@ namespace RimWorldDevBridge
                 .Add("position", thing.Spawned ? Cell(thing.Position) : "unspawned");
         }
 
-        private static BridgeResult UiState(BridgeExecutionContext context)
+        internal static BridgeResult UiState(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -399,7 +296,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Select(BridgeExecutionContext context)
+        internal static BridgeResult Select(BridgeExecutionContext context)
         {
             if (!TryThingReference(context, context.Request.Argument, out int id, out BridgeResult failure)) return failure;
             Thing thing = context.Map.listerThings.AllThings.FirstOrDefault(item => item.thingIDNumber == id);
@@ -411,21 +308,21 @@ namespace RimWorldDevBridge
                 .WithMutation("selected and focused thing " + id);
         }
 
-        private static BridgeResult Jump(BridgeExecutionContext context)
+        internal static BridgeResult Jump(BridgeExecutionContext context)
         {
             if (!TryCell(context.Request.Argument, context.Map, out IntVec3 cell, out BridgeResult failure)) return failure;
             Find.CameraDriver.JumpToCurrentMapLoc(cell);
             return BridgeResult.Ok("core.jump").Add("cell", Cell(cell)).WithMutation("camera jump " + Cell(cell));
         }
 
-        private static BridgeResult Screenshot(BridgeExecutionContext context)
+        internal static BridgeResult Screenshot(BridgeExecutionContext context)
         {
             string name = SafeArtifactName(context.Request.Argument, "screenshot-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff")) + ".png";
             return CaptureScreenshot(new Rect(0f, 0f, Screen.width, Screen.height), Screen.width,
                 Screen.height, name, "core.screenshot");
         }
 
-        private static BridgeResult ScreenshotRegion(BridgeExecutionContext context)
+        internal static BridgeResult ScreenshotRegion(BridgeExecutionContext context)
         {
             Dictionary<string, string> options;
             try { options = BridgeProtocol.ParseOptions((context.Request.Argument ?? string.Empty).Replace(';', '&')); }
@@ -465,7 +362,7 @@ namespace RimWorldDevBridge
             finally { UnityEngine.Object.Destroy(image); }
         }
 
-        private static BridgeResult RefreshCell(BridgeExecutionContext context)
+        internal static BridgeResult RefreshCell(BridgeExecutionContext context)
         {
             if (!TryCell(context.Request.Argument, context.Map, out IntVec3 cell, out BridgeResult failure)) return failure;
             context.Map.mapDrawer.MapMeshDirty(cell, ulong.MaxValue);
@@ -473,7 +370,7 @@ namespace RimWorldDevBridge
                 .WithMutation("marked map mesh dirty at " + Cell(cell));
         }
 
-        private static BridgeResult Logs(BridgeExecutionContext context, string category)
+        internal static BridgeResult Logs(BridgeExecutionContext context, string category)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -492,7 +389,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult HarmonyPatches(BridgeExecutionContext context)
+        internal static BridgeResult HarmonyPatches(BridgeExecutionContext context)
         {
             BridgeQuery query = Query(context.Request, out BridgeResult failure);
             if (failure != null) return failure;
@@ -513,7 +410,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult CompatibilityReport()
+        internal static BridgeResult CompatibilityReport()
         {
             int errors = (Log.Messages ?? Enumerable.Empty<LogMessage>()).Count(item => item.type == LogMessageType.Error);
             return BridgeResult.Ok("core.compatibilityReport")
@@ -525,12 +422,12 @@ namespace RimWorldDevBridge
                 .Add("remoteMutationEnabled", RimWorldDevBridgeMod.Settings?.RemoteMutationEnabled ?? false);
         }
 
-        private static BridgeResult CaptureState(BridgeExecutionContext context) =>
+        internal static BridgeResult CaptureState(BridgeExecutionContext context) =>
             BridgeDiagnosticArtifacts.CaptureState(context);
 
-        private static BridgeResult DiffState(BridgeRequest request) => BridgeDiagnosticArtifacts.DiffState(request);
+        internal static BridgeResult DiffState(BridgeRequest request) => BridgeDiagnosticArtifacts.DiffState(request);
 
-        private static BridgeResult Performance()
+        internal static BridgeResult Performance()
         {
             Process process = Process.GetCurrentProcess();
             try { process.Refresh(); } catch { }
@@ -578,7 +475,7 @@ namespace RimWorldDevBridge
             return result;
         }
 
-        private static BridgeResult Benchmark(BridgeExecutionContext context)
+        internal static BridgeResult Benchmark(BridgeExecutionContext context)
         {
             int iterations = BridgeProtocol.ParseBoundedInt((context.Request.Argument ?? string.Empty).Replace("iterations=", ""),
                 20, 1, 100);
@@ -595,7 +492,7 @@ namespace RimWorldDevBridge
                 .Add("meanMs", elapsed / iterations).Add("checksum", checksum);
         }
 
-        private static BridgeResult SaveGame(string argument)
+        internal static BridgeResult SaveGame(string argument)
         {
             string name = SafeSaveName(argument);
             if (name == null) return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_save_name");
@@ -604,7 +501,7 @@ namespace RimWorldDevBridge
             return BridgeResult.Ok("core.saveGame").Add("save", name).WithMutation("saved development copy " + name);
         }
 
-        private static BridgeResult LoadGame(string argument)
+        internal static BridgeResult LoadGame(string argument)
         {
             string name = SafeSaveName(argument);
             if (name == null) return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_save_name");

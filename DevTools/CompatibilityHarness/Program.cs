@@ -1782,9 +1782,12 @@ internal static class Program
             Name = request.Command, Provider = "core", ProviderVersion = BridgeProtocol.BridgeVersion,
             Mode = request.Mode, Cost = BridgeCostClass.Trivial
         };
-        MethodInfo complete = typeof(BridgeRuntime).GetMethod("CompleteScheduled",
+        FieldInfo executorField = typeof(BridgeRuntime).GetField("RequestExecutor",
             BindingFlags.Static | BindingFlags.NonPublic);
-        complete.Invoke(null, new object[] { request,
+        object executor = executorField.GetValue(null);
+        MethodInfo complete = executor.GetType().GetMethod("Complete",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        complete.Invoke(executor, new object[] { request,
             BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_required") });
         Check(!auth.TryGetCompleted(request, out _), "pre-execution failure poisoned idempotency cache");
     }
