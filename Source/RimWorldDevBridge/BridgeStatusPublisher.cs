@@ -11,7 +11,6 @@ namespace RimWorldDevBridge
         internal readonly BridgeRuntime.BridgeRuntimeStateSnapshot Snapshot;
         internal readonly string State;
         internal readonly string Extra;
-        internal readonly long CurrentVersion;
         internal readonly double BootstrapMs;
         internal readonly double HarmonyMs;
         internal readonly double FinalizeInitMs;
@@ -19,13 +18,12 @@ namespace RimWorldDevBridge
         internal readonly long BootstrapManagedDeltaBytes;
 
         internal BridgeStatusPublication(BridgeRuntime.BridgeRuntimeStateSnapshot snapshot, string state, string extra,
-            long currentVersion, double bootstrapMs, double harmonyMs, double finalizeInitMs, double activationMs,
+            double bootstrapMs, double harmonyMs, double finalizeInitMs, double activationMs,
             long bootstrapManagedDeltaBytes)
         {
             Snapshot = snapshot;
             State = state;
             Extra = extra;
-            CurrentVersion = currentVersion;
             BootstrapMs = bootstrapMs;
             HarmonyMs = harmonyMs;
             FinalizeInitMs = finalizeInitMs;
@@ -52,11 +50,11 @@ namespace RimWorldDevBridge
             }
         }
 
-        internal static bool Write(BridgeStatusPublication publication)
+        internal static bool Write(BridgeStatusPublication publication, Func<long> currentVersion)
         {
             lock (Gate)
             {
-                if (publication.Snapshot.Version != publication.CurrentVersion) return false;
+                if (publication.Snapshot.Version != currentVersion()) return false;
                 long writeStart = Stopwatch.GetTimestamp();
                 BridgeRuntime.BridgeRuntimeStateSnapshot snapshot = publication.Snapshot;
                 BridgeSessionContextSnapshot context = snapshot.Context;

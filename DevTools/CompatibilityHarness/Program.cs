@@ -58,6 +58,7 @@ internal static class Program
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
+        Run("status publication version guard", StatusPublicationVersionGuard);
         Run("remote mutation confirmation security", RemoteMutationConfirmationSecurity);
         Run("audit projection and redaction", AuditProjectionAndRedaction);
         Run("remote mutation settings fail closed", RemoteMutationSettingsFailClosed);
@@ -1050,6 +1051,20 @@ internal static class Program
                 "lease revocation did not invalidate authority");
         });
         InvokeRotateSession("event-driven-cleanup");
+    }
+
+    private static void StatusPublicationVersionGuard()
+    {
+        BridgeRuntime.BridgeRuntimeStateSnapshot snapshot = BridgeRuntime.StateSnapshot;
+        int writes = BridgeRuntime.StatusWriteCountForTests;
+        BridgeStatusPublication publication = new BridgeStatusPublication(snapshot, "DORMANT", null,
+            BridgeRuntime.BootstrapMs, BridgeRuntime.HarmonyMs,
+            BridgeRuntime.FinalizeInitMs, BridgeRuntime.ActivationMs,
+            BridgeRuntime.BootstrapManagedDeltaBytes);
+        Check(!BridgeStatusPublisher.Write(publication, () => snapshot.Version + 1),
+            "stale status snapshot was accepted");
+        Equal(writes, BridgeRuntime.StatusWriteCountForTests,
+            "stale status snapshot changed write metrics");
     }
 
     private static void RemoteMutationConfirmationSecurity()

@@ -201,9 +201,11 @@ namespace RimWorldDevBridge
             string state = snapshot.TransportActive ?
                 (snapshot.TransportReady ? "ON" : "ACTIVATING") : "DORMANT";
             if (!BridgeStatusPublisher.Write(new BridgeStatusPublication(snapshot, state, extra,
-                Interlocked.Read(ref stateVersion), bootstrapMs, harmonyMs, finalizeInitMs, activationMs,
-                bootstrapManagedDeltaBytes))) Interlocked.Exchange(ref stateDirty, 1);
+                bootstrapMs, harmonyMs, finalizeInitMs, activationMs, bootstrapManagedDeltaBytes),
+                CurrentStateVersion)) Interlocked.Exchange(ref stateDirty, 1);
         }
+
+        private static long CurrentStateVersion() => Interlocked.Read(ref stateVersion);
 
         internal static void Bootstrap(string modRoot, long constructionStart, long managedBefore)
         {
