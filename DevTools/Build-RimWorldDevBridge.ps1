@@ -153,6 +153,10 @@ if (-not (Test-Path -LiteralPath $harness -PathType Leaf)) { throw "Compatibilit
 & $harness
 if ($LASTEXITCODE -ne 0) { throw "Compatibility harness failed with exit code $LASTEXITCODE." }
 Invoke-Script (Join-Path $PSScriptRoot 'Test-BridgeSourceInvariants.ps1') -arguments @()
+$restartCoordinatorTest = Join-Path $PSScriptRoot 'Test-RestartCoordinator.ps1'
+$restartCoordinator = Join-Path $root '1.6/Assemblies/RestartCoordinator/net472/RimWorldDevBridge.RestartCoordinator.exe'
+& $restartCoordinatorTest -CoordinatorPath $restartCoordinator
+if (-not $?) { throw 'Coordinator workflow validation failed.' }
 
 $oldManaged = [Environment]::GetEnvironmentVariable('RIMWORLD_MANAGED_DIR', 'Process')
 $oldHarmony = [Environment]::GetEnvironmentVariable('RIMWORLD_HARMONY_PATH', 'Process')

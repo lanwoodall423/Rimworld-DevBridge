@@ -6,6 +6,10 @@ param(
     [int]$StartupTimeoutSeconds = 300,
     [int]$BridgeWakeTimeoutSeconds = 10,
     [int]$CommandTimeoutMs = 120000,
+    [string]$UserRoot = "",
+    [string]$ModConfiguration = "managed-test",
+    [string]$Layout = "auto",
+    [string]$GameProcessName = "RimWorldWin64",
     [switch]$RequireMap,
     [switch]$SkipBuild,
     [switch]$NoQuickTest,
@@ -16,7 +20,11 @@ param(
 $ErrorActionPreference = "Stop"
 $modRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $gameRoot = [IO.Path]::GetFullPath((Join-Path $modRoot "..\.."))
-$saveDir = Join-Path $env:USERPROFILE "AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios"
+$saveDir = if (-not [string]::IsNullOrWhiteSpace($UserRoot)) { $UserRoot } elseif (-not [string]::IsNullOrWhiteSpace($env:RIMWORLD_DEVBRIDGE_USER_ROOT)) { $env:RIMWORLD_DEVBRIDGE_USER_ROOT } else {
+    Join-Path $env:USERPROFILE "AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios"
+}
+$saveDir = [IO.Path]::GetFullPath($saveDir)
+if (-not (Test-Path -LiteralPath $saveDir -PathType Container)) { throw "UserRoot does not exist: $saveDir" }
 $statusPath = Join-Path $saveDir "RimWorld-DevBridge-Status.txt"
 $wakePath = Join-Path $saveDir "RimWorld-DevBridge-Wake.request"
 $inputPath = Join-Path $saveDir "RimWorld-DevBridge-In.txt"
@@ -138,16 +146,23 @@ function Start-CoordinatorOwnedProcess([string]$Executable, [string[]]$Arguments
     $clientArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $devbridgePath,
         "restart", "launch", "--bridge-root", $modRoot, "--user-root", $saveDir,
         "--game-path", $Executable, "--working-directory", (Split-Path -Parent $Executable),
-        "--arguments", $argumentText)
+        "--arguments", $argumentText, "--mod-configuration", $ModConfiguration,
+        "--user-data-root", $saveDir,
+        "--launch-profile", "managed-test", "--layout", $Layout)
     $lines = & $shellPath $clientArguments 2>&1
     if ($LASTEXITCODE -ne 0) {
         $lines | ForEach-Object { Write-Output $_ }
         throw "coordinator-owned launch failed"
     }
     $json = (@($lines) -join "`n") | ConvertFrom-Json
-    $pidValue = $json.details.ProcessId
+    $pidValue = $json.ownership.ProcessId
     if ($null -eq $pidValue) { throw "coordinator launch did not return a process id" }
-    return Get-Process -Id ([int]$pidValue) -ErrorAction Stop
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        try { return Get-Process -Id ([int]$pidValue) -ErrorAction Stop }
+        catch { Start-Sleep -Milliseconds 100 }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "coordinator-owned process did not remain running"
 }
 
 if ($StartupTimeoutSeconds -lt 1 -or $StartupTimeoutSeconds -gt 1800) {
@@ -165,8 +180,17 @@ foreach ($required in @("bridge", "protocol", "schema")) {
     if (-not $manifest.ContainsKey($required)) { throw "Bridge manifest is missing '$required'." }
 }
 
-$process = Get-Process -Name "RimWorldWin64" -ErrorAction SilentlyContinue | Select-Object -First 1
+$process = Get-Process -Name $GameProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($process) {
+    $attachedStatus = Read-KeyFile $statusPath
+    if ($attachedStatus["processId"] -ne "$($process.Id)" -or [string]::IsNullOrWhiteSpace($attachedStatus["bootId"])) {
+        Write-Output '{"ok":false,"status":"USER_RESTART_REQUIRED","ownership":"attached","operatorActionRequired":true,"nextAction":"stop the manually attached RimWorld process, then rerun"}'
+        exit 4
+    }
+    if ($Command.ToUpperInvariant() -eq "RUN_FEATURE_TESTS") {
+        Write-Output '{"ok":false,"status":"ATTACHED_READ_ONLY","ownership":"attached","operatorActionRequired":true,"nextAction":"use restart ensure for a coordinator-owned test process"}'
+        exit 4
+    }
     Write-Output ("launch=ATTACHED processId={0}" -f $process.Id)
 }
 else {

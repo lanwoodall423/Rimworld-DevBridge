@@ -8,6 +8,7 @@ using System.Net.Sockets;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -40,6 +41,7 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 20)] public string ModConfiguration;
         [DataMember(Order = 21)] public string Environment;
         [DataMember(Order = 22)] public string LaunchProfile;
+        [DataMember(Order = 23)] public string UserDataRoot;
     }
 
     [DataContract]
@@ -52,6 +54,8 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 5)] public string CycleId;
         [DataMember(Order = 6)] public string Json;
         [DataMember(Order = 7)] public int ExitCode;
+        [DataMember(Order = 8)] public string OwnershipJson;
+        [DataMember(Order = 9)] public string CoordinatorIdentity;
     }
 
     [DataContract]
@@ -67,6 +71,19 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 8)] public string ModConfiguration;
         [DataMember(Order = 9)] public string Environment;
         [DataMember(Order = 10)] public string LaunchProfile;
+        [DataMember(Order = 11)] public string UserDataRoot;
+        [DataMember(Order = 12)] public DateTime ProfileValidatedUtc;
+    }
+
+    [DataContract]
+    internal sealed class CoordinatorOwnership
+    {
+        [DataMember(Order = 1)] public bool Owned;
+        [DataMember(Order = 2)] public bool Running;
+        [DataMember(Order = 3)] public int ProcessId;
+        [DataMember(Order = 4)] public long ProcessStartTimeUtcTicks;
+        [DataMember(Order = 5)] public string BootId;
+        [DataMember(Order = 6)] public string LaunchProfile;
     }
 
     internal static class Program
@@ -127,7 +144,8 @@ namespace RimWorldDevBridge.RestartCoordinator
                 ForceKillTestOnly = options.ContainsKey("force-kill-test-only"),
                 ModConfiguration = Get(options, "mod-configuration"),
                 Environment = Get(options, "environment"),
-                LaunchProfile = Get(options, "launch-profile")
+                LaunchProfile = Get(options, "launch-profile"),
+                UserDataRoot = Get(options, "user-data-root")
             };
         }
 
@@ -173,6 +191,17 @@ namespace RimWorldDevBridge.RestartCoordinator
                 new DataContractJsonSerializer(value.GetType()).WriteObject(stream, value);
                 return Encoding.UTF8.GetString(stream.ToArray());
             }
+        }
+
+        internal static string CoordinatorIdentity()
+        {
+            string path = typeof(Program).Assembly.Location;
+            string hash;
+            using (FileStream stream = File.OpenRead(path))
+            using (SHA256 sha = SHA256.Create())
+                hash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", string.Empty);
+            return typeof(Program).Assembly.GetName().Name + "|" +
+                typeof(Program).Assembly.GetName().Version + "|" + hash;
         }
 
         internal static T FromJson<T>(string json)
@@ -236,6 +265,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     {
                         response = new CoordinatorResponse { Ok = false, Error = exception.Message, ExitCode = 2 };
                     }
+                    response.CoordinatorIdentity = Program.CoordinatorIdentity();
                     byte[] bytes = Encoding.UTF8.GetBytes(Program.Json(response));
                     pipe.Write(bytes, 0, bytes.Length);
                     pipe.Flush();
@@ -271,6 +301,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     case "wait": return Wait(message);
                     case "register": return Register(message);
                     case "launch": return Launch(message);
+                    case "ensure": return Ensure(message);
                     case "heartbeat": return Heartbeat();
                     default: return new CoordinatorResponse { Ok = false, Error = "unknown_coordinator_operation", ExitCode = 2 };
                 }
@@ -300,6 +331,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 CycleId = ticket?.CycleId,
                 Phase = ticket?.Phase,
                 Json = Program.Json(machine.Snapshot),
+                OwnershipJson = Program.Json(GetOwnership()),
                 ExitCode = ticket == null ? 2 : 0
             };
         }
@@ -312,6 +344,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Ok = true,
                 Phase = machine.Snapshot.Phase.ToString(),
                 Json = Program.Json(machine.Snapshot),
+                OwnershipJson = Program.Json(GetOwnership()),
                 ExitCode = 0
             };
         }
@@ -334,6 +367,38 @@ namespace RimWorldDevBridge.RestartCoordinator
             return TicketResponse(timeout, "coordinator_wait_timeout");
         }
 
+        private CoordinatorResponse Ensure(CoordinatorMessage message)
+        {
+            if (launchRecord != null && !launchRecord.Owned)
+            {
+                return new CoordinatorResponse
+                {
+                    Ok = false,
+                    Error = "attached_process_user_restart_required",
+                    Phase = BridgeRestartPhase.USER_RESTART_REQUIRED.ToString(),
+                    OwnershipJson = Program.Json(GetOwnership()),
+                    ExitCode = 4
+                };
+            }
+            if (launchRecord == null)
+            {
+                if (!message.Owned)
+                {
+                    return new CoordinatorResponse
+                    {
+                        Ok = false,
+                        Error = "attached_process_user_restart_required",
+                        Phase = BridgeRestartPhase.USER_RESTART_REQUIRED.ToString(),
+                        OwnershipJson = Program.Json(GetOwnership()),
+                        ExitCode = 4
+                    };
+                }
+                CoordinatorResponse launched = Launch(message);
+                if (!launched.Ok) return launched;
+            }
+            return Request(message);
+        }
+
         private CoordinatorResponse Register(CoordinatorMessage message)
         {
             if (string.IsNullOrWhiteSpace(message.GamePath) || !File.Exists(message.GamePath))
@@ -341,6 +406,9 @@ namespace RimWorldDevBridge.RestartCoordinator
             string working = string.IsNullOrWhiteSpace(message.WorkingDirectory) ?
                 Path.GetDirectoryName(Path.GetFullPath(message.GamePath)) : Path.GetFullPath(message.WorkingDirectory);
             if (!Directory.Exists(working)) return new CoordinatorResponse { Ok = false, Error = "working_directory_missing", ExitCode = 2 };
+            string userDataRoot = string.IsNullOrWhiteSpace(message.UserDataRoot) ? userRoot :
+                Path.GetFullPath(message.UserDataRoot);
+            if (!Directory.Exists(userDataRoot)) return new CoordinatorResponse { Ok = false, Error = "user_data_root_missing", ExitCode = 2 };
             launchRecord = new LaunchRecord
             {
                 GamePath = Path.GetFullPath(message.GamePath),
@@ -350,23 +418,38 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Owned = message.Owned,
                 ModConfiguration = Limit(message.ModConfiguration, 2048),
                 Environment = Limit(message.Environment, 8192),
-                LaunchProfile = Limit(message.LaunchProfile, 256)
+                LaunchProfile = Limit(message.LaunchProfile, 256),
+                UserDataRoot = userDataRoot,
+                ProfileValidatedUtc = DateTime.UtcNow
             };
             Persist("register launch");
-            return new CoordinatorResponse { Ok = true, Json = Program.Json(launchRecord) };
+            return new CoordinatorResponse
+            {
+                Ok = true,
+                Json = Program.Json(launchRecord),
+                OwnershipJson = Program.Json(GetOwnership())
+            };
         }
 
         private CoordinatorResponse Launch(CoordinatorMessage message)
         {
             if (!message.Owned)
                 return new CoordinatorResponse { Ok = false, Error = "attached_process_cannot_be_launched", ExitCode = 4 };
+            if (!string.Equals(message.LaunchProfile, "managed-test", StringComparison.OrdinalIgnoreCase))
+                return new CoordinatorResponse { Ok = false, Error = "validated_launch_profile_required", ExitCode = 2 };
             CoordinatorResponse registered = Register(message);
             if (!registered.Ok) return registered;
             Process process = StartOwned();
             launchRecord.ProcessId = process.Id;
             launchRecord.ProcessStartTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks;
             Persist("launch pid=" + process.Id);
-            return new CoordinatorResponse { Ok = true, Json = Program.Json(launchRecord), ExitCode = 0 };
+            return new CoordinatorResponse
+            {
+                Ok = true,
+                Json = Program.Json(launchRecord),
+                OwnershipJson = Program.Json(GetOwnership()),
+                ExitCode = 0
+            };
         }
 
         private void Pump()
@@ -683,8 +766,35 @@ namespace RimWorldDevBridge.RestartCoordinator
                 CycleId = ticket?.CycleId,
                 Phase = ticket?.Phase,
                 Json = ticket == null ? null : Program.Json(ticket),
+                OwnershipJson = Program.Json(GetOwnership()),
                 ExitCode = error == null ? 0 : 4
             };
+        }
+
+        private CoordinatorOwnership GetOwnership()
+        {
+            CoordinatorOwnership result = new CoordinatorOwnership
+            {
+                Owned = launchRecord != null && launchRecord.Owned,
+                LaunchProfile = launchRecord == null ? string.Empty : launchRecord.LaunchProfile
+            };
+            if (launchRecord == null || launchRecord.ProcessId <= 0) return result;
+            result.ProcessId = launchRecord.ProcessId;
+            result.ProcessStartTimeUtcTicks = launchRecord.ProcessStartTimeUtcTicks;
+            try
+            {
+                Process process = Process.GetProcessById(launchRecord.ProcessId);
+                result.Running = !process.HasExited && OwnsProcess(process);
+                if (result.Running)
+                {
+                    Dictionary<string, string> status = ReadStatus();
+                    if (status.ContainsKey("processId") &&
+                        status["processId"] == launchRecord.ProcessId.ToString())
+                        result.BootId = Get(status, "bootId");
+                }
+            }
+            catch { result.Running = false; }
+            return result;
         }
 
         private static string PipeName(string value)

@@ -87,6 +87,49 @@ finally {
     if (Test-Path -LiteralPath $testUserRoot) { Remove-Item -LiteralPath $testUserRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+$sourceValidation = Invoke-Client @('validate', '--bridge-root', $BridgeRoot, '--layout', 'source', '--json')
+if ($sourceValidation.valid -ne $true -or $sourceValidation.layout -ne 'source' -or
+    $sourceValidation.coordinator.status -notin @('available', 'buildable')) {
+    throw "source layout validation failed expected=source with coordinator state actual=$($sourceValidation | ConvertTo-Json -Compress)"
+}
+
+$invalidCoordinator = Join-Path ([IO.Path]::GetTempPath()) ('missing-coordinator-' + [Guid]::NewGuid().ToString('N') + '.exe')
+$invalidLayout = Invoke-Client @('validate', '--bridge-root', $BridgeRoot, '--layout', 'source', '--coordinator-path', $invalidCoordinator, '--json') 2
+if ($invalidLayout.valid -ne $false -or $invalidLayout.reason -ne 'coordinator_invalid') {
+    throw "invalid coordinator path was not structured expected=coordinator_invalid actual=$($invalidLayout | ConvertTo-Json -Compress)"
+}
+
+$ensureRoot = Join-Path ([IO.Path]::GetTempPath()) ('DevBridgeEnsure-' + [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($ensureRoot) | Out-Null
+$ensureProcessId = 0
+try {
+    $fakePowerShell = (Get-Process -Id $PID).Path
+    $ensure = Invoke-Client @('restart', 'ensure', '--bridge-root', $BridgeRoot, '--user-root', $ensureRoot,
+        '--game-path', $fakePowerShell, '--working-directory', (Split-Path -Parent $fakePowerShell),
+        '--arguments', '-NoProfile -Command "Start-Sleep -Seconds 30"', '--mod-configuration', 'managed-test',
+        '--readiness', 'bridge', '--save-policy', 'none', '--keep-running', '--timeout-ms', '250', '--json') 4
+    if ($ensure.restartRequested -ne $true -or [string]::IsNullOrWhiteSpace($ensure.ticket) -or
+        $ensure.ownership -ne 'coordinator-owned') {
+        throw "restart ensure did not persist ownership/ticket actual=$($ensure | ConvertTo-Json -Compress)"
+    }
+    $profilePath = Join-Path $ensureRoot 'RimWorld-DevBridge-ManagedTestLaunch.json'
+    if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) { throw 'managed launch profile was not persisted' }
+    $profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
+    foreach ($property in @('executable', 'workingDirectory', 'arguments', 'userDataRoot', 'modConfiguration')) {
+        if ([string]::IsNullOrWhiteSpace([string]$profile.$property)) { throw "managed profile field missing: $property" }
+    }
+    if ($ensure.details -and $ensure.details.ownership) { $ensureProcessId = [int]$ensure.details.ownership.ProcessId }
+}
+finally {
+    if ($ensureProcessId -gt 0) { Stop-Process -Id $ensureProcessId -Force -ErrorAction SilentlyContinue }
+    try {
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq 'RimWorldDevBridge.RestartCoordinator.exe' -and $_.CommandLine -like "*$ensureRoot*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    if (Test-Path -LiteralPath $ensureRoot) { Remove-Item -LiteralPath $ensureRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $mockRoot = Join-Path ([IO.Path]::GetTempPath()) ('DevBridgeClientMock-' + [Guid]::NewGuid().ToString('N'))
 $serverScript = Join-Path $mockRoot 'mock-server.ps1'
 $serverLog = Join-Path $mockRoot 'requests.log'
