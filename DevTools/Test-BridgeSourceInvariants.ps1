@@ -4,7 +4,10 @@ $sourceRoot = Join-Path $root "Source\RimWorldDevBridge"
 $runtime = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeRuntime.cs"))
 $gameComponent = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeGameComponent.cs"))
 $diagnostics = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeDiagnostics.cs"))
-$allSource = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeAdapterCatalog.cs")) + $runtime
+$projection = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeSnapshotProjection.cs"))
+$activation = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeFileActivation.cs"))
+$allSource = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeAdapterCatalog.cs")) +
+    [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeAdapterSourceDiscovery.cs")) + $runtime + $activation
 
 function Assert-Absent([string]$Text, [string]$Pattern, [string]$Label) {
     if ($Text -match $Pattern) { throw "$Label contains forbidden pattern: $Pattern" }
@@ -19,7 +22,7 @@ Assert-Absent $bootstrap "BridgeAdapterCatalog|BridgeOrchestration|BridgeFeature
 Assert-Absent $bootstrap "TcpListener|System\.Threading\.Timer|new Timer" "dormant bootstrap"
 Assert-Absent $gameComponent "GameComponentTick|GameComponentUpdate" "game component"
 Assert-Absent $diagnostics "AllPawnsSpawned\.ToList\(\)|AllThings\.ToList\(\)" "paged query capture"
-if ($diagnostics -notmatch "SnapshotProjectionOperation|currentCount") {
+if (($diagnostics + $projection) -notmatch "SnapshotProjectionOperation|Operation<|currentCount") {
     throw "Cooperative paged query projection is missing."
 }
 Assert-Absent $allSource "\.GetTypes\(\)|PatchAll\(" "bridge source"
@@ -28,12 +31,12 @@ if ([regex]::Matches($allSource, "AppDomain\.CurrentDomain\.GetAssemblies").Coun
 }
 
 if ($bootstrap -notmatch "EnsureUpdatePatch\(\)") { throw "Main-thread bootstrap update hook is missing." }
-if ($runtime -notmatch "StartDormantWatcher\(\)") { throw "Dormant wake watcher is missing." }
-if ($runtime -notmatch "WakeSignal\.Signal\(\)") { throw "Wake signal is missing." }
-$wakeStart = $runtime.IndexOf("private static void OnWakeFile", [StringComparison]::Ordinal)
-$wakeEnd = $runtime.IndexOf("private static void ProcessPendingFileSignals", $wakeStart, [StringComparison]::Ordinal)
+if ($runtime -notmatch "FileActivation\.Initialize\(\)") { throw "Dormant wake watcher is missing." }
+if ($activation -notmatch "wakeSignal\.Signal\(\)") { throw "Wake signal is missing." }
+$wakeStart = $activation.IndexOf("private void OnWakeFile", [StringComparison]::Ordinal)
+$wakeEnd = $activation.Length
 if ($wakeStart -lt 0 -or $wakeEnd -le $wakeStart) { throw "Wake callback boundaries were not found." }
-$wakeCallback = $runtime.Substring($wakeStart, $wakeEnd - $wakeStart)
+$wakeCallback = $activation.Substring($wakeStart, $wakeEnd - $wakeStart)
 Assert-Absent $wakeCallback "StartTransport|StopTransport|Harmony|BridgePaths\." "wake callback"
 if ($allSource -notmatch 'DevTools.*BridgeAdapters' -or
     $allSource -notmatch 'SearchOption\.TopDirectoryOnly') {
