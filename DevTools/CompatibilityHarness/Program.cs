@@ -80,6 +80,7 @@ internal static class Program
         Run("idempotency conflict", IdempotencyConflict);
         Run("pre-execution failure not cached", PreExecutionFailureNotCached);
         Run("idempotency copy preserves bounds", IdempotencyCopyPreservesBounds);
+        Run("adapter catalog concurrent readers", AdapterCatalogConcurrentReaders);
         Run("manifest adapter lifecycle", ManifestAdapterLifecycle);
         Run("owner adapter discovery and duplicate resolution", OwnerAdapterDiscoveryAndDuplicateResolution);
         string ownerAdapters = Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_OWNER_ADAPTERS");
@@ -1855,6 +1856,67 @@ internal static class Program
         }
         finally
         {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    private static void AdapterCatalogConcurrentReaders()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "RimWorldDevBridgeCatalogRace-" + Guid.NewGuid().ToString("N"));
+        string adapters = Path.Combine(root, "DevTools", "HotAdapters");
+        Directory.CreateDirectory(adapters);
+        try
+        {
+            string built = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BridgeFixtureAdapter.dll");
+            if (!File.Exists(built))
+                built = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                    "..", "..", "..", "FixtureAdapter", "bin", "Release", "net472", "BridgeFixtureAdapter.dll"));
+            byte[] bytes = File.ReadAllBytes(built);
+            string command = "CATALOG_RACE_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            string adapterId = "catalog-race-" + Guid.NewGuid().ToString("N");
+            WriteGeneration(adapters, bytes, AssemblyName.GetAssemblyName(built).FullName, Sha256(bytes),
+                "1", "2026-08-01T00:00:00Z", command, 1, 10, adapterId);
+            BridgePaths.Initialize(root);
+            BridgeAdapterSourceRecord source = new BridgeAdapterSourceRecord(
+                BridgeAdapterSourceKind.LegacyDevelopment, "Lan.RimWorldDevBridge", "legacy", adapters,
+                "legacy:catalog-race", 1, Array.Empty<BridgeLoadedModuleRecord>());
+            BridgeAdapterCatalog.IndexSynchronouslyForTests(Array.Empty<string>(), new[] { source });
+
+            List<Exception> failures = new List<Exception>();
+            object failureGate = new object();
+            Thread[] readers = Enumerable.Range(0, 8).Select(_ => new Thread(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 100; i++)
+                    {
+                        string state = BridgeAdapterCatalog.State;
+                        string fingerprint = BridgeAdapterCatalog.Fingerprint;
+                        List<BridgeCommandDescriptor> commands = BridgeAdapterCatalog.Commands.ToList();
+                        BridgeCommandDescriptor descriptor = BridgeAdapterCatalog.Describe(command);
+                        bool available = BridgeAdapterCatalog.IsAvailable(adapterId);
+                        BridgeResult health = BridgeAdapterCatalog.Health();
+                    }
+                }
+                catch (Exception exception)
+                {
+                    lock (failureGate) failures.Add(exception);
+                }
+            })).ToArray();
+            foreach (Thread reader in readers) reader.Start();
+            for (int i = 0; i < 5; i++)
+                BridgeAdapterCatalog.IndexAsynchronouslyForTests(Array.Empty<string>(), new[] { source }, i == 0 ? 150 : 0);
+            foreach (Thread reader in readers) reader.Join();
+            DateTime waitUntil = DateTime.UtcNow.AddSeconds(5);
+            while (BridgeAdapterCatalog.Indexing && DateTime.UtcNow < waitUntil) Thread.Sleep(10);
+            Check(failures.Count == 0, "concurrent catalog reader failed: " +
+                (failures.Count == 0 ? string.Empty : failures[0].GetBaseException().Message));
+            Check(!BridgeAdapterCatalog.Indexing, "concurrent catalog index did not settle");
+            Check(BridgeAdapterCatalog.Describe(command) != null, "concurrent catalog lost active command");
+        }
+        finally
+        {
+            try { RestoreFixtureAdapterCatalog(); } catch { }
             try { Directory.Delete(root, true); } catch { }
         }
     }
