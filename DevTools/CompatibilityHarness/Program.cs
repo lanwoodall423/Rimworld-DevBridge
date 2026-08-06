@@ -28,6 +28,8 @@ internal static class Program
         Run("agent identity isolation", AgentIdentityIsolation);
         Run("runtime boundary characterization", RuntimeBoundaryCharacterization);
         Run("finalize init defers before owner adoption", FinalizeInitDefersBeforeOwnerAdoption);
+        Run("diagnostic command registration characterization", DiagnosticCommandRegistrationCharacterization);
+        Run("event journal concurrent access", EventJournalConcurrentAccess);
         Run("invalid timeout rejected", InvalidTimeoutRejected);
         Run("out of range timeout rejected", OutOfRangeTimeoutRejected);
         Run("malformed option rejected", MalformedOptionRejected);
@@ -57,6 +59,7 @@ internal static class Program
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
         Run("remote mutation confirmation security", RemoteMutationConfirmationSecurity);
+        Run("audit projection and redaction", AuditProjectionAndRedaction);
         Run("remote mutation settings fail closed", RemoteMutationSettingsFailClosed);
         Run("mutation confirmation prompt stages", MutationConfirmationPromptStages);
         Run("mutation identity boundaries", MutationIdentityBoundaries);
@@ -233,6 +236,64 @@ internal static class Program
         BridgeRuntime.OnRootUpdate();
         Equal(executionThread, BridgeRuntime.FinalizeInitExecutionThreadIdForTests,
             "duplicate finalize ran more than once");
+    }
+
+    private static void DiagnosticCommandRegistrationCharacterization()
+    {
+        Dictionary<string, string> commands = new Dictionary<string, string>(StringComparer.Ordinal);
+        BridgeDiagnostics.Register((name, description, mode, cost, requiresMap, argumentSchema) =>
+        {
+            Check(!commands.ContainsKey(name), "duplicate diagnostic command " + name);
+            commands[name] = mode + "|" + cost + "|" + requiresMap + "|" + argumentSchema + "|" + description;
+        });
+
+        Equal(28, commands.Count, "diagnostic command count");
+        Check(commands.ContainsKey("PAWNS") && commands.ContainsKey("THINGS") &&
+            commands.ContainsKey("EVENTS") && commands.ContainsKey("LOAD_GAME"),
+            "diagnostic command set changed");
+        Check(commands["PAWNS"].StartsWith("PureRead|Normal|True|filter,limit,cursor,fields|",
+            StringComparison.Ordinal), "paged pawn descriptor changed");
+        Check(commands["SELECT"].StartsWith("UiOnly|Trivial|True|[session:map:]thingId|",
+            StringComparison.Ordinal), "selection descriptor changed");
+        Check(commands["LOAD_GAME"].StartsWith("PotentiallyDestructive|Simulation|False|name|",
+            StringComparison.Ordinal), "load descriptor changed");
+    }
+
+    private static void EventJournalConcurrentAccess()
+    {
+        int failures = 0;
+        Thread[] workers = Enumerable.Range(0, 8).Select(workerIndex => new Thread(() =>
+        {
+            try
+            {
+                for (int index = 0; index < 100; index++)
+                {
+                    BridgeEventJournal.Record("characterization-" + workerIndex,
+                        "detail-" + index + "|secret=should-be-clean");
+                    BridgeRequest request = Request("journal-" + workerIndex + "-" + index,
+                        BridgeRuntime.SessionId);
+                    request.Command = "EVENTS";
+                    request.Argument = "filter=characterization-" + workerIndex + "&limit=8";
+                    BridgeResult report = BridgeEventJournal.Report(request);
+                    Check(report.Status == BridgeStatus.OK, "concurrent event report failed");
+                }
+            }
+            catch { Interlocked.Increment(ref failures); }
+        })).ToArray();
+
+        foreach (Thread worker in workers) worker.Start();
+        foreach (Thread worker in workers) Check(worker.Join(5000), "event journal worker did not finish");
+        Equal(0, failures, "event journal concurrent access failures");
+
+        BridgeRequest finalRequest = Request("journal-final", BridgeRuntime.SessionId);
+        finalRequest.Command = "EVENTS";
+        finalRequest.Argument = "filter=characterization&limit=512";
+        BridgeResult finalReport = BridgeEventJournal.Report(finalRequest);
+        Equal(BridgeStatus.OK, finalReport.Status, "event journal final report status");
+        Check(finalReport.Lines.Count > 0 && finalReport.Lines.All(line => line.Contains("kind:characterization-")),
+            "event journal report lost concurrent records");
+        Check(finalReport.Lines.All(line => !line.Contains("|secret=should-be-clean")),
+            "event journal did not clean record delimiters");
     }
 
     private static void InvalidTimeoutRejected()
@@ -1108,6 +1169,41 @@ internal static class Program
             BridgeRuntime.ApplyRemoteMutationSettings();
             InvokeRotateSession("settings-fail-closed-cleanup");
         }
+    }
+
+    private static void AuditProjectionAndRedaction()
+    {
+        BridgeAuthorization authorization = new BridgeAuthorization();
+        authorization.RotateSession("audit-characterization-session");
+        string marker = "audit-characterization-" + Guid.NewGuid().ToString("N");
+        BridgeRequest request = Request(marker, "audit-characterization-session");
+        request.Command = "AUDIT_PROJECTION";
+        request.Mode = BridgeCommandMode.Reversible;
+        request.IdempotencyKey = marker + "-key";
+        request.AuthToken = "secret-transport-token-" + marker;
+        request.MutationGameLoaded = true;
+        request.MutationGameIdentity = "game|identity\r\n";
+        request.MutationSaveIdentity = "save-digest";
+        request.MutationSettingEnabled = true;
+        request.MutationConfirmationState = "confirmed";
+        request.AuthorizedLeaseContext = "sandbox";
+        request.AuthorizedLeaseExpiresUtc = DateTime.UtcNow.AddMinutes(1);
+        authorization.Audit(request, BridgeResult.Ok().WithMutation("mutation|detail\r\n"));
+
+        string line = null;
+        DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+        while (DateTime.UtcNow < deadline && line == null)
+        {
+            if (File.Exists(BridgePaths.AuditPath))
+                line = File.ReadAllLines(BridgePaths.AuditPath).LastOrDefault(value => value.Contains(marker));
+            if (line == null) Thread.Sleep(10);
+        }
+        Check(line != null, "audit projection was not written");
+        Check(line.Contains("gameIdentity=game/identity  |saveIdentity=save-digest") &&
+            line.Contains("mutation=mutation/detail  ") && line.Contains("leaseContext=sandbox") &&
+            line.Contains("confirmation=confirmed"), "audit authorization projection changed");
+        Check(!line.Contains("secret-transport-token-"), "audit projection leaked a transport token");
+        Check(!line.Contains("AuthToken") && !line.Contains("lease="), "audit projection leaked secret fields");
     }
 
     private static void MutationConfirmationPromptStages()
