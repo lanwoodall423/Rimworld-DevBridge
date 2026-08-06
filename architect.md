@@ -337,10 +337,10 @@ the current source tree; generated assemblies are excluded.
 
 | Composition root | Before | After | Change |
 | --- | ---: | ---: | ---: |
-| `BridgeRuntime.cs` | 1,266 lines | 861 lines | -405 (-32.0%) |
-| `BridgeAdapterCatalog.cs` | 1,343 lines | 644 lines | -699 (-52.0%) |
-| `BridgeDiagnostics.cs` | 1,225 lines | 781 lines | -444 (-36.2%) |
-| Combined hotspots | 3,834 lines | 2,286 lines | -1,548 (-40.4%) |
+| `BridgeRuntime.cs` | 1,266 lines | 862 lines | -404 (-31.9%) |
+| `BridgeAdapterCatalog.cs` | 1,343 lines | 641 lines | -702 (-52.3%) |
+| `BridgeDiagnostics.cs` | 1,225 lines | 779 lines | -446 (-36.4%) |
+| Combined hotspots | 3,834 lines | 2,282 lines | -1,552 (-40.5%) |
 
 The reduction is responsibility movement, not contract removal. The extracted
 runtime services cover lifecycle dispatch, lease expiry, status/file output,
@@ -349,7 +349,7 @@ The extracted adapter services cover source discovery, assembly verification,
 manifest validation, generation management, lazy loading, and execution health.
 The extracted diagnostics services cover command routing, cooperative snapshot
 projection, artifact serialization, and the bounded event journal. The current
-compatibility harness reports 68 cases, including the characterization tests
+compatibility harness reports 69 cases, including the characterization tests
 added before this pass for command registration, concurrent event access,
 audit redaction, and concurrent catalog readers.
 
