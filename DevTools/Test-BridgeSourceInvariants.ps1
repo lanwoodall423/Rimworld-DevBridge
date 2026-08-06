@@ -6,8 +6,9 @@ $gameComponent = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeGameCompon
 $diagnostics = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeDiagnostics.cs"))
 $projection = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeSnapshotProjection.cs"))
 $activation = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeFileActivation.cs"))
-$allSource = [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeAdapterCatalog.cs")) +
-    [IO.File]::ReadAllText((Join-Path $sourceRoot "BridgeAdapterSourceDiscovery.cs")) + $runtime + $activation
+$adapterSource = (Get-ChildItem -LiteralPath $sourceRoot -Filter "BridgeAdapter*.cs" -File |
+    ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+$allSource = $adapterSource + $runtime + $activation
 
 function Assert-Absent([string]$Text, [string]$Pattern, [string]$Label) {
     if ($Text -match $Pattern) { throw "$Label contains forbidden pattern: $Pattern" }
