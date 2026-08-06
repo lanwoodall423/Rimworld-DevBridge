@@ -454,7 +454,8 @@ function Invoke-Help {
             "discover", "wake", "read --command <name>", "call <command>",
             "lease acquire|inspect|renew|release", "mutate --command <name>", "cancel --request-id <id>",
             "context --package-id <id>", "describe --package-id <id>", "repo context", "adapter publish|reload",
-            "restart request|status|wait|register|launch|ensure", "validate --layout auto|source|package", "help"
+            "restart authorize-sandbox|revoke-sandbox|request|status|wait|register|launch|ensure",
+            "validate --layout auto|source|package", "help"
         )
         exitCodes = [ordered]@{ success = 0; invalidArguments = 2; pathOrUnavailable = 3; transport = 4; stale = 5; bridgeRejected = 6 }
         secrets = "transport and lease tokens are redacted; use --unsafe-debug only for explicit local debugging"
@@ -695,6 +696,7 @@ function Get-ManagedLaunchProfile([string[]] $values, $config, [string] $userRoo
         arguments = [string]$arguments
         userDataRoot = $profileUserRoot
         modConfiguration = [string]$modConfiguration
+        executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
         validatedUtc = [DateTime]::UtcNow.ToString("o")
     }
     Write-JsonAtomic $profilePath $profile
@@ -702,8 +704,122 @@ function Get-ManagedLaunchProfile([string[]] $values, $config, [string] $userRoo
     return $profile
 }
 
-function Get-AttachedGameProcesses {
-    try { return @(Get-Process -Name "RimWorldWin64" -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited }) }
+function Get-SandboxAuthorizationPath([string[]] $values, $config, [string] $userRoot) {
+    $path = Get-Value $values "--sandbox-authorization-path"
+    if ([string]::IsNullOrWhiteSpace($path) -and $config) { $path = [string]$config.sandboxAuthorizationPath }
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = Join-Path $userRoot "RimWorld-DevBridge-SandboxAuthorization.json" }
+    $fullPath = [IO.Path]::GetFullPath($path)
+    $rootPrefix = [IO.Path]::GetFullPath($userRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "sandbox_authorization_path_invalid: authorization must remain under the user root"
+    }
+    return $fullPath
+}
+
+function Test-SandboxAuthorizationProfile($authorization, $profile, [string] $userRoot) {
+    if ($null -eq $authorization -or $authorization.schema -ne 1 -or
+        $authorization.policy -ne "explicit-operator-disposable-sandbox" -or
+        $authorization.scope -ne "coordinator-owned-managed-test" -or
+        $authorization.profile -ne "managed-test" -or
+        $authorization.operatorConfirmed -ne $true) { return $false }
+    $pathMatches = [StringComparer]::OrdinalIgnoreCase
+    $stringMatches = [StringComparer]::Ordinal
+    return $pathMatches.Equals([IO.Path]::GetFullPath([string]$authorization.userDataRoot), $userRoot) -and
+        $pathMatches.Equals([IO.Path]::GetFullPath([string]$authorization.executable), [IO.Path]::GetFullPath([string]$profile.executable)) -and
+        $pathMatches.Equals([IO.Path]::GetFullPath([string]$authorization.workingDirectory), [IO.Path]::GetFullPath([string]$profile.workingDirectory)) -and
+        $stringMatches.Equals([string]$authorization.arguments, [string]$profile.arguments) -and
+        $stringMatches.Equals([string]$authorization.modConfiguration, [string]$profile.modConfiguration) -and
+        $stringMatches.Equals([string]$authorization.executableSha256, [string]$profile.executableSha256)
+}
+
+function Get-SandboxAuthorization([string[]] $values, $config, [string] $userRoot, $profile) {
+    $path = Get-SandboxAuthorizationPath $values $config $userRoot
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [ordered]@{ authorized = $false; reason = "sandbox_authorization_required"; path = $path }
+    }
+    try { $authorization = Read-JsonFile $path }
+    catch { return [ordered]@{ authorized = $false; reason = "sandbox_authorization_invalid"; path = $path } }
+    try {
+        if (-not (Test-SandboxAuthorizationProfile $authorization $profile $userRoot)) {
+            return [ordered]@{ authorized = $false; reason = "sandbox_authorization_scope_mismatch"; path = $path }
+        }
+    }
+    catch { return [ordered]@{ authorized = $false; reason = "sandbox_authorization_invalid"; path = $path } }
+    return [ordered]@{
+        authorized = $true
+        reason = "sandbox_authorized"
+        path = $path
+        authorizedUtc = [string]$authorization.authorizedUtc
+        scope = [string]$authorization.scope
+    }
+}
+
+function Invoke-SandboxAuthorization([string[]] $values, [bool] $revoke = $false) {
+    $config = Get-ClientConfig
+    $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
+    $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
+    if ($null -eq $bridgeRoot -or $null -eq $userRoot) {
+        $script:ExitCode = 3
+        return New-ErrorResult "configuration_error" "bridge and user roots are required"
+    }
+    try {
+        $path = Get-SandboxAuthorizationPath $values $config $userRoot
+        if ($revoke) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+            return [ordered]@{ ok = $true; status = "REVOKED"; authorizationPersisted = $false; path = $path }
+        }
+        if (-not (Has-Flag $values "--confirm-disposable-sandbox")) {
+            $script:ExitCode = 3
+            return New-ErrorResult "operator_confirmation_required" "Run restart authorize-sandbox with --confirm-disposable-sandbox once for this managed-test sandbox."
+        }
+        $profile = Get-ManagedLaunchProfile $values $config $userRoot
+        $authorization = [ordered]@{
+            schema = 1
+            policy = "explicit-operator-disposable-sandbox"
+            scope = "coordinator-owned-managed-test"
+            operatorConfirmed = $true
+            authorizedUtc = [DateTime]::UtcNow.ToString("o")
+            profile = "managed-test"
+            executable = $profile.executable
+            executableSha256 = $profile.executableSha256
+            workingDirectory = $profile.workingDirectory
+            arguments = $profile.arguments
+            userDataRoot = $profile.userDataRoot
+            modConfiguration = $profile.modConfiguration
+        }
+        Write-JsonAtomic $path $authorization
+        $attached = Get-AttachedGameProcesses $profile.executable
+        return [ordered]@{
+            ok = $true
+            status = "AUTHORIZED"
+            authorizationPersisted = $true
+            path = $path
+            scope = $authorization.scope
+            attachedProcessDetected = $attached.Count -gt 0
+            nextAction = if ($attached.Count -gt 0) { "close the attached process before restart ensure" } else { "use restart ensure" }
+        }
+    }
+    catch {
+        $script:ExitCode = 3
+        return New-ErrorResult "configuration_error" $_.Exception.Message
+    }
+}
+
+function Require-SandboxAuthorization([string[]] $values, $config, [string] $userRoot, $profile) {
+    $authorization = Get-SandboxAuthorization $values $config $userRoot $profile
+    if (-not $authorization.authorized) {
+        $script:ExitCode = 3
+        return New-ErrorResult $authorization.reason "Run restart authorize-sandbox --confirm-disposable-sandbox once for this validated managed-test profile."
+    }
+    return $authorization
+}
+
+function Get-AttachedGameProcesses([string] $gamePath) {
+    try {
+        $processName = [IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetFullPath($gamePath))
+        if ($processName -notmatch '^RimWorldWin64(?:Steam)?$') { return @() }
+        return @(Get-Process -Name $processName -ErrorAction SilentlyContinue | Where-Object { -not $_.HasExited })
+    }
     catch { return @() }
 }
 
@@ -743,6 +859,14 @@ function Invoke-RestartEnsure([string[]] $values) {
     $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
     try {
         $profile = Get-ManagedLaunchProfile $values $config $userRoot
+        $authorization = Get-SandboxAuthorization $values $config $userRoot $profile
+        if ($authorization.authorized -ne $true) {
+            $script:ExitCode = 3
+            $result = New-RestartEnsureResult "SANDBOX_AUTHORIZATION_REQUIRED" $false $false "unauthorized" "CONFIGURATION" `
+                "Run restart authorize-sandbox --confirm-disposable-sandbox once for this validated managed-test profile." `
+                "restart authorize-sandbox --confirm-disposable-sandbox" $authorization
+            return $result
+        }
         $layout = Get-BridgeLayout $bridgeRoot (Get-Value $values "--layout" "auto")
     }
     catch {
@@ -756,7 +880,7 @@ function Invoke-RestartEnsure([string[]] $values) {
     }
     $heartbeat = Invoke-Coordinator "heartbeat" $values
     $ownership = $heartbeat.ownership
-    $attached = Get-AttachedGameProcesses
+    $attached = Get-AttachedGameProcesses $profile.executable
     if (($ownership -and $ownership.running -and -not $ownership.owned) -or $attached.Count -gt 0) {
         $script:ExitCode = 4
         return New-RestartEnsureResult "USER_RESTART_REQUIRED" $false $false "attached" "USER_RESTART_REQUIRED" "Stop the manually attached RimWorld process, then rerun restart ensure." "rerun restart ensure after human restart" $heartbeat
@@ -802,6 +926,12 @@ function Invoke-RestartEnsure([string[]] $values) {
 }
 
 function Invoke-Wake([string[]] $values) {
+    if (Has-Flag $values "--start") {
+        $ensureValues = @($values)
+        if (-not ($values -contains "--readiness")) { $ensureValues += @("--readiness", "bridge") }
+        if (-not ($values -contains "--save-policy")) { $ensureValues += @("--save-policy", "none") }
+        return Invoke-RestartEnsure $ensureValues
+    }
     $config = Get-ClientConfig
     $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
     if ($null -eq $userRoot) { $script:ExitCode = 3; return New-ErrorResult "user_root_unavailable" "Supply --user-root or RIMWORLD_DEVBRIDGE_USER_ROOT." }
@@ -811,22 +941,8 @@ function Invoke-Wake([string[]] $values) {
     $status = Read-KeyFile $statusPath
     $started = $false
     if ($status["bridge"] -ne "ON" -and [string]::IsNullOrWhiteSpace($status["processId"])) {
-        if (-not (Has-Flag $values "--start")) {
-            $script:ExitCode = 3
-            return New-ErrorResult "process_not_running" "Use --start with --game-path, RIMWORLD_DEVBRIDGE_GAME_PATH, or configured gamePath."
-        }
-        $game = Resolve-GameExecutable (Get-Value $values "--game-path") $config
-        if ($null -eq $game) {
-            $script:ExitCode = 3
-            return New-ErrorResult "game_path_required" "Supply --game-path or RIMWORLD_DEVBRIDGE_GAME_PATH; no broad installation scan is performed."
-        }
-        $working = Split-Path -Parent $game
-        $gameArguments = Get-Value $values "--game-arguments" ""
-        $parameters = @{ FilePath = $game; WorkingDirectory = $working; PassThru = $true }
-        if (-not [string]::IsNullOrWhiteSpace($gameArguments)) { $parameters.ArgumentList = $gameArguments }
-        $process = Start-Process @parameters
-        $started = $true
-        $status = [ordered]@{ processId = $process.Id }
+        $script:ExitCode = 3
+        return New-ErrorResult "process_not_running" "Use restart ensure for a validated coordinator-owned managed-test launch."
     }
     if ($status["bridge"] -ne "ON") {
         [IO.File]::WriteAllText((Join-Path $userRoot "RimWorld-DevBridge-Wake.request"), "")
@@ -919,7 +1035,9 @@ function Invoke-Coordinator([string] $operation, [string[]] $values, [bool] $Ens
     for ($index = 0; $index -lt $values.Count; $index++) {
         $value = $values[$index]
         if ($value -in @("--bridge-root", "--user-root", "--layout", "--coordinator-path", "--launch-profile-path", "--profile-user-root")) { $index++; continue }
-        if ($value -in @("--ensure-runtime-tools", "--keep-running", "--json", "--unsafe-debug")) { continue }
+        if ($value -in @("--ensure-runtime-tools", "--keep-running", "--json", "--unsafe-debug", "--confirm-disposable-sandbox")) { continue }
+        if ($value -eq "--sandbox-authorization-path") { $index++; continue }
+        if ($value.StartsWith("--sandbox-authorization-path=", [StringComparison]::OrdinalIgnoreCase)) { continue }
         if ($value -like "--*" -and -not $value.Contains("=")) {
             $base += $value
             if ($index + 1 -lt $values.Count -and -not $values[$index + 1].StartsWith("--")) { $base += $values[$index + 1]; $index++ }
@@ -1046,12 +1164,21 @@ try {
             throw "adapter_operation_invalid: use publish or reload"
         }
         "restart" {
-            if ($args.Count -lt 1) { throw "restart_operation_required: use request, status, wait, register, launch, or ensure" }
+            if ($args.Count -lt 1) { throw "restart_operation_required: use authorize-sandbox, revoke-sandbox, request, status, wait, register, launch, or ensure" }
+            if ($args[0] -eq "authorize-sandbox") { $result = Invoke-SandboxAuthorization $args; break }
+            if ($args[0] -eq "revoke-sandbox") { $result = Invoke-SandboxAuthorization $args $true; break }
             if ($args[0] -eq "ensure") { $result = Invoke-RestartEnsure $args; break }
             if ($args[0] -eq "launch") {
                 try {
                     $launchRoot = Resolve-UserRoot (Get-Value $args "--user-root") $config
-                    Get-ManagedLaunchProfile $args $config $launchRoot | Out-Null
+                    $launchProfile = Get-ManagedLaunchProfile $args $config $launchRoot
+                    $launchAuthorization = Require-SandboxAuthorization $args $config $launchRoot $launchProfile
+                    if ($launchAuthorization.authorized -ne $true) { $result = $launchAuthorization; break }
+                    if ((Get-AttachedGameProcesses $launchProfile.executable).Count -gt 0) {
+                        $script:ExitCode = 4
+                        $result = New-ErrorResult "attached_process_user_restart_required" "The configured RimWorld process is attached; no process was claimed or stopped."
+                        break
+                    }
                 }
                 catch {
                     $script:ExitCode = 3

@@ -90,7 +90,8 @@ owner, drains lifecycle work before dormant return, and executes finalization on
 duplicate notifications are discarded.
 
 The canonical client supports `discover`, `wake`, `read`, `context`, `describe`, `call`, `mutate`,
-`cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and `restart request|status|wait|ensure`.
+`cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and
+`restart authorize-sandbox|revoke-sandbox|request|status|wait|ensure`.
 It emits JSON on stdout and diagnostics on stderr. Idempotency keys are generated for mutations when
 omitted and are returned in the JSON response; callers should supply the same key for an intentional retry.
 Transport and lease secrets are redacted unless `--unsafe-debug` is explicitly supplied.
@@ -107,6 +108,18 @@ For unattended managed verification, persist and validate a `managed-test` launc
   --game-path <validated-executable> --user-data-root <existing-user-root> `
   --mod-configuration managed-test --readiness bridge --save-policy none --keep-running --json
 ```
+
+An operator can authorize that validated profile once for unattended sandbox control:
+
+```powershell
+& ".\DevTools\devbridge.ps1" restart authorize-sandbox `
+  --game-path <validated-executable> --user-data-root <existing-user-root> `
+  --mod-configuration managed-test --confirm-disposable-sandbox --json
+```
+
+The authorization is local to the user root, binds the executable hash and complete launch profile, and
+allows later agents to launch or restart only that coordinator-owned managed-test process. It can be
+removed with `restart revoke-sandbox`; it never authorizes an attached process, mutation, or write lease.
 
 The profile records the executable, working directory, arguments, user-data root, mod configuration, and
 validation time. Ensure coalesces compatible requests by restart cycle, rotates stale coordinator builds,

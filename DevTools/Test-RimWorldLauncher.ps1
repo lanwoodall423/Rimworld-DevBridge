@@ -17,6 +17,11 @@ $testUserRoot = Join-Path ([IO.Path]::GetTempPath()) ("RimWorldDevBridgeLauncher
 [IO.Directory]::CreateDirectory($testUserRoot) | Out-Null
 $output = $null
 try {
+    $client = Join-Path $root "DevTools\devbridge.ps1"
+    & $shell -NoProfile -ExecutionPolicy Bypass -File $client restart authorize-sandbox --bridge-root $root --user-root $testUserRoot `
+        --game-path $env:ComSpec --working-directory (Split-Path -Parent $env:ComSpec) --arguments $gameArguments `
+        --mod-configuration managed-test --confirm-disposable-sandbox --json 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "sandbox authorization failed with exit code $LASTEXITCODE" }
     $output = & $shell -NoProfile -ExecutionPolicy Bypass -File $launcher -GamePath $env:ComSpec `
         -UserRoot $testUserRoot -ModConfiguration managed-test -GameProcessName RimWorldLauncherSynthetic `
         -NoQuickTest -SkipBuild -GameArguments $gameArguments -StartupTimeoutSeconds $TimeoutSeconds 2>&1

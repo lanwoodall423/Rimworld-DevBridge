@@ -65,7 +65,10 @@ user-data root, mod configuration, and validation time; it starts only a validat
 profile, detects and replaces a stale coordinator serving the same coordinator root, coalesces compatible
 restart requests, and preserves `keep-running`. Coordinator ownership is not mutation authority: restart
 does not acquire a write lease, and attached/live game processes remain under human or external-orchestrator
-control.
+control. A human operator may authorize one validated managed-test profile once with
+`restart authorize-sandbox --confirm-disposable-sandbox`; that profile/hash-bound authorization persists
+under the user root for later coordinator-owned launches and can be revoked without authorizing attached
+processes or gameplay mutation.
 
 ## Selected architecture
 

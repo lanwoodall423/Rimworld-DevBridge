@@ -104,10 +104,36 @@ $ensureRoot = Join-Path ([IO.Path]::GetTempPath()) ('DevBridgeEnsure-' + [Guid]:
 $ensureProcessId = 0
 try {
     $fakePowerShell = (Get-Process -Id $PID).Path
-    $ensure = Invoke-Client @('restart', 'ensure', '--bridge-root', $BridgeRoot, '--user-root', $ensureRoot,
-        '--game-path', $fakePowerShell, '--working-directory', (Split-Path -Parent $fakePowerShell),
-        '--arguments', '-NoProfile -Command "Start-Sleep -Seconds 30"', '--mod-configuration', 'managed-test',
-        '--readiness', 'bridge', '--save-policy', 'none', '--keep-running', '--timeout-ms', '250', '--json') 4
+    $profileArguments = @('--game-path', $fakePowerShell, '--working-directory', (Split-Path -Parent $fakePowerShell),
+        '--arguments', '-NoProfile -Command "Start-Sleep -Seconds 30"', '--mod-configuration', 'managed-test')
+    $ensureBase = @('--bridge-root', $BridgeRoot, '--user-root', $ensureRoot) + $profileArguments
+    $missingAuthorization = Invoke-Client (@('restart', 'ensure') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--timeout-ms', '250', '--json')) 3
+    if ($missingAuthorization.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED' -or $missingAuthorization.operatorActionRequired -ne $true) {
+        throw "missing sandbox authorization was not required actual=$($missingAuthorization | ConvertTo-Json -Compress)"
+    }
+    $wakeStart = Invoke-Client (@('wake', '--start') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--timeout-ms', '250', '--json')) 3
+    if ($wakeStart.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED') {
+        throw "wake start bypassed sandbox authorization actual=$($wakeStart | ConvertTo-Json -Compress)"
+    }
+    $authorization = Invoke-Client (@('restart', 'authorize-sandbox') + $ensureBase + @('--confirm-disposable-sandbox', '--json'))
+    if ($authorization.status -ne 'AUTHORIZED' -or $authorization.authorizationPersisted -ne $true) {
+        throw "sandbox authorization was not persisted actual=$($authorization | ConvertTo-Json -Compress)"
+    }
+    $authorizationPath = Join-Path $ensureRoot 'RimWorld-DevBridge-SandboxAuthorization.json'
+    if (-not (Test-Path -LiteralPath $authorizationPath -PathType Leaf)) { throw 'sandbox authorization file was not persisted' }
+    $authorizationFile = Get-Content -LiteralPath $authorizationPath -Raw | ConvertFrom-Json
+    if ($authorizationFile.scope -ne 'coordinator-owned-managed-test' -or $authorizationFile.operatorConfirmed -ne $true) {
+        throw "sandbox authorization scope was not persisted safely actual=$($authorizationFile | ConvertTo-Json -Compress)"
+    }
+    $revoked = Invoke-Client (@('restart', 'revoke-sandbox') + $ensureBase + @('--json'))
+    if ($revoked.status -ne 'REVOKED' -or (Test-Path -LiteralPath $authorizationPath -PathType Leaf)) {
+        throw "sandbox authorization was not revoked actual=$($revoked | ConvertTo-Json -Compress)"
+    }
+    $authorization = Invoke-Client (@('restart', 'authorize-sandbox') + $ensureBase + @('--confirm-disposable-sandbox', '--json'))
+    if ($authorization.status -ne 'AUTHORIZED' -or $authorization.authorizationPersisted -ne $true) {
+        throw "sandbox authorization could not be restored actual=$($authorization | ConvertTo-Json -Compress)"
+    }
+    $ensure = Invoke-Client (@('restart', 'ensure') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--keep-running', '--timeout-ms', '250', '--json')) 4
     if ($ensure.restartRequested -ne $true -or [string]::IsNullOrWhiteSpace($ensure.ticket) -or
         $ensure.ownership -ne 'coordinator-owned') {
         throw "restart ensure did not persist ownership/ticket actual=$($ensure | ConvertTo-Json -Compress)"

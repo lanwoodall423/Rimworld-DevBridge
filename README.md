@@ -52,6 +52,7 @@ pwsh -File .\DevTools\devbridge.ps1 describe --package-id Lan.RimWorldDevBridge 
 pwsh -File .\DevTools\devbridge.ps1 read --command STATUS --json
 pwsh -File .\DevTools\devbridge.ps1 call SYNC --json
 pwsh -File .\DevTools\devbridge.ps1 validate --layout auto --json
+pwsh -File .\DevTools\devbridge.ps1 restart authorize-sandbox --game-path <path> --user-data-root <existing-root> --mod-configuration managed-test --confirm-disposable-sandbox --json
 pwsh -File .\DevTools\devbridge.ps1 restart ensure --readiness bridge --save-policy none --keep-running --json
 ```
 
@@ -68,9 +69,13 @@ temporary compatibility wrapper and delegates to `devbridge.ps1`.
 
 `restart ensure` is for explicitly configured, coordinator-owned managed-test processes. It validates
 the executable, working directory, existing user-data root, arguments, and `managed-test` mod
-configuration, persists the launch profile, and returns a structured ticket/readiness handshake. It does
-not grant mutation authority or acquire a write lease. Attached or live RimWorld processes are never
-claimed or stopped; they return `USER_RESTART_REQUIRED` for human or external-orchestrator action.
+configuration, persists the launch profile, and returns a structured ticket/readiness handshake. Run
+`restart authorize-sandbox --confirm-disposable-sandbox` once after a human operator has identified that
+managed-test profile as disposable. The authorization is stored under the user root and is bound to the
+validated executable hash and launch profile; future agents can launch or restart that coordinator-owned
+profile without another prompt. Use `restart revoke-sandbox` to remove it. Authorization does not grant
+mutation authority or acquire a write lease. Attached or live RimWorld processes are never claimed or
+stopped; they return `USER_RESTART_REQUIRED` for human or external-orchestrator action.
 
 Lease and mutation examples:
 
