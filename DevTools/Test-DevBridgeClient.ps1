@@ -68,13 +68,13 @@ try {
     }
     $wait = Invoke-Client @('restart', 'wait', '--bridge-root', $BridgeRoot, '--user-root', $testUserRoot,
         '--ticket', $restart.ticket, '--timeout-ms', '250', '--json') 4
-    if ($wait.error -ne 'coordinator_wait_timeout' -or $wait.ticket -ne $restart.ticket) {
-        throw "durable restart wait failed expected=timeout for ticket actual=$($wait | ConvertTo-Json -Compress)"
+    if ($wait.ticket -ne $restart.ticket -or $wait.error -notin @('coordinator_wait_timeout', 'attached_process_user_restart_required')) {
+        throw "durable restart wait failed expected=timeout or protected attached refusal for ticket actual=$($wait | ConvertTo-Json -Compress)"
     }
     $unauthorized = Invoke-Client @('restart', 'request', '--bridge-root', $BridgeRoot, '--user-root', $testUserRoot,
         '--agent-id', 'client-live-agent', '--package-id', 'client.test', '--reason', 'live test',
-        '--readiness', 'game', '--live-confirmed', '--save-policy', 'none', '--json')
-    if ($unauthorized.ok -ne $true -or $unauthorized.phase -ne 'FAILED') {
+        '--readiness', 'game', '--live-confirmed', '--save-policy', 'none', '--json') 4
+    if ($unauthorized.ok -ne $false -or $unauthorized.phase -ne 'FAILED') {
         throw "live restart authorization was not rejected expected=FAILED actual=$($unauthorized | ConvertTo-Json -Compress)"
     }
 }
@@ -220,6 +220,11 @@ $server = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-Execution
     '-UserRoot', $mockRoot, '-Port', $mockPort, '-ProcessId', $PID, '-Mvid', $mockMvid, '-LogPath', $serverLog) -PassThru -WindowStyle Hidden
 try {
     Start-Sleep -Milliseconds 250
+    $inactiveRecovery = Invoke-Client @('discover', '--bridge-root', $BridgeRoot, '--user-root', $mockRoot,
+        '--startup-timeout-ms', '3000', '--progress-interval-ms', '100', '--json')
+    if ($inactiveRecovery.available -ne $true -or $inactiveRecovery.activationRecovered -ne $true) {
+        throw "inactive bridge recovery failed expected=activationRecovered actual=$($inactiveRecovery | ConvertTo-Json -Compress)"
+    }
     $wake = Invoke-Client @('wake', '--bridge-root', $BridgeRoot, '--user-root', $mockRoot,
         '--timeout-ms', '5000', '--json')
     if ($wake.available -ne $true -or $wake.woke -ne $true) {

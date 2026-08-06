@@ -116,7 +116,7 @@ namespace RimWorldDevBridge
         public BridgeRestartTicketRecord Request(string agentId, string packageId, string reason,
             string readiness, string savePolicy, string requiredCoreFingerprint,
             string requiredAdapterFingerprint, bool ownedSandbox, bool liveConfirmedAuthorized,
-            bool liveConfirmed = false)
+            bool liveConfirmed = false, bool processAlreadyStarted = false)
         {
             lock (gate)
             {
@@ -143,7 +143,8 @@ namespace RimWorldDevBridge
                         SavePolicy = savePolicy,
                         RequiredCoreFingerprint = requiredCoreFingerprint ?? string.Empty,
                         RequiredAdapterFingerprint = requiredAdapterFingerprint ?? string.Empty,
-                        Phase = BridgeRestartPhase.REQUESTED.ToString(),
+                         Phase = (processAlreadyStarted ? BridgeRestartPhase.WAITING_FOR_BRIDGE :
+                             BridgeRestartPhase.REQUESTED).ToString(),
                         OwnedProcess = ownedSandbox,
                         LiveConfirmed = liveConfirmed,
                         CreatedUtc = DateTime.UtcNow,
@@ -159,9 +160,10 @@ namespace RimWorldDevBridge
                     if (string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint))
                         cycle.RequiredAdapterFingerprint = requiredAdapterFingerprint ?? string.Empty;
                 }
+                BridgeRestartPhase ticketPhase = ParsePhase(cycle.Phase);
                 BridgeRestartTicketRecord ticket = NewTicket(cycle.CycleId, agentId, packageId, reason,
                     readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
-                    BridgeRestartPhase.REQUESTED, "restart_requested");
+                    ticketPhase, "restart_requested");
                 cycle.TicketIds.Add(ticket.Ticket);
                 state.Tickets.Add(ticket);
                 cycle.UpdatedUtc = DateTime.UtcNow;
@@ -433,7 +435,8 @@ namespace RimWorldDevBridge
             if (from == BridgeRestartPhase.DRAINED && to == BridgeRestartPhase.STOPPING) return true;
             if (from == BridgeRestartPhase.STOPPING && to == BridgeRestartPhase.STARTING) return true;
             if (from == BridgeRestartPhase.STARTING && to == BridgeRestartPhase.WAITING_FOR_BRIDGE) return true;
-            if (from == BridgeRestartPhase.WAITING_FOR_BRIDGE && to == BridgeRestartPhase.WAITING_FOR_GAME) return true;
+            if (from == BridgeRestartPhase.WAITING_FOR_BRIDGE &&
+                (to == BridgeRestartPhase.WAITING_FOR_GAME || to == BridgeRestartPhase.READY)) return true;
             if (from == BridgeRestartPhase.WAITING_FOR_GAME && to == BridgeRestartPhase.READY) return true;
             return false;
         }

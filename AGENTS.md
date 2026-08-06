@@ -11,6 +11,7 @@
 - Client output is JSON on stdout with diagnostics on stderr; use `--agent-id` only for an explicit override.
 - Layout validation: `devbridge.ps1 validate --layout auto|source|package --json`; source validation may report and build a missing coordinator with `--ensure-runtime-tools`.
 - Managed runtime verification: `devbridge.ps1 restart ensure --game-path <path> --user-data-root <existing-root> --mod-configuration managed-test --readiness bridge|game|map --save-policy none|development-copy --json`.
+- Runtime recovery: `bridge_not_active` is recoverable. Activate the authorized managed-test instance and wait for bridge readiness before abandoning runtime verification. Read-only operations use bounded `--startup-timeout-ms` and `--progress-interval-ms`, refresh discover/context/STATUS, and retry once when safe.
 - One-time sandbox authorization: `devbridge.ps1 restart authorize-sandbox --game-path <path> --user-data-root <existing-root> --mod-configuration managed-test --confirm-disposable-sandbox --json`; revoke with `restart revoke-sandbox`. Authorization is profile/hash-bound and only permits later coordinator-owned managed-test launch/restart.
 - Coordinator workflow test: `DevTools/Test-RestartCoordinator.ps1`; it covers validated launch profiles, ownership, coalescing, stale coordinator replacement, and attached-process refusal.
 - Before runtime tests, query live context with `DevTools\devbridge.ps1 discover --json` and `context --package-id Lan.RimWorldDevBridge --json`.

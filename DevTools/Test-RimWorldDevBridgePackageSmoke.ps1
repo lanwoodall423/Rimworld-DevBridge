@@ -28,9 +28,20 @@ try {
         throw 'packaged manifest validation did not pass'
     }
 
-    $discoverOutput = & powershell.exe @arguments discover --bridge-root $root --user-root $userRoot --json 2>$null
-    if ($LASTEXITCODE -ne 4) { throw "offline discovery exit code expected=4 actual=$LASTEXITCODE" }
-    $discover = ($discoverOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $discoverOutput = @(& powershell.exe @arguments discover --bridge-root $root --user-root $userRoot --json 2>&1)
+        $discoverExitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previousErrorActionPreference }
+    if ($discoverExitCode -ne 4) { throw "offline discovery exit code expected=4 actual=$discoverExitCode" }
+    $discoverJson = @($discoverOutput |
+        Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+        ForEach-Object { [string]$_ } |
+        Where-Object { $_.TrimStart().StartsWith('{') }) | Select-Object -Last 1
+    if ([string]::IsNullOrWhiteSpace($discoverJson)) { throw 'offline discovery did not emit structured JSON on stdout' }
+    $discover = [string]$discoverJson | ConvertFrom-Json
     if ($discover.available -ne $false -or [string]::IsNullOrWhiteSpace($discover.reason)) {
         throw 'offline discovery did not return a structured unavailable result'
     }

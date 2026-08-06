@@ -310,11 +310,16 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse Request(CoordinatorMessage message)
         {
+            return Request(message, false);
+        }
+
+        private CoordinatorResponse Request(CoordinatorMessage message, bool processAlreadyStarted)
+        {
             bool owned = launchRecord != null && launchRecord.Owned;
             BridgeRestartTicketRecord ticket = machine.Request(message.AgentId, message.PackageId,
                 message.Reason, message.Readiness, message.SavePolicy, message.RequiredCoreFingerprint,
                 message.RequiredAdapterFingerprint, owned, message.LiveConfirmedAuthorized,
-                message.LiveConfirmed);
+                message.LiveConfirmed, processAlreadyStarted);
             Persist("request " + ticket.Ticket);
             return TicketResponse(ticket);
         }
@@ -395,6 +400,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 }
                 CoordinatorResponse launched = Launch(message);
                 if (!launched.Ok) return launched;
+                return Request(message, true);
             }
             return Request(message);
         }
@@ -474,6 +480,20 @@ namespace RimWorldDevBridge.RestartCoordinator
                         machine.SetCycleIdentity(cycle.CycleId, Get(beforeDrain, "processId"),
                             Get(beforeDrain, "bootId"));
                         cycle = machine.Cycle(cycle.CycleId);
+
+                        string observedPid = Get(beforeDrain, "processId");
+                        bool observedProcessRunning = IsProcessRunning(observedPid);
+                        bool ownedObservedProcess = launchRecord != null && launchRecord.Owned &&
+                            observedPid == launchRecord.ProcessId.ToString() && observedProcessRunning;
+                        bool bridgeActive = string.Equals(Get(beforeDrain, "bridge"), "ON",
+                            StringComparison.OrdinalIgnoreCase);
+                        if (!observedProcessRunning || (ownedObservedProcess && !bridgeActive))
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.DRAINED,
+                                "no_active_bridge_to_drain");
+                            Persist("drained without active bridge");
+                            break;
+                        }
                     }
                     if (TryBridge("RESTART_DRAIN_STATUS", cycle, out string drainResponse) &&
                         drainResponse.IndexOf("drained=true", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -503,10 +523,26 @@ namespace RimWorldDevBridge.RestartCoordinator
                     StartOwnedForCycle(cycle);
                     break;
                 case BridgeRestartPhase.WAITING_FOR_BRIDGE:
+                    if (launchRecord != null && launchRecord.Owned && launchRecord.ProcessId > 0 &&
+                        !IsProcessRunning(launchRecord.ProcessId.ToString()))
+                    {
+                        machine.Fail(cycle.CycleId, "game_process_exited");
+                        Persist("game process exited");
+                        break;
+                    }
                     if (ReadyForBridge(cycle))
                     {
-                        machine.SetPhase(cycle.CycleId, BridgeRestartPhase.WAITING_FOR_GAME);
-                        Persist("bridge ready cycle=" + cycle.CycleId);
+                        if (string.Equals(cycle.Readiness, "bridge", StringComparison.OrdinalIgnoreCase))
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.READY,
+                                "bridge_ready_reacquire_write_authority");
+                            Persist("bridge ready cycle=" + cycle.CycleId);
+                        }
+                        else
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.WAITING_FOR_GAME);
+                            Persist("bridge ready; waiting for game cycle=" + cycle.CycleId);
+                        }
                     }
                     break;
                 case BridgeRestartPhase.WAITING_FOR_GAME:
@@ -524,8 +560,10 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             try
             {
-                Process process = launchRecord == null || launchRecord.ProcessId == 0 ? null :
-                    Process.GetProcessById(launchRecord.ProcessId);
+                Process process = null;
+                if (launchRecord != null && launchRecord.ProcessId != 0 &&
+                    IsProcessRunning(launchRecord.ProcessId.ToString()))
+                    process = Process.GetProcessById(launchRecord.ProcessId);
                 if (process != null && !process.HasExited)
                 {
                     if (!OwnsProcess(process))
@@ -545,6 +583,11 @@ namespace RimWorldDevBridge.RestartCoordinator
                 }
                 machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STARTING);
                 Persist("stopped cycle=" + cycle.CycleId);
+            }
+            catch (ArgumentException)
+            {
+                machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STARTING);
+                Persist("owned process exited before stop");
             }
             catch (Exception exception)
             {
@@ -725,6 +768,16 @@ namespace RimWorldDevBridge.RestartCoordinator
             }
         }
 
+        private static bool IsProcessRunning(string processId)
+        {
+            if (!int.TryParse(processId, out int pid) || pid <= 0) return false;
+            try
+            {
+                using (Process process = Process.GetProcessById(pid)) return !process.HasExited;
+            }
+            catch { return false; }
+        }
+
         private void Persist(string journal)
         {
             BridgeRestartCoordinatorState snapshot = machine.Snapshot;
@@ -758,16 +811,21 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse TicketResponse(BridgeRestartTicketRecord ticket, string error = null)
         {
+            string terminalError = error;
+            if (string.IsNullOrWhiteSpace(terminalError) && ticket != null &&
+                (ticket.Phase == BridgeRestartPhase.FAILED.ToString() ||
+                 ticket.Phase == BridgeRestartPhase.USER_RESTART_REQUIRED.ToString()))
+                terminalError = string.IsNullOrWhiteSpace(ticket.Completion) ? ticket.Reason : ticket.Completion;
             return new CoordinatorResponse
             {
-                Ok = ticket != null && error == null,
-                Error = error,
+                Ok = ticket != null && string.IsNullOrWhiteSpace(terminalError),
+                Error = terminalError,
                 Ticket = ticket?.Ticket,
                 CycleId = ticket?.CycleId,
                 Phase = ticket?.Phase,
                 Json = ticket == null ? null : Program.Json(ticket),
                 OwnershipJson = Program.Json(GetOwnership()),
-                ExitCode = error == null ? 0 : 4
+                ExitCode = string.IsNullOrWhiteSpace(terminalError) ? 0 : 4
             };
         }
 

@@ -63,7 +63,7 @@ under RimWorld user data. Stable denial codes are `remote_mutation_disabled`, `n
 
 ## Efficient Workflow
 
-1. Run `DevTools/devbridge.ps1 discover --json`, then `wake --json` if transport is dormant.
+1. Run `DevTools/devbridge.ps1 discover --json`. `bridge_not_active` is recoverable. Activate the authorized managed-test instance and wait for bridge readiness before abandoning runtime verification.
 2. Query `context --package-id Lan.RimWorldDevBridge --json` and retrieve descriptors with
    `describe --package-id Lan.RimWorldDevBridge --json`.
 3. Start with `DevTools/devbridge.ps1 read --command STATUS --json`, `MAP_SUMMARY`, or another adapter summary.
@@ -73,6 +73,20 @@ under RimWorld user data. Stable denial codes are `remote_mutation_disabled`, `n
    cursors with `snapshot_cursor_required`; other paged commands retain the legacy cursor behavior.
 5. Use `DevTools/devbridge.ps1 adapter reload --package-id <id> --json` after publishing a new adapter generation.
 6. Use `DevTools/devbridge.ps1 read --command ADAPTER_HEALTH --json`, `SCHEDULER_METRICS`, `COMMAND_METRICS`, and `PERFORMANCE` for evidence.
+
+When a read-only runtime operation reports `bridge_not_active`, the canonical client first
+signals wake, then uses the authorized managed-test profile through `restart ensure` when the
+process is absent, stale, or has mismatched assemblies. Activation uses readiness `bridge`, save
+policy `none`, and `--keep-running`; concurrent clients coalesce on one persisted activation
+cycle. Progress is emitted as structured JSON diagnostics on stderr. After readiness the client
+discards stale context, refreshes discover, context, and `STATUS`, and retries the original
+read-only operation once. Startup is bounded by `--startup-timeout-ms`.
+
+Structured activation failures are `activation_in_progress`, `activation_timeout`,
+`managed_profile_missing`, `sandbox_authorization_missing`, `runtime_build_required`,
+`deployment_mismatch`, `attached_process_requires_operator`, `game_process_exited`, and
+`bridge_load_failed`. Activation never claims or terminates an unrelated manually launched
+RimWorld process and never grants mutation authorization or a write lease.
 
 Multiple clients have isolated request IDs and responses. RimWorld/Unity access is serialized on
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit

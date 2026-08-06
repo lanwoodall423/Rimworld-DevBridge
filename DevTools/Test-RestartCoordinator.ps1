@@ -52,6 +52,26 @@ try {
     $status = Invoke-Coordinator 'status' @('--ticket', $first.Ticket)
     if (-not $status.OwnershipJson) { throw 'status did not preserve ownership projection' }
 
+    $failedRoot = Join-Path $root 'failed-game'
+    [IO.Directory]::CreateDirectory($failedRoot) | Out-Null
+    Start-CoordinatorServer $failedRoot $CoordinatorPath
+    $failedArguments = '-NoProfile -Command "exit 7"'
+    $failedLaunch = & $CoordinatorPath launch '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--game-path' $game '--working-directory' $working '--arguments' $failedArguments '--user-data-root' $userRoot `
+        '--mod-configuration' 'managed-test' '--launch-profile' 'managed-test' '--owned' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "failed-game launch failed: $failedLaunch" }
+    $failedEnsure = & $CoordinatorPath ensure '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--agent-id' 'failed-game-agent' '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
+        '--timeout-ms' '3000' '--owned' 2>&1 | Out-String
+    $failedEnsureJson = $failedEnsure.Trim() | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($failedEnsureJson.Ticket)) { throw "failed-game ensure returned no ticket: $failedEnsure" }
+    $failedWait = & $CoordinatorPath wait '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--ticket' $failedEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
+    $failedWaitJson = $failedWait.Trim() | ConvertFrom-Json
+    if ($failedWaitJson.Phase -ne 'FAILED' -or $failedWaitJson.Error -ne 'game_process_exited') {
+        throw "failed-game exit was not classified safely: $failedWait"
+    }
+
     $staleOutput = Join-Path $root 'stale-output'
     [IO.Directory]::CreateDirectory($staleOutput) | Out-Null
     $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
@@ -91,7 +111,7 @@ try {
     $attachedResult = $attached.Trim() | ConvertFrom-Json
     if ($attachedResult.Error -ne 'attached_process_user_restart_required') { throw 'attached ensure did not fail closed' }
 
-    Write-Output 'restartCoordinator=PASS launch=owned ensure=coalesced stale=rotated attached=protected'
+    Write-Output 'restartCoordinator=PASS launch=owned ensure=coalesced failed=classified stale=rotated attached=protected'
 }
 finally {
     foreach ($processId in $processIds) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
