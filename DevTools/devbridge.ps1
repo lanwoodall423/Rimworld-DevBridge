@@ -497,6 +497,12 @@ function Invoke-Help {
         secrets = "transport and lease tokens are redacted; use --unsafe-debug only for explicit local debugging"
         activation = "bridge_not_active is recoverable. Activate the authorized managed-test instance and wait for bridge readiness before abandoning runtime verification."
         activationOptions = @("--startup-timeout-ms <100..600000>", "--progress-interval-ms <100..10000>")
+        managedLaunch = [ordered]@{
+            maxAttempts = "--max-launch-attempts <1..5> (default 2)"
+            backoff = "--launch-backoff-ms <0..10000> (default 500)"
+            deadCoordinatorOwnedProcess = "automatically validate identity, clear stale ownership, and retry; never return USER_RESTART_REQUIRED for a dead coordinator-owned PID"
+            states = @("managed_process_exited_before_ready", "stale_managed_ownership_recovered", "managed_launch_retrying", "managed_launch_failed", "bridge_handshake_timeout", "bridge_load_failed", "launch_profile_invalid", "attached_live_process_requires_operator", "bridge_ready")
+        }
     }
 }
 
@@ -782,7 +788,8 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
     $allowed = @(
         "--agent-id", "--package-id", "--layout", "--coordinator-path", "--launch-profile-path",
         "--profile-user-root", "--game-path", "--working-directory", "--arguments", "--game-arguments",
-        "--mod-configuration", "--sandbox-authorization-path", "--reason"
+        "--mod-configuration", "--sandbox-authorization-path", "--reason",
+        "--max-launch-attempts", "--launch-backoff-ms"
     )
     for ($index = 0; $index -lt $values.Count; $index++) {
         $value = [string]$values[$index]
@@ -796,6 +803,14 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
         }
     }
     $result += @("--readiness", "bridge", "--save-policy", "none", "--keep-running", "--timeout-ms", [string]$timeoutMs)
+    if (-not ($result -contains "--max-launch-attempts") -and
+        -not ($result | Where-Object { [string]$_ -like "--max-launch-attempts=*" })) {
+        $result += @("--max-launch-attempts", (Get-Value $values "--max-launch-attempts" "2"))
+    }
+    if (-not ($result -contains "--launch-backoff-ms") -and
+        -not ($result | Where-Object { [string]$_ -like "--launch-backoff-ms=*" })) {
+        $result += @("--launch-backoff-ms", (Get-Value $values "--launch-backoff-ms" "500"))
+    }
     return $result
 }
 
@@ -960,7 +975,7 @@ function Get-AttachedGameProcesses([string] $gamePath) {
 
 function New-RestartEnsureResult([string] $status, [bool] $requested, [bool] $performed,
     [string] $ownership, [string] $phase, [string] $operatorAction, [string] $nextAction,
-    $details = $null) {
+    $details = $null, [string] $failureReason = $null) {
     $result = [ordered]@{
         ok = $status -eq "READY"
         status = $status
@@ -975,6 +990,7 @@ function New-RestartEnsureResult([string] $status, [bool] $requested, [bool] $pe
         nextAction = $nextAction
         contextHandshake = $null
     }
+    if (-not [string]::IsNullOrWhiteSpace($failureReason)) { $result.reason = $failureReason }
     if ($details) { $result.details = $details }
     return $result
 }
@@ -999,7 +1015,7 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
             $script:ExitCode = 3
             $result = New-RestartEnsureResult "SANDBOX_AUTHORIZATION_REQUIRED" $false $false "unauthorized" "CONFIGURATION" `
                 "Run restart authorize-sandbox --confirm-disposable-sandbox once for this validated managed-test profile." `
-                "restart authorize-sandbox --confirm-disposable-sandbox" $authorization
+                "restart authorize-sandbox --confirm-disposable-sandbox" $authorization "sandbox_authorization_missing"
             return $result
         }
         $layout = Get-BridgeLayout $bridgeRoot (Get-Value $values "--layout" "auto")
@@ -1018,7 +1034,7 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     $attached = Get-AttachedGameProcesses $profile.executable
     if (($ownership -and $ownership.running -and -not $ownership.owned) -or $attached.Count -gt 0) {
         $script:ExitCode = 4
-        return New-RestartEnsureResult "USER_RESTART_REQUIRED" $false $false "attached" "USER_RESTART_REQUIRED" "Stop the manually attached RimWorld process, then rerun restart ensure." "rerun restart ensure after human restart" $heartbeat
+        return New-RestartEnsureResult "USER_RESTART_REQUIRED" $false $false "attached" "USER_RESTART_REQUIRED" "A human or external orchestrator must manage the attached RimWorld process." "rerun restart ensure after the attached process is stopped by its owner" $heartbeat "attached_live_process_requires_operator"
     }
     $launchValues = @(
         "--bridge-root", $bridgeRoot, "--user-root", $userRoot,
@@ -1035,14 +1051,17 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         "--agent-id", $agent.value, "--package-id", (Get-Value $values "--package-id" "Lan.RimWorldDevBridge"),
         "--readiness", $readiness, "--save-policy", $savePolicy,
         "--reason", (Get-Value $values "--reason" "runtime-verification"),
-        "--timeout-ms", (Get-Value $values "--timeout-ms" "120000")
+        "--timeout-ms", (Get-Value $values "--timeout-ms" "120000"),
+        "--max-launch-attempts", (Get-Value $values "--max-launch-attempts" "2"),
+        "--launch-backoff-ms", (Get-Value $values "--launch-backoff-ms" "500")
     )
     if (Has-Flag $values "--keep-running") { $requestValues += "--keep-running" }
     $ensureValues = @($launchValues + $requestValues)
     $ensure = Invoke-Coordinator "ensure" $ensureValues
     if (-not $ensure.ok) {
-            $script:ExitCode = 4
-        return New-RestartEnsureResult "FAILED" $false $false "none" $ensure.phase "Coordinator could not activate the validated profile." "inspect coordinator diagnostics" $ensure
+        Clear-LeaseState $userRoot
+        $script:ExitCode = 4
+        return New-RestartEnsureResult "FAILED" $false $false "none" $ensure.phase $null "retry restart ensure within the bounded managed-launch policy" $ensure ([string]$ensure.error)
     }
     $ticket = $ensure.ticket
     $waitValues = @($requestValues + @("--ticket", $ticket))
@@ -1062,11 +1081,14 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         if ($activationProgressCallback) { & $activationProgressCallback $phase $details }
     }
     $wait = Invoke-Coordinator "wait" $waitValues $true $waitProgress $progressInterval
-    $result = New-RestartEnsureResult ([string]$wait.phase) $true ($wait.phase -eq "READY") "coordinator-owned" $wait.phase $null "restart status --ticket $ticket" $wait
+    $result = New-RestartEnsureResult ([string]$wait.phase) $true ($wait.phase -eq "READY") "coordinator-owned" $wait.phase $null "restart status --ticket $ticket" $wait ([string]$wait.error)
     $result.ticket = $ticket
     $result.readiness = $readiness
     $result.contextHandshake = if ($wait.contextHandshake) { $wait.contextHandshake } else { $null }
-    if ($wait.phase -ne "READY") { $script:ExitCode = 4 }
+    if ($wait.phase -ne "READY") {
+        Clear-LeaseState $userRoot
+        $script:ExitCode = 4
+    }
     return $result
 }
 
@@ -1092,10 +1114,14 @@ function Get-ActivationFailureReason($ensure) {
     ) -join " "
     if ($text -match "sandbox_authorization|SANDBOX_AUTHORIZATION") { return "sandbox_authorization_missing" }
     if ($text -match "managed_test_(executable|working|user|mod)|profile_missing|profile.*required") { return "managed_profile_missing" }
+    if ($text -match "launch_profile_invalid|validated_launch_profile") { return "launch_profile_invalid" }
     if ($text -match "missing_build_tooling|runtime_tools|coordinator_.*missing") { return "runtime_build_required" }
     if ($text -match "disk_runtime_mismatch|core_fingerprint_mismatch|deployment_mismatch|fingerprint") { return "deployment_mismatch" }
+    if ($text -match "attached_live_process_requires_operator") { return "attached_live_process_requires_operator" }
     if ($text -match "attached_process|USER_RESTART_REQUIRED|manually attached") { return "attached_process_requires_operator" }
-    if ($text -match "game_process_exited|process_exited|game.*exited") { return "game_process_exited" }
+    if ($text -match "managed_launch_failed") { return "managed_launch_failed" }
+    if ($text -match "managed_process_exited_before_ready|game_process_exited|process_exited|game.*exited") { return "managed_process_exited_before_ready" }
+    if ($text -match "bridge_handshake_timeout") { return "bridge_handshake_timeout" }
     if ($text -match "wait_timeout|timeout") { return "activation_timeout" }
     return "bridge_load_failed"
 }

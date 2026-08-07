@@ -145,12 +145,16 @@ ignored and must not be committed.
 ## Troubleshooting
 
 `status_unavailable` or `bridge_not_active` means the process is absent, dormant, stale, or the
-bridge root/user root is wrong. Supply explicit roots and run `wake`, then query fresh context.
+bridge root/user root is wrong. It is recoverable for an authorized managed-test profile: the
+client wakes first, then uses bounded coordinator-owned replacement attempts and refreshes context
+before retrying a safe read. A dead coordinator-owned PID is stale ownership, never `USER_RESTART_REQUIRED`.
 `restart_coordinator_stale` means a coordinator built from a different validated binary owns the
 configured coordinator root; the client replaces only that coordinator process, never an attached game.
-`USER_RESTART_REQUIRED` means a RimWorld process is attached or live and must be handled by a person or
-external orchestrator. `restart ensure` requires an existing user-data root and an explicit game path; it
-does not scan arbitrary installations.
+`USER_RESTART_REQUIRED` means a live RimWorld process is attached or externally owned and must be handled
+by a person or external orchestrator. Managed launch failures report bounded states such as
+`managed_process_exited_before_ready`, `managed_launch_retrying`, `managed_launch_failed`,
+`bridge_handshake_timeout`, and `launch_profile_invalid`. `restart ensure` requires an existing user-data
+root and an explicit game path; it does not scan arbitrary installations.
 `RimWorldManagedDir is not configured` or a missing assembly error means the private dependency
 inputs are absent; do not copy those files into this repository. A fingerprint, boot, session, or
 transport mismatch requires discarding cached context, leases, cursors, and handles.

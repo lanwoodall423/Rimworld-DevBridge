@@ -76,6 +76,10 @@ namespace RimWorldDevBridge
         [DataMember(Order = 20)] public string NewCoreFingerprint;
         [DataMember(Order = 21)] public string NewAdapterFingerprint;
         [DataMember(Order = 22)] public string CheckpointPath;
+        [DataMember(Order = 23)] public int LaunchAttempts;
+        [DataMember(Order = 24)] public int MaxLaunchAttempts = 2;
+        [DataMember(Order = 25)] public int LaunchBackoffMs = 500;
+        [DataMember(Order = 26)] public DateTime NextLaunchUtc;
     }
 
     [DataContract]
@@ -116,7 +120,8 @@ namespace RimWorldDevBridge
         public BridgeRestartTicketRecord Request(string agentId, string packageId, string reason,
             string readiness, string savePolicy, string requiredCoreFingerprint,
             string requiredAdapterFingerprint, bool ownedSandbox, bool liveConfirmedAuthorized,
-            bool liveConfirmed = false, bool processAlreadyStarted = false)
+            bool liveConfirmed = false, bool processAlreadyStarted = false,
+            int maxLaunchAttempts = 2, int launchBackoffMs = 500)
         {
             lock (gate)
             {
@@ -144,9 +149,12 @@ namespace RimWorldDevBridge
                         RequiredCoreFingerprint = requiredCoreFingerprint ?? string.Empty,
                         RequiredAdapterFingerprint = requiredAdapterFingerprint ?? string.Empty,
                          Phase = (processAlreadyStarted ? BridgeRestartPhase.WAITING_FOR_BRIDGE :
-                             BridgeRestartPhase.REQUESTED).ToString(),
-                        OwnedProcess = ownedSandbox,
-                        LiveConfirmed = liveConfirmed,
+                              BridgeRestartPhase.REQUESTED).ToString(),
+                         OwnedProcess = ownedSandbox,
+                         LaunchAttempts = processAlreadyStarted ? 1 : 0,
+                         MaxLaunchAttempts = ClampAttempts(maxLaunchAttempts),
+                         LaunchBackoffMs = ClampBackoff(launchBackoffMs),
+                         LiveConfirmed = liveConfirmed,
                         CreatedUtc = DateTime.UtcNow,
                         UpdatedUtc = DateTime.UtcNow
                     };
@@ -191,7 +199,8 @@ namespace RimWorldDevBridge
                     ticket.Phase = cycle.Phase;
                     ticket.UpdatedUtc = cycle.UpdatedUtc;
                     if (phase == BridgeRestartPhase.READY)
-                        ticket.Completion = "ready_reacquire_write_authority";
+                        ticket.Completion = string.IsNullOrEmpty(cycle.Diagnostics) ?
+                            "bridge_ready" : Bound(cycle.Diagnostics, 512);
                     else if (phase == BridgeRestartPhase.FAILED || phase == BridgeRestartPhase.USER_RESTART_REQUIRED)
                         ticket.Completion = cycle.Diagnostics;
                 }
@@ -222,6 +231,78 @@ namespace RimWorldDevBridge
         public void Fail(string cycleId, string diagnostics)
         {
             SetPhase(cycleId, BridgeRestartPhase.FAILED, diagnostics);
+        }
+
+        public void PrepareLaunchRetry(string cycleId, int attempts, int maxAttempts,
+            int backoffMs, DateTime nextLaunchUtc, string diagnostics)
+        {
+            lock (gate)
+            {
+                BridgeRestartCycleRecord cycle = FindCycle(cycleId);
+                if (cycle == null) return;
+                if (!IsValidTransition(ParsePhase(cycle.Phase), BridgeRestartPhase.STARTING))
+                    throw new InvalidOperationException("invalid_restart_transition");
+                cycle.LaunchAttempts = Math.Max(0, attempts);
+                cycle.MaxLaunchAttempts = ClampAttempts(maxAttempts);
+                cycle.LaunchBackoffMs = ClampBackoff(backoffMs);
+                cycle.NextLaunchUtc = nextLaunchUtc;
+                cycle.Phase = BridgeRestartPhase.STARTING.ToString();
+                cycle.Diagnostics = Bound(diagnostics, 512);
+                state.Phase = cycle.Phase;
+                foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == cycleId))
+                {
+                    ticket.Phase = cycle.Phase;
+                    ticket.Completion = cycle.Diagnostics;
+                    ticket.UpdatedUtc = DateTime.UtcNow;
+                }
+                Touch();
+            }
+        }
+
+        public void RecoverStaleOwnership(string diagnostics)
+        {
+            lock (gate)
+            {
+                string bounded = Bound(diagnostics, 512);
+                foreach (BridgeRestartCycleRecord cycle in state.Cycles)
+                {
+                    BridgeRestartPhase phase = ParsePhase(cycle.Phase);
+                    if (phase == BridgeRestartPhase.READY || phase == BridgeRestartPhase.FAILED ||
+                        phase == BridgeRestartPhase.USER_RESTART_REQUIRED) continue;
+                    cycle.Phase = BridgeRestartPhase.FAILED.ToString();
+                    cycle.Diagnostics = bounded;
+                    cycle.UpdatedUtc = DateTime.UtcNow;
+                    foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == cycle.CycleId))
+                    {
+                        ticket.Phase = cycle.Phase;
+                        ticket.Completion = bounded;
+                        ticket.UpdatedUtc = cycle.UpdatedUtc;
+                    }
+                }
+                state.OwnedPid = string.Empty;
+                state.OwnedBootId = string.Empty;
+                state.LastError = bounded;
+                Touch();
+            }
+        }
+
+        public void SetLastError(string diagnostics)
+        {
+            lock (gate)
+            {
+                state.LastError = Bound(diagnostics, 512);
+                Touch();
+            }
+        }
+
+        public void ClearOwnedProcess()
+        {
+            lock (gate)
+            {
+                state.OwnedPid = string.Empty;
+                state.OwnedBootId = string.Empty;
+                Touch();
+            }
         }
 
         public void SetCycleIdentity(string cycleId, string oldPid, string oldBootId)
@@ -269,6 +350,18 @@ namespace RimWorldDevBridge
                 BridgeRestartCycleRecord cycle = FindCycle(cycleId);
                 if (cycle == null) return;
                 cycle.NewPid = Bound(pid, 32);
+                Touch();
+            }
+        }
+
+        public void SetLaunchAttempt(string cycleId, int attempt)
+        {
+            lock (gate)
+            {
+                BridgeRestartCycleRecord cycle = FindCycle(cycleId);
+                if (cycle == null) return;
+                cycle.LaunchAttempts = Math.Max(0, attempt);
+                cycle.UpdatedUtc = DateTime.UtcNow;
                 Touch();
             }
         }
@@ -431,12 +524,16 @@ namespace RimWorldDevBridge
             if (to == BridgeRestartPhase.FAILED || to == BridgeRestartPhase.USER_RESTART_REQUIRED) return true;
             if (from == BridgeRestartPhase.RUNNING && to == BridgeRestartPhase.REQUESTED) return true;
             if (from == BridgeRestartPhase.REQUESTED && to == BridgeRestartPhase.DRAINING) return true;
+            if (from == BridgeRestartPhase.REQUESTED && to == BridgeRestartPhase.STARTING) return true;
             if (from == BridgeRestartPhase.DRAINING && to == BridgeRestartPhase.DRAINED) return true;
+            if (from == BridgeRestartPhase.DRAINING && to == BridgeRestartPhase.STARTING) return true;
             if (from == BridgeRestartPhase.DRAINED && to == BridgeRestartPhase.STOPPING) return true;
+            if (from == BridgeRestartPhase.DRAINED && to == BridgeRestartPhase.STARTING) return true;
             if (from == BridgeRestartPhase.STOPPING && to == BridgeRestartPhase.STARTING) return true;
             if (from == BridgeRestartPhase.STARTING && to == BridgeRestartPhase.WAITING_FOR_BRIDGE) return true;
             if (from == BridgeRestartPhase.WAITING_FOR_BRIDGE &&
-                (to == BridgeRestartPhase.WAITING_FOR_GAME || to == BridgeRestartPhase.READY)) return true;
+                (to == BridgeRestartPhase.STARTING || to == BridgeRestartPhase.WAITING_FOR_GAME ||
+                 to == BridgeRestartPhase.READY)) return true;
             if (from == BridgeRestartPhase.WAITING_FOR_GAME && to == BridgeRestartPhase.READY) return true;
             return false;
         }
@@ -445,6 +542,16 @@ namespace RimWorldDevBridge
         {
             if (string.IsNullOrEmpty(value)) return string.Empty;
             return value.Length <= length ? value : value.Substring(0, length);
+        }
+
+        private static int ClampAttempts(int value)
+        {
+            return Math.Max(1, Math.Min(5, value <= 0 ? 2 : value));
+        }
+
+        private static int ClampBackoff(int value)
+        {
+            return Math.Max(0, Math.Min(10000, value));
         }
 
         private static string SafeReason(string value)

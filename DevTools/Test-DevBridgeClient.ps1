@@ -68,7 +68,7 @@ try {
     }
     $wait = Invoke-Client @('restart', 'wait', '--bridge-root', $BridgeRoot, '--user-root', $testUserRoot,
         '--ticket', $restart.ticket, '--timeout-ms', '250', '--json') 4
-    if ($wait.ticket -ne $restart.ticket -or $wait.error -notin @('coordinator_wait_timeout', 'attached_process_user_restart_required')) {
+    if ($wait.ticket -ne $restart.ticket -or $wait.error -notin @('coordinator_wait_timeout', 'attached_live_process_requires_operator')) {
         throw "durable restart wait failed expected=timeout or protected attached refusal for ticket actual=$($wait | ConvertTo-Json -Compress)"
     }
     $unauthorized = Invoke-Client @('restart', 'request', '--bridge-root', $BridgeRoot, '--user-root', $testUserRoot,

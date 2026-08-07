@@ -12,7 +12,13 @@ Activation uses readiness `bridge`, save policy `none`, and keeps the coordinato
 RimWorld process running. Concurrent activation requests coalesce. Failure reasons distinguish
 `activation_in_progress`, `activation_timeout`, `managed_profile_missing`,
 `sandbox_authorization_missing`, `runtime_build_required`, `deployment_mismatch`,
-`attached_process_requires_operator`, `game_process_exited`, and `bridge_load_failed`.
+`managed_process_exited_before_ready`, `stale_managed_ownership_recovered`,
+`managed_launch_retrying`, `managed_launch_failed`, `bridge_handshake_timeout`,
+`bridge_load_failed`, `launch_profile_invalid`, and `attached_live_process_requires_operator`.
+A dead coordinator-owned PID is automatically validated, cleared, and retried within the
+configured attempt/backoff limit. Never report it as `USER_RESTART_REQUIRED`; that result is
+reserved for a live externally owned process. Never suggest manual launch for a configured
+managed-test profile unless it is explicitly human-owned.
    After reload, restart, session rotation, or game transition, discard cached context, cursors, handles, and leases and query again.
 
 Mutation denial codes distinguish disabled settings, missing games, missing in-game confirmation, and

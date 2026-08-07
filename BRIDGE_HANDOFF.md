@@ -82,11 +82,16 @@ cycle. Progress is emitted as structured JSON diagnostics on stderr. After readi
 discards stale context, refreshes discover, context, and `STATUS`, and retries the original
 read-only operation once. Startup is bounded by `--startup-timeout-ms`.
 
-Structured activation failures are `activation_in_progress`, `activation_timeout`,
-`managed_profile_missing`, `sandbox_authorization_missing`, `runtime_build_required`,
-`deployment_mismatch`, `attached_process_requires_operator`, `game_process_exited`, and
-`bridge_load_failed`. Activation never claims or terminates an unrelated manually launched
-RimWorld process and never grants mutation authorization or a write lease.
+Structured activation failures and managed-launch states include `activation_in_progress`,
+`activation_timeout`, `managed_profile_missing`, `sandbox_authorization_missing`,
+`runtime_build_required`, `deployment_mismatch`, `managed_process_exited_before_ready`,
+`stale_managed_ownership_recovered`, `managed_launch_retrying`, `managed_launch_failed`,
+`bridge_handshake_timeout`, `bridge_load_failed`, `launch_profile_invalid`, and
+`attached_live_process_requires_operator`. A dead coordinator-owned PID is automatically
+recoverable after identity validation and bounded replacement attempts; it never produces
+`USER_RESTART_REQUIRED`. That result is reserved for a live externally owned process.
+Activation never claims or terminates an unrelated manually launched RimWorld process and
+never grants mutation authorization or a write lease.
 
 Multiple clients have isolated request IDs and responses. RimWorld/Unity access is serialized on
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit
