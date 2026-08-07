@@ -88,6 +88,8 @@
       "states": ["queued", "running", "succeeded", "failed", "cancelled", "checkpointed"],
       "phases": ["QUEUED", "ACTIVATING", "WAITING_FOR_BRIDGE", "WAITING_FOR_GAME", "WAITING_FOR_MAP", "READY", "MAP_READY", "TEST_READY", "FAILED", "CANCELLED", "READY_AWAITING_HUMAN"],
       "requiredIdentity": ["pid", "sessionId", "lifecycleGeneration", "coreFingerprint"],
+      "progressFields": ["startedUtc", "updatedUtc", "overallDeadlineUtc", "timeoutMs", "noProgressTimeoutMs", "lastProgressUtc", "progressSequence"],
+      "responseFields": ["goalId", "operationId", "operationState", "phase", "desiredState", "contextFresh", "recoverable", "requiredAction", "waitFor", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction", "resourcesReleased", "evidence"],
       "durableUserRootPersistence": true,
       "coalescedByGoalId": true,
       "boundedProgressWatchdog": true,
