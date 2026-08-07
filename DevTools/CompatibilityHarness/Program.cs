@@ -58,6 +58,7 @@ internal static class Program
         Run("restart coordinator state machine", RestartCoordinatorStateMachineTest);
         Run("restart postcondition does not coalesce stale cycle", RestartPostconditionDoesNotCoalesceStaleCycle);
         Run("restart supersession and identity contract", RestartSupersessionAndIdentityContract);
+        Run("restart waiter follows replacement retry cycle", RestartWaiterFollowsReplacementRetryCycle);
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
@@ -786,6 +787,23 @@ internal static class Program
             "replacement identity contract was not persisted");
         Check(machine.Snapshot.Cycles.Single(item => item.CycleId == old.CycleId).Phase ==
             BridgeRestartPhase.FAILED.ToString(), "superseded cycle was not terminal");
+    }
+
+    private static void RestartWaiterFollowsReplacementRetryCycle()
+    {
+        BridgeRestartCoordinatorStateMachine machine = new BridgeRestartCoordinatorStateMachine();
+        BridgeRestartTicketRecord replacement = machine.Request("agent-owner", "owner.a",
+            "replacement process required", "game", "none", "core-a", "adapter-a", true, false,
+            false, false, 2, 500, "game", true, 4, null, null, true, 10000);
+        machine.SetPhase(replacement.CycleId, BridgeRestartPhase.STARTING, "managed_launch_retrying");
+
+        BridgeRestartTicketRecord waiter = machine.Request("agent-waiter", "owner.a",
+            "runtime verification", "game", "none", "core-a", "adapter-a", true, false,
+            false, false, 2, 500, "game", false, 0, null, null, true, 10000);
+        Equal(replacement.CycleId, waiter.CycleId,
+            "a compatible waiter did not follow the active replacement retry cycle");
+        Check(machine.Snapshot.Cycles.Single(item => item.CycleId == waiter.CycleId).RequiresNewProcess,
+            "replacement waiter lost the cycle replacement requirement");
     }
 
     private static void SessionContextTransitions()

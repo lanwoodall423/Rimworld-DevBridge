@@ -592,8 +592,14 @@ namespace RimWorldDevBridge
             if (ReadinessRank(cycle.TargetPostcondition ?? cycle.Readiness) < ReadinessRank(targetPostcondition)) return false;
             bool cycleRequiresReplacement = cycle.RequiresNewProcess || IsReplacementReason(cycle.RestartReason);
             bool requestRequiresReplacement = requiresNewProcess || IsReplacementReason(reason);
-            if (cycleRequiresReplacement != requestRequiresReplacement) return false;
-            if (cycleRequiresReplacement && !string.Equals(cycle.RestartReason ?? string.Empty,
+            if (cycleRequiresReplacement != requestRequiresReplacement)
+            {
+                // A normal waiter may follow an already-authorized replacement cycle, but a
+                // request that explicitly requires a replacement must never join an ordinary cycle.
+                if (!cycleRequiresReplacement || requestRequiresReplacement || requiresNewProcess ||
+                    !string.IsNullOrEmpty(requestedPid) || !string.IsNullOrEmpty(requestedSessionId)) return false;
+            }
+            if (cycleRequiresReplacement && requestRequiresReplacement && !string.Equals(cycle.RestartReason ?? string.Empty,
                 reason ?? string.Empty, StringComparison.Ordinal)) return false;
             bool replacementAlreadyStarted = cycle.RequiresNewProcess && processAlreadyStarted &&
                 !string.IsNullOrEmpty(requestedPid) &&

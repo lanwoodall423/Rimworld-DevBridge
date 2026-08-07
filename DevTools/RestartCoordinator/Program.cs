@@ -453,14 +453,18 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private bool ActiveCycleUsesCurrentLaunch()
         {
-            if (launchRecord == null || launchRecord.ProcessId <= 0) return false;
-            string pid = launchRecord.ProcessId.ToString(CultureInfo.InvariantCulture);
+            if (launchRecord == null || !launchRecord.Owned) return false;
+            string pid = launchRecord.ProcessId > 0 ?
+                launchRecord.ProcessId.ToString(CultureInfo.InvariantCulture) : null;
             return machine.Snapshot.Cycles.Any(c =>
             {
                 BridgeRestartPhase phase = ParsePhase(c.Phase);
-                return phase != BridgeRestartPhase.READY && phase != BridgeRestartPhase.FAILED &&
-                    phase != BridgeRestartPhase.USER_RESTART_REQUIRED &&
-                    string.Equals(c.NewPid, pid, StringComparison.Ordinal);
+                bool open = phase != BridgeRestartPhase.READY && phase != BridgeRestartPhase.FAILED &&
+                    phase != BridgeRestartPhase.USER_RESTART_REQUIRED;
+                if (!open || !c.OwnedProcess) return false;
+                if (!string.IsNullOrEmpty(pid) && string.Equals(c.NewPid, pid, StringComparison.Ordinal)) return true;
+                // A STARTING cycle may intentionally have no PID during bounded retry backoff.
+                return launchRecord.ProcessId <= 0 && phase == BridgeRestartPhase.STARTING;
             });
         }
 
