@@ -473,7 +473,7 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
                 $failure.activation = $activation
                 return Set-ActivationRecoveryFields $failure
             }
-            $status = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
+            $status = Wait-ForFreshBridgeStatus $bridgeRoot $userRoot $agent.value $config 5000
             if (-not $status.available) {
                 $script:ExitCode = 4
                 $failure = New-ErrorResult "bridge_load_failed" "Bridge status remained unavailable after activation."
@@ -576,6 +576,7 @@ function Invoke-Help {
             "lease acquire|inspect|renew|release", "mutate --command <name>", "cancel --request-id <id>",
             "context --package-id <id>", "describe --package-id <id>", "repo context", "adapter publish|reload",
             "restart authorize-sandbox|revoke-sandbox|request|status|wait|register|launch|ensure",
+            "review request|list|get|resolve|cancel|wait|checkpoint|resume",
             "validate --layout auto|source|package", "help"
         )
         exitCodes = [ordered]@{ success = 0; invalidArguments = 2; pathOrUnavailable = 3; transport = 4; stale = 5; bridgeRejected = 6 }
@@ -587,9 +588,16 @@ function Invoke-Help {
             waitFor = @("none", "bridge", "game", "map")
             canonicalReady = "reason=bridge_ready;phase=READY"
             canonicalAttached = "attached_live_process_requires_operator"
-            fields = @("recoverable", "requiredAction", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction")
+            fields = @("activationState", "waitFor", "recoverable", "requiredAction", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction")
             automaticActivation = @("discover", "context", "describe", "read", "repo context", "lease inspect")
             noAutomaticActivation = @("call", "mutate", "cancel", "lease acquire", "lease renew", "lease release", "adapter reload")
+        }
+        reviewQueue = [ordered]@{
+            commands = @("request", "list", "get", "resolve", "cancel", "wait", "checkpoint", "resume")
+            categories = @("human_review", "human_approval", "hard_blocker")
+            defaultResponseWindowMs = 60000
+            awaitingState = "READY_AWAITING_HUMAN"
+            safety = "Human review and safety approval never grant mutation authority, attached-process control, or a write lease."
         }
         managedLaunch = [ordered]@{
             maxAttempts = "--max-launch-attempts <1..5> (default 2)"
@@ -795,7 +803,17 @@ function Write-JsonAtomic([string] $path, $value) {
     $temporary = $path + ".tmp." + [Guid]::NewGuid().ToString("N")
     try {
         [IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-        Move-Item -LiteralPath $temporary -Destination $path -Force
+        $moved = $false
+        for ($attempt = 0; $attempt -lt 8 -and -not $moved; $attempt++) {
+            try {
+                Move-Item -LiteralPath $temporary -Destination $path -Force -ErrorAction Stop
+                $moved = $true
+            }
+            catch [IO.IOException] {
+                if ($attempt -eq 7) { throw }
+                Start-Sleep -Milliseconds 25
+            }
+        }
     }
     finally {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
@@ -828,6 +846,18 @@ function Get-ActivationStatePath([string] $userRoot) {
     return Join-Path $userRoot "RimWorld-DevBridge-Activation.json"
 }
 
+function Wait-ForFreshBridgeStatus([string] $bridgeRoot, [string] $userRoot,
+    [string] $agentId, $config, [int] $timeoutMs = 5000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(100, [Math]::Min(600000, $timeoutMs)))
+    $last = $null
+    do {
+        $last = Get-BridgeStatus $bridgeRoot $userRoot $agentId $config
+        if ($last.available) { return $last }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $last
+}
+
 function Get-ActivationLockPath([string] $userRoot) {
     return Join-Path $userRoot "RimWorld-DevBridge-Activation.lock"
 }
@@ -851,6 +881,294 @@ function Write-ActivationState([string] $userRoot, [string] $state, [string] $ph
     if ($null -ne $result) { $value.result = $result }
     Write-JsonAtomic (Get-ActivationStatePath $userRoot) $value
     return $value
+}
+
+function Get-ReviewRoot([string] $userRoot) {
+    $root = Join-Path $userRoot "RimWorld-DevBridge-Review"
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    return $root
+}
+
+function Get-ReviewLockPath([string] $userRoot) {
+    return Join-Path (Get-ReviewRoot $userRoot) "queue.lock"
+}
+
+function Get-ReviewRequestPath([string] $userRoot, [string] $requestId) {
+    return Join-Path (Get-ReviewRoot $userRoot) ("request-" + $requestId + ".json")
+}
+
+function Test-SafeReviewId([string] $value) {
+    return -not [string]::IsNullOrWhiteSpace($value) -and $value.Length -le 96 -and
+        $value -match '^[A-Za-z0-9._-]+$'
+}
+
+function Invoke-ReviewLocked([string] $userRoot, [scriptblock] $action) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(2)
+    $lock = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $lock = [IO.FileStream]::new((Get-ReviewLockPath $userRoot), [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            break
+        } catch [IO.IOException] { Start-Sleep -Milliseconds 25 }
+        catch [UnauthorizedAccessException] { Start-Sleep -Milliseconds 25 }
+    }
+    if ($null -eq $lock) { throw "review_queue_busy: retry the review operation" }
+    try { return & $action }
+    finally { $lock.Dispose() }
+}
+
+function Get-ReviewRequests([string] $userRoot) {
+    $files = @(Get-ChildItem -LiteralPath (Get-ReviewRoot $userRoot) -Filter "request-*.json" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 256)
+    $requests = @()
+    foreach ($file in $files) {
+        try {
+            $request = Read-JsonFile $file.FullName
+            if ($request) { $requests += $request }
+        } catch { }
+    }
+    return $requests
+}
+
+function Get-ReviewRequest([string] $userRoot, [string] $requestId) {
+    if (-not (Test-SafeReviewId $requestId)) { throw "review_request_id_invalid" }
+    $request = Read-JsonFile (Get-ReviewRequestPath $userRoot $requestId)
+    if ($null -eq $request) { throw "review_request_not_found" }
+    return $request
+}
+
+function Save-ReviewRequest([string] $userRoot, $request) {
+    Write-JsonAtomic (Get-ReviewRequestPath $userRoot ([string]$request.requestId)) $request
+    return $request
+}
+
+function Set-ReviewProperty($request, [string] $name, $value) {
+    if ($null -eq $request.PSObject.Properties[$name]) {
+        $request | Add-Member -NotePropertyName $name -NotePropertyValue $value
+    }
+    else { $request.$name = $value }
+    return $request
+}
+
+function Update-ReviewCheckpoint($request, [string] $reason) {
+    $request.state = "READY_AWAITING_HUMAN"
+    Set-ReviewProperty $request "checkpointedUtc" ([DateTime]::UtcNow.ToString("o")) | Out-Null
+    Set-ReviewProperty $request "checkpointReason" (Redact-Text $reason) | Out-Null
+    Set-ReviewProperty $request "checkpoint" ([ordered]@{
+        requestId = $request.requestId
+        taskId = $request.taskId
+        state = $request.state
+        resumeOperation = $request.resumeOperation
+        completedWork = $request.completedWork
+        remainingDependentWork = $request.remainingDependentWork
+        independentWork = $request.independentWork
+        resourcesReleased = $true
+        runtimePreserved = [bool]$request.runtimePreserved
+    }) | Out-Null
+    return $request
+}
+
+function Refresh-ReviewRequest([string] $userRoot, $request) {
+    $now = [DateTime]::UtcNow
+    if ($request.state -eq "WAITING_FOR_HUMAN" -and $request.expiresUtc) {
+        $expires = [DateTime]::MinValue
+        if ([DateTime]::TryParse([string]$request.expiresUtc, [ref]$expires) -and $now -ge $expires) {
+            $request.state = "EXPIRED"
+            Set-ReviewProperty $request "resolvedUtc" ($now.ToString("o")) | Out-Null
+            Set-ReviewProperty $request "resolution" "expired_by_policy" | Out-Null
+            Set-ReviewProperty $request "resourcesReleased" $true | Out-Null
+            Set-ReviewProperty $request "checkpoint" ([ordered]@{
+                requestId = $request.requestId
+                taskId = $request.taskId
+                state = $request.state
+                resumeOperation = $request.resumeOperation
+                completedWork = $request.completedWork
+                remainingDependentWork = $request.remainingDependentWork
+                independentWork = $request.independentWork
+                resourcesReleased = $true
+                runtimePreserved = [bool]$request.runtimePreserved
+            }) | Out-Null
+            return $request
+        }
+    }
+    if ($request.state -eq "WAITING_FOR_HUMAN" -and $request.responseDeadlineUtc) {
+        $deadline = [DateTime]::MinValue
+        if ([DateTime]::TryParse([string]$request.responseDeadlineUtc, [ref]$deadline) -and $now -ge $deadline) {
+            return Update-ReviewCheckpoint $request "response_window_expired; no optional human feedback arrived"
+        }
+    }
+    return $request
+}
+
+function Get-ReviewText([string[]] $values, [string] $name, [string] $default = "") {
+    return Redact-Text (Get-Value $values $name $default)
+}
+
+function New-ReviewRequest([string] $userRoot, [string[]] $values, $agent) {
+    $category = (Get-Value $values "--category" "human_review").ToLowerInvariant()
+    if ($category -notin @("human_review", "human_approval", "hard_blocker")) {
+        throw "review_category_invalid"
+    }
+    $taskId = Get-ReviewText $values "--task-id"
+    $question = Get-ReviewText $values "--question"
+    $resume = Get-ReviewText $values "--resume-operation"
+    if ([string]::IsNullOrWhiteSpace($taskId) -or [string]::IsNullOrWhiteSpace($question) -or
+        [string]::IsNullOrWhiteSpace($resume)) { throw "review_required_fields_missing" }
+    $requestId = Get-Value $values "--request-id" ([Guid]::NewGuid().ToString("N"))
+    if (-not (Test-SafeReviewId $requestId) -or -not (Test-SafeReviewId $taskId)) { throw "review_id_invalid" }
+    $option1 = Get-ReviewText $values "--option-1"
+    $option2 = Get-ReviewText $values "--option-2"
+    $option3 = Get-ReviewText $values "--option-3"
+    if ($category -ne "hard_blocker" -and ([string]::IsNullOrWhiteSpace($option1) -or [string]::IsNullOrWhiteSpace($option2))) {
+        throw "review_options_required: provide option-1 and option-2"
+    }
+    $responseMs = 60000
+    [int]::TryParse((Get-Value $values "--response-timeout-ms" "60000"), [ref]$responseMs) | Out-Null
+    if ($responseMs -lt 1000 -or $responseMs -gt 600000) { throw "review_response_timeout_invalid" }
+    $now = [DateTime]::UtcNow
+    $dedupKey = Get-ReviewText $values "--dedup-key" ($taskId + "|" + $category + "|" + $question)
+    $existing = @(Get-ReviewRequests $userRoot | Where-Object {
+        $_.deduplicationKey -eq $dedupKey -and $_.state -in @("WAITING_FOR_HUMAN", "READY_AWAITING_HUMAN", "RESOLVED")
+    } | Select-Object -First 1)
+    if ($existing.Count -gt 0) {
+        $existing[0] | Add-Member -NotePropertyName deduplicated -NotePropertyValue $true -Force
+        return $existing[0]
+    }
+    $request = [ordered]@{
+        schema = 1
+        requestId = $requestId
+        taskId = $taskId
+        category = $category
+        question = $question
+        options = @($option1, $option2, $option3 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        recommendedDefault = Get-ReviewText $values "--recommended"
+        screenshotReferences = @(Get-ReviewText $values "--screenshot-ref")
+        artifactReferences = @(Get-ReviewText $values "--artifact-ref")
+        completedWork = Get-ReviewText $values "--completed-work"
+        verificationEvidence = Get-ReviewText $values "--verification-evidence"
+        remainingDependentWork = Get-ReviewText $values "--dependent-work"
+        independentWork = Get-ReviewText $values "--independent-work"
+        runtimePreserved = Has-Flag $values "--preserve-runtime"
+        branch = Get-ReviewText $values "--branch" "unknown"
+        commit = Get-ReviewText $values "--commit" "unknown"
+        dirtyState = Get-ReviewText $values "--dirty-state" "unknown"
+        createdByAgentId = if ($agent) { [string]$agent.value } else { "unknown" }
+        createdUtc = $now.ToString("o")
+        responseDeadlineUtc = $now.AddMilliseconds($responseMs).ToString("o")
+        expiresUtc = Get-ReviewText $values "--expires-utc"
+        deduplicationKey = $dedupKey
+        resumeOperation = $resume
+        state = "WAITING_FOR_HUMAN"
+        authorization = [ordered]@{ authorizesMutation = $false; authorizesAttachedProcess = $false; grantsWriteLease = $false }
+    }
+    return $request
+}
+
+function Invoke-Review([string[]] $values, $agent, [string] $userRoot) {
+    $action = if ($values.Count -gt 0) { $values[0].ToLowerInvariant() } else { "list" }
+    $remaining = if ($values.Count -gt 1) { @($values[1..($values.Count - 1)]) } else { @() }
+    switch ($action) {
+        "request" {
+            $request = Invoke-ReviewLocked $userRoot {
+                $created = New-ReviewRequest $userRoot $remaining $agent
+                if (-not $created.deduplicated) { Save-ReviewRequest $userRoot $created | Out-Null }
+                $created
+            }
+            return [ordered]@{ ok = $true; operation = "review.request"; request = $request; resourcesReleased = $true }
+        }
+        "list" {
+            $requests = @(Invoke-ReviewLocked $userRoot {
+                @(Get-ReviewRequests $userRoot | ForEach-Object {
+                    $fresh = Refresh-ReviewRequest $userRoot $_
+                    if ($fresh.state -ne $_.state) { Save-ReviewRequest $userRoot $fresh | Out-Null }
+                    $fresh
+                })
+            })
+            return [ordered]@{ ok = $true; operation = "review.list"; requests = @($requests); count = $requests.Count }
+        }
+        "get" {
+            $request = Invoke-ReviewLocked $userRoot {
+                $current = Get-ReviewRequest $userRoot (Get-Value $remaining "--request-id")
+                $current = Refresh-ReviewRequest $userRoot $current
+                Save-ReviewRequest $userRoot $current | Out-Null
+                $current
+            }
+            return [ordered]@{ ok = $true; operation = "review.get"; request = $request }
+        }
+        "checkpoint" {
+            $requestId = Get-Value $remaining "--request-id"
+            $request = Invoke-ReviewLocked $userRoot {
+                $current = Get-ReviewRequest $userRoot $requestId
+                $current = Update-ReviewCheckpoint $current (Get-ReviewText $remaining "--reason" "autonomous work paused for human dependency")
+                Set-ReviewProperty $current "checkpointEvidence" (Get-ReviewText $remaining "--checkpoint-evidence") | Out-Null
+                Save-ReviewRequest $userRoot $current | Out-Null
+                $current
+            }
+            return [ordered]@{ ok = $true; operation = "review.checkpoint"; request = $request; resourcesReleased = $true }
+        }
+        "resolve" {
+            $request = Invoke-ReviewLocked $userRoot {
+                $current = Get-ReviewRequest $userRoot (Get-Value $remaining "--request-id")
+                $current.state = "RESOLVED"
+                Set-ReviewProperty $current "resolvedUtc" ([DateTime]::UtcNow.ToString("o")) | Out-Null
+                Set-ReviewProperty $current "selectedOption" (Get-ReviewText $remaining "--selected-option") | Out-Null
+                Set-ReviewProperty $current "answer" (Get-ReviewText $remaining "--answer") | Out-Null
+                Set-ReviewProperty $current "resolution" (Get-ReviewText $remaining "--resolution" "human_response") | Out-Null
+                $current.authorization = [ordered]@{ authorizesMutation = $false; authorizesAttachedProcess = $false; grantsWriteLease = $false }
+                Save-ReviewRequest $userRoot $current | Out-Null
+                $current
+            }
+            return [ordered]@{ ok = $true; operation = "review.resolve"; request = $request; resumeOperation = $request.resumeOperation; authorization = $request.authorization }
+        }
+        "cancel" {
+            $request = Invoke-ReviewLocked $userRoot {
+                $current = Get-ReviewRequest $userRoot (Get-Value $remaining "--request-id")
+                $current.state = "CANCELLED"
+                Set-ReviewProperty $current "resolvedUtc" ([DateTime]::UtcNow.ToString("o")) | Out-Null
+                Set-ReviewProperty $current "resolution" (Get-ReviewText $remaining "--reason" "cancelled") | Out-Null
+                Save-ReviewRequest $userRoot $current | Out-Null
+                $current
+            }
+            return [ordered]@{ ok = $true; operation = "review.cancel"; request = $request; resourcesReleased = $true }
+        }
+        "resume" {
+            $request = Invoke-ReviewLocked $userRoot {
+                $current = Get-ReviewRequest $userRoot (Get-Value $remaining "--request-id")
+                $current = Refresh-ReviewRequest $userRoot $current
+                Save-ReviewRequest $userRoot $current | Out-Null
+                $current
+            }
+            return [ordered]@{ ok = $request.state -eq "RESOLVED"; operation = "review.resume"; request = $request; canResume = $request.state -eq "RESOLVED"; resumeOperation = $request.resumeOperation; authorization = [ordered]@{ authorizesMutation = $false; authorizesAttachedProcess = $false; grantsWriteLease = $false } }
+        }
+        "wait" {
+            $requestId = Get-Value $remaining "--request-id"
+            $timeoutMs = 60000
+            [int]::TryParse((Get-Value $remaining "--timeout-ms" "60000"), [ref]$timeoutMs) | Out-Null
+            if ($timeoutMs -lt 100 -or $timeoutMs -gt 600000) { throw "review_wait_timeout_invalid" }
+            $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+            do {
+                $request = Invoke-ReviewLocked $userRoot {
+                    $current = Get-ReviewRequest $userRoot $requestId
+                    $current = Refresh-ReviewRequest $userRoot $current
+                    Save-ReviewRequest $userRoot $current | Out-Null
+                    $current
+                }
+                if ($request.state -ne "WAITING_FOR_HUMAN") {
+                    return [ordered]@{ ok = $request.state -eq "RESOLVED"; operation = "review.wait"; request = $request; awaitingHuman = $request.state -eq "READY_AWAITING_HUMAN"; resourcesReleased = $true }
+                }
+                Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $request = Invoke-ReviewLocked $userRoot {
+                $current = Get-ReviewRequest $userRoot $requestId
+                $current = Update-ReviewCheckpoint $current "response window elapsed; autonomous work is complete"
+                Save-ReviewRequest $userRoot $current | Out-Null
+                $current
+            }
+            return [ordered]@{ ok = $true; operation = "review.wait"; request = $request; awaitingHuman = $true; resourcesReleased = $true; nextAction = "review resume --request-id $requestId after resolution" }
+        }
+        default { throw "review_operation_invalid: use request, list, get, resolve, cancel, wait, checkpoint, or resume" }
+    }
 }
 
 function Try-OpenActivationLock([string] $userRoot) {
@@ -1267,6 +1585,8 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
     $deadline = $started.AddMilliseconds($timeoutMs)
     $operationId = "activation-" + [Guid]::NewGuid().ToString("N")
     $lock = $null
+    # Activation invalidates the prior session for every caller, including coalesced waiters.
+    Clear-LeaseState $userRoot
     while ([DateTime]::UtcNow -lt $deadline) {
         $lock = Try-OpenActivationLock $userRoot
         if ($lock) { break }
@@ -1289,7 +1609,6 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
         return New-ActivationResult $false "activation_timeout" "activation_in_progress" $true ([int64]([DateTime]::UtcNow - $started).TotalMilliseconds)
     }
     try {
-        Clear-LeaseState $userRoot
         Write-ActivationState $userRoot "in_progress" "waking" $initialReason $operationId $started.ToString("o") | Out-Null
         Write-ActivationProgress "in_progress" "waking" 0 $initialReason $false
         $wakeValues = @("--bridge-root", $bridgeRoot, "--user-root", $userRoot,
@@ -1559,7 +1878,7 @@ try {
             if (-not $result.available -and (Test-ActivationEligibleReason $result.reason)) {
                 $activation = Invoke-ActivationRecovery $args $result.reason
                 if ($activation.ready) {
-                    $result = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
+                    $result = Wait-ForFreshBridgeStatus $bridgeRoot $userRoot $agent.value $config 5000
                     if ($result.available) {
                         $freshStatus = Invoke-BridgeCommand "STATUS" "" $args $false $null $null $false
                         if (-not (Test-ResponseOk $freshStatus)) {
@@ -1639,6 +1958,12 @@ try {
             & (Join-Path $PSScriptRoot "Test-DevBridgeAgentDescriptor.ps1") -RepositoryRoot $repoRoot | Out-Null
             $descriptor = Get-Content -LiteralPath (Join-Path $repoRoot "DevTools\DevBridge\agent.json") -Raw | ConvertFrom-Json
             $result = Invoke-BridgeCommand "AGENT_CONTEXT" ("packageId=" + $descriptor.packageId) $args
+        }
+        "review" {
+            $userRoot = Resolve-UserRoot (Get-Value $args "--user-root") $config
+            if ($null -eq $userRoot) { throw "user_root_required: review state is scoped to an existing user root" }
+            $agent = Get-AgentId $userRoot (Get-Value $args "--agent-id")
+            $result = Invoke-Review $args $agent $userRoot
         }
         "adapter" {
             if ($args.Count -lt 1) { throw "adapter_operation_required: use publish or reload" }

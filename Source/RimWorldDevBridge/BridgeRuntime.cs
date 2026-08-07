@@ -116,6 +116,9 @@ namespace RimWorldDevBridge
             LifecycleDispatch.FinalizeInitExecutionThreadId;
         internal static int FinalizeInitDeferredCountForTests =>
             LifecycleDispatch.FinalizeInitDeferredCount;
+        internal static int PendingLifecycleWorkForTests => LifecycleDispatch.PendingCount;
+        internal static long CoalescedLifecycleWorkForTests => LifecycleDispatch.CoalescedCount;
+        internal static long DroppedStaleLifecycleWorkForTests => LifecycleDispatch.DroppedStaleCount;
         internal static long PublishedLifecycleSequenceForTests =>
             Interlocked.Read(ref publishedGameTransitionSequence);
         internal static int PublishedLifecycleThreadIdForTests =>
@@ -400,7 +403,10 @@ namespace RimWorldDevBridge
             BridgeFileOperations.TryDelete(BridgePaths.StatusPath);
         }
 
-        internal static BridgeResult SchedulerMetrics() => Scheduler.Metrics();
+        internal static BridgeResult SchedulerMetrics() => Scheduler.Metrics()
+            .Add("lifecyclePending", LifecycleDispatch.PendingCount)
+            .Add("lifecycleCoalesced", LifecycleDispatch.CoalescedCount)
+            .Add("lifecycleDroppedStale", LifecycleDispatch.DroppedStaleCount);
 
         internal static BridgeResult BeginRestartDrain(BridgeRequest request)
         {

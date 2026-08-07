@@ -164,6 +164,17 @@ Automatic activation is restricted to unambiguously read-only operations: `disco
 `describe`, `read`, `repo context`, and `lease inspect`. Generic `call`, `mutate`, `cancel`, lease
 acquire/renew/release, and adapter reload return actionable state without automatic activation or
 stale-lease reuse.
+Lifecycle callbacks are bounded/coalesced to the newest sequence and expose
+`lifecyclePending`, `lifecycleCoalesced`, and `lifecycleDroppedStale` in scheduler metrics. Compatible
+pure reads may run concurrently; restart, save/load, adapter reload, stateful setup, mutation, and
+lease writes use a fair serialized runtime lane.
+
+For work that genuinely needs a person, use the durable queue:
+`review request|list|get|resolve|cancel|wait|checkpoint|resume`. Tickets are redacted and atomically
+persisted under the user root, deduplicated, and retain exact resume operations. After the default
+60-second response window, the client checkpoints as `READY_AWAITING_HUMAN`, releases resources, and
+ends successfully awaiting input. Review and approval never authorize mutation, attached-process
+control, or a write lease.
 `RimWorldManagedDir is not configured` or a missing assembly error means the private dependency
 inputs are absent; do not copy those files into this repository. A fingerprint, boot, session, or
 transport mismatch requires discarding cached context, leases, cursors, and handles.

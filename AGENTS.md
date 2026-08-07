@@ -26,3 +26,6 @@
 - Dev Bridge owns contracts, discovery, validation, execution, safety, and diagnostics. Integrations and adapter distribution remain owner-controlled; Dev Bridge is optional.
 - Dev Bridge-owned source is licensed under the MIT License in `LICENSE`; this does not license RimWorld, Unity, Harmony, or owner-mod content.
 - Full workflow: `DevTools/DEVBRIDGE_AGENT.md`.
+- Lifecycle queues are bounded/coalesced. `FinalizeInit` callbacks retain only the newest lifecycle sequence; inspect `lifecyclePending`, `lifecycleCoalesced`, and `lifecycleDroppedStale` in scheduler metrics. Owner adoption and runtime sequence checks remain authoritative.
+- Shared runtime-lane policy: compatible pure reads may run concurrently; restart, save/load, adapter reload, stateful setup, mutation, and lease writes are fair serialized lane work. Runtime-lane requests must not wait on optional human feedback while holding a resource.
+- Durable human work queue: `devbridge.ps1 review request|list|get|resolve|cancel|wait|checkpoint|resume`. Review tickets are atomically persisted under the existing user root, deduplicated, redacted, and may end in `READY_AWAITING_HUMAN`. Review or approval never grants mutation, attached-process control, or a write lease.

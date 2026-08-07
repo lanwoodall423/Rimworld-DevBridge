@@ -29,7 +29,12 @@ namespace RimWorldDevBridge
         private bool drainPosted;
         private long executed;
         private long rejected;
+        private long runtimeLaneAcquired;
+        private long runtimeLaneCompleted;
         private int queuedCount;
+        private int runtimeLanePending;
+        private bool runtimeLaneActive;
+        private bool runtimeLaneTurn = true;
         private long drainBarrierId;
         private bool draining;
         private double totalQueueMs;
@@ -175,6 +180,7 @@ namespace RimWorldDevBridge
                 request.QueueBarrierId = draining ? drainBarrierId : 0;
                 agentQueue.Enqueue(request);
                 queuedCount++;
+                if (IsRuntimeLaneRequest(request)) runtimeLanePending++;
                 PostDrainLocked();
                 return null;
             }
@@ -216,6 +222,9 @@ namespace RimWorldDevBridge
                 agentQueues.Clear();
                 agentRoundRobin.Clear();
                 queuedCount = 0;
+                runtimeLanePending = 0;
+                runtimeLaneActive = false;
+                runtimeLaneTurn = true;
                 draining = false;
                 drainBarrierId = 0;
                 foreach (BridgeRequest request in running.Values) request.Cancelled = true;
@@ -242,6 +251,10 @@ namespace RimWorldDevBridge
                     .Add("slowestCommand", slowestCommand)
                     .Add("budgetMs", budgetMs)
                     .Add("perAgentQueueCapacity", MaximumPerAgentQueue)
+                    .Add("runtimeLanePending", runtimeLanePending)
+                    .Add("runtimeLaneActive", runtimeLaneActive)
+                    .Add("runtimeLaneAcquired", runtimeLaneAcquired)
+                    .Add("runtimeLaneCompleted", runtimeLaneCompleted)
                     .Add("draining", draining)
                     .Add("barrierId", drainBarrierId);
                 foreach (KeyValuePair<string, AgentMetric> pair in agentMetrics.OrderBy(item => item.Key,
@@ -288,18 +301,26 @@ namespace RimWorldDevBridge
                     }
                     running[request.RequestId] = request;
                 }
-                if (request.Cancelled)
-                    CompleteRejected(request, BridgeStatus.CANCELLED, "cancelled_before_execution");
-                else if (request.ClientDisconnected)
-                    CompleteRejected(request, BridgeStatus.CANCELLED, "client_disconnected");
-                else if (IsStaleSession(request))
-                    CompleteRejected(request, BridgeStatus.INCOMPATIBLE, "stale_session");
-                else if (request.Expired)
-                    CompleteRejected(request, BridgeStatus.TIMEOUT, "queue_deadline_expired");
-                else if (request.Cost >= BridgeCostClass.Expensive && !request.AllowExpensive)
-                    CompleteRejected(request, BridgeStatus.FORBIDDEN, "expensive_override_required");
-                else
-                    yielded = Execute(request);
+                bool runtimeLaneRequest = IsRuntimeLaneRequest(request);
+                try
+                {
+                    if (request.Cancelled)
+                        CompleteRejected(request, BridgeStatus.CANCELLED, "cancelled_before_execution");
+                    else if (request.ClientDisconnected)
+                        CompleteRejected(request, BridgeStatus.CANCELLED, "client_disconnected");
+                    else if (IsStaleSession(request))
+                        CompleteRejected(request, BridgeStatus.INCOMPATIBLE, "stale_session");
+                    else if (request.Expired)
+                        CompleteRejected(request, BridgeStatus.TIMEOUT, "queue_deadline_expired");
+                    else if (request.Cost >= BridgeCostClass.Expensive && !request.AllowExpensive)
+                        CompleteRejected(request, BridgeStatus.FORBIDDEN, "expensive_override_required");
+                    else
+                        yielded = Execute(request);
+                }
+                finally
+                {
+                    if (runtimeLaneRequest) ReleaseRuntimeLane();
+                }
                 operations++;
                 if (yielded) break;
                 if (request.Cost >= BridgeCostClass.Expensive) break;
@@ -313,6 +334,19 @@ namespace RimWorldDevBridge
 
         private BridgeRequest NextLocked()
         {
+            if (runtimeLaneActive) return null;
+            if (runtimeLanePending > 0 && (runtimeLaneTurn || !HasOrdinaryWorkLocked()))
+            {
+                BridgeRequest laneRequest = NextRuntimeLaneLocked();
+                if (laneRequest != null)
+                {
+                    runtimeLanePending--;
+                    runtimeLaneActive = true;
+                    runtimeLaneTurn = false;
+                    runtimeLaneAcquired++;
+                    return laneRequest;
+                }
+            }
             while (agentRoundRobin.Count > 0)
             {
                 string agentKey = agentRoundRobin.Dequeue();
@@ -321,13 +355,68 @@ namespace RimWorldDevBridge
                     agentQueues.Remove(agentKey);
                     continue;
                 }
+                if (runtimeLanePending > 0 && !runtimeLaneTurn && IsRuntimeLaneRequest(pending.Peek()))
+                {
+                    agentRoundRobin.Enqueue(agentKey);
+                    continue;
+                }
                 BridgeRequest request = pending.Dequeue();
                 queuedCount--;
                 if (pending.Count > 0) agentRoundRobin.Enqueue(agentKey);
                 else agentQueues.Remove(agentKey);
+                if (runtimeLanePending > 0) runtimeLaneTurn = true;
                 return request;
             }
             return null;
+        }
+
+        private bool HasOrdinaryWorkLocked()
+        {
+            return agentQueues.Values.Any(items => items.Count > 0 && !IsRuntimeLaneRequest(items.Peek()));
+        }
+
+        private BridgeRequest NextRuntimeLaneLocked()
+        {
+            int agents = agentRoundRobin.Count;
+            for (int index = 0; index < agents; index++)
+            {
+                string agentKey = agentRoundRobin.Dequeue();
+                if (!agentQueues.TryGetValue(agentKey, out Queue<BridgeRequest> pending) || pending.Count == 0)
+                {
+                    agentQueues.Remove(agentKey);
+                    continue;
+                }
+                if (IsRuntimeLaneRequest(pending.Peek()))
+                {
+                    BridgeRequest request = pending.Dequeue();
+                    queuedCount--;
+                    if (pending.Count > 0) agentRoundRobin.Enqueue(agentKey);
+                    else agentQueues.Remove(agentKey);
+                    return request;
+                }
+                agentRoundRobin.Enqueue(agentKey);
+            }
+            return null;
+        }
+
+        private void ReleaseRuntimeLane()
+        {
+            lock (gate)
+            {
+                runtimeLaneActive = false;
+                runtimeLaneCompleted++;
+            }
+        }
+
+        private static bool IsRuntimeLaneRequest(BridgeRequest request)
+        {
+            if (request == null) return false;
+            if (request.Mode >= BridgeCommandMode.TemporaryTestMutation) return true;
+            string command = BridgeText.NormalizeCommand(request.Command);
+            return command == "CANCEL" || command == "WRITE_LEASE" ||
+                command == "RENEW_WRITE_LEASE" || command == "REVOKE_WRITE_LEASE" ||
+                command.StartsWith("RELOAD_", StringComparison.Ordinal) ||
+                command.StartsWith("RESTART_", StringComparison.Ordinal);
         }
 
         private bool Execute(BridgeRequest request)

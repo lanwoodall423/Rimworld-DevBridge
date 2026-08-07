@@ -13,7 +13,7 @@ try {
     foreach ($number in 1..$Clients) {
         $powerShell = [PowerShell]::Create()
         $powerShell.RunspacePool = $pool
-        [void]$powerShell.AddScript("& '$escapedPath' call --command=STATUS --timeout-ms=$TimeoutMs --json")
+        [void]$powerShell.AddScript("& '$escapedPath' read --command=STATUS --timeout-ms=$TimeoutMs --json")
         $calls += [pscustomobject]@{
             PowerShell = $powerShell
             Handle = $powerShell.BeginInvoke()
@@ -24,7 +24,9 @@ try {
         ($call.PowerShell.EndInvoke($call.Handle) | Out-String).Trim()
     }
     $objects = @($responses | ForEach-Object { $_ | ConvertFrom-Json })
-    $ids = @($objects | ForEach-Object { $_.id })
+    $ids = @($objects | ForEach-Object {
+        if ($_.requestId) { $_.requestId } else { $_.id }
+    })
     $successful = @($objects | Where-Object { "$($_.status)" -eq "OK" }).Count
     $uniqueIds = @($ids | Sort-Object -Unique).Count
 

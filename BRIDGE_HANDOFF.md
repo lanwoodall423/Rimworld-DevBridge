@@ -103,6 +103,22 @@ limited to `discover`, `context`, `describe`, `read`, `repo context`, and `lease
 Generic `call`, `mutate`, `cancel`, lease acquire/renew/release, and adapter reload do not
 automatically wake, activate, retry, or reuse stale leases.
 
+## Shared Runtime And Human Work
+
+Lifecycle callbacks are coalesced to the newest lifecycle sequence. Scheduler metrics expose
+`lifecyclePending`, `lifecycleCoalesced`, and `lifecycleDroppedStale`; owner adoption and lifecycle
+generation checks remain authoritative. Compatible pure reads may run concurrently, while restart,
+save/load, adapter reload, stateful setup, mutation, and lease writes use the fair serialized runtime
+lane. Restart requests coalesce into one cycle and affected clients must reacquire fresh context.
+
+The canonical client provides a durable, redacted human-work queue:
+`review request|list|get|resolve|cancel|wait|checkpoint|resume`. Requests contain a stable task ID,
+category, exact question, options/recommendation, evidence, dependent and independent work,
+branch/commit state, expiration/deduplication keys, and an exact resume operation. A response window
+defaults to 60 seconds; unresolved work is checkpointed as `READY_AWAITING_HUMAN`, releases all
+resources, and remains resumable. Review or approval never authorizes mutation, attached-process
+control, or a write lease.
+
 Multiple clients have isolated request IDs and responses. RimWorld/Unity access is serialized on
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit
 override. A timed-out or disconnected queued request is cancelled before execution.
@@ -120,7 +136,8 @@ duplicate notifications are discarded.
 
 The canonical client supports `discover`, `wake`, `read`, `context`, `describe`, `call`, `mutate`,
 `cancel`, `lease acquire|inspect|renew|release`, `adapter publish|reload`, and
-`restart authorize-sandbox|revoke-sandbox|request|status|wait|ensure`.
+`restart authorize-sandbox|revoke-sandbox|request|status|wait|ensure`, plus
+`review request|list|get|resolve|cancel|wait|checkpoint|resume`.
 It emits JSON on stdout and diagnostics on stderr. Idempotency keys are generated for mutations when
 omitted and are returned in the JSON response; callers should supply the same key for an intentional retry.
 Transport and lease secrets are redacted unless `--unsafe-debug` is explicitly supplied.

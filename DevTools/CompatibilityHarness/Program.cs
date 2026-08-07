@@ -53,6 +53,7 @@ internal static class Program
         Run("scheduler stale session", SchedulerStaleSession);
         Run("scheduler queue capacity", SchedulerQueueCapacity);
         Run("fair per-agent scheduler", FairPerAgentScheduler);
+        Run("shared runtime lane fairness", SharedRuntimeLaneFairness);
         Run("restart drain barrier", RestartDrainBarrier);
         Run("restart coordinator state machine", RestartCoordinatorStateMachineTest);
         Run("session context transitions", SessionContextTransitions);
@@ -67,6 +68,7 @@ internal static class Program
         Run("production pawn thing job snapshots", ProductionPawnThingJobSnapshots);
         Run("wake signal idempotence", WakeSignalIdempotence);
         Run("main thread dispatch queue", MainThreadDispatchQueue);
+        Run("lifecycle queue coalescing", LifecycleQueueCoalescing);
         Run("main thread owner assertion", MainThreadOwnerAssertion);
         Run("main thread owner adoption", MainThreadOwnerAdoption);
         Run("worker game transition lifecycle", WorkerGameTransitionLifecycle);
@@ -644,6 +646,45 @@ internal static class Program
         bounded.RotateSession("bounded-next");
     }
 
+    private static void SharedRuntimeLaneFairness()
+    {
+        QueuedContext context = new QueuedContext();
+        List<string> order = new List<string>();
+        BridgeScheduler scheduler = new BridgeScheduler(request =>
+        {
+            order.Add(request.Command);
+            return BridgeResult.Ok("lane.test");
+        });
+        scheduler.Configure(context, "lane-session", 8, 12);
+
+        BridgeRequest read = Request("lane-read", "lane-session");
+        read.AgentId = "read-agent";
+        read.Mode = BridgeCommandMode.PureRead;
+        BridgeRequest mutation = Request("lane-write", "lane-session");
+        mutation.AgentId = "write-agent";
+        mutation.Command = "SET_SPEED";
+        mutation.Mode = BridgeCommandMode.PersistentMutation;
+        BridgeRequest readAgain = Request("lane-read-again", "lane-session");
+        readAgain.AgentId = "read-agent-again";
+        BridgeRequest mutationAgain = Request("lane-write-again", "lane-session");
+        mutationAgain.AgentId = "write-agent-again";
+        mutationAgain.Command = "SET_SPEED";
+        mutationAgain.Mode = BridgeCommandMode.PersistentMutation;
+        Check(scheduler.Enqueue(read) == null, "read lane request rejected");
+        Check(scheduler.Enqueue(mutation) == null, "runtime lane request rejected");
+        Check(scheduler.Enqueue(readAgain) == null, "second read lane request rejected");
+        Check(scheduler.Enqueue(mutationAgain) == null, "second runtime lane request rejected");
+        context.Drain();
+        Check(order.Count == 4 && order[0] != order[1] && order[1] != order[2] && order[2] != order[3] &&
+            order.All(command => command == "STATUS" || command == "SET_SPEED") &&
+            order.Count(command => command == "STATUS") == 2 && order.Count(command => command == "SET_SPEED") == 2,
+            "runtime lane did not alternate fairly with ordinary work: " + string.Join(",", order));
+        BridgeResult metrics = scheduler.Metrics();
+        Equal("2", FieldValue(metrics, "runtimeLaneAcquired"), "runtime lane acquisition metric");
+        Equal("2", FieldValue(metrics, "runtimeLaneCompleted"), "runtime lane completion metric");
+        Equal("0", FieldValue(metrics, "runtimeLanePending"), "runtime lane pending metric");
+    }
+
     private static void RestartDrainBarrier()
     {
         QueuedContext context = new QueuedContext();
@@ -748,6 +789,37 @@ internal static class Program
         Equal(0, called, "callback ran off main thread");
         Equal(1, context.Drain(16, 100), "callback not drained");
         Equal(1, called, "callback did not execute");
+    }
+
+    private static void LifecycleQueueCoalescing()
+    {
+        BridgeMainThreadContext context = new BridgeMainThreadContext();
+        int executed = 0;
+        long newest = -1;
+        for (long sequence = 0; sequence < 10000; sequence++)
+        {
+            long captured = sequence;
+            context.PostLifecycle(state =>
+            {
+                executed++;
+                newest = (long)state;
+            }, captured);
+        }
+        Equal(1, context.LifecyclePendingCount, "lifecycle queue was not bounded");
+        Check(context.LifecycleCoalescedCount > 0, "lifecycle flood was not coalesced");
+        Equal(1, context.DrainLifecycle(8, 100), "coalesced lifecycle callback was not drained");
+        Equal(1, executed, "coalesced lifecycle callbacks executed more than once");
+        Equal(9999L, newest, "newest lifecycle sequence was not preserved");
+
+        context.PostLifecycle(state => executed++, 9998L);
+        Check(context.LifecycleDroppedStaleCount > 0, "stale lifecycle callback was not dropped");
+        Equal(0, context.DrainLifecycle(8, 100), "stale lifecycle callback was drained");
+
+        BridgeResult metrics = BridgeRuntime.SchedulerMetrics();
+        Check(FieldValue(metrics, "lifecyclePending") != null &&
+            FieldValue(metrics, "lifecycleCoalesced") != null &&
+            FieldValue(metrics, "lifecycleDroppedStale") != null,
+            "lifecycle metrics were not projected");
     }
 
     private static void MainThreadOwnerAssertion()

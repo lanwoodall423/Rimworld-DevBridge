@@ -54,6 +54,25 @@
       "launch_profile_invalid",
       "attached_live_process_requires_operator",
       "bridge_ready"
-    ]
+    ],
+    "lifecycleMetrics": ["lifecyclePending", "lifecycleCoalesced", "lifecycleDroppedStale"],
+    "runtimeLane": {
+      "compatibleReadConcurrency": true,
+      "serializedOperations": ["restart", "save_load", "adapter_reload", "stateful_setup", "mutation", "lease_write"],
+      "fair": true,
+      "humanFeedbackNeverHoldsLane": true
+    },
+    "reviewQueue": {
+      "commands": ["request", "list", "get", "resolve", "cancel", "wait", "checkpoint", "resume"],
+      "categories": ["human_review", "human_approval", "hard_blocker"],
+      "defaultResponseWindowMs": 60000,
+      "awaitingState": "READY_AWAITING_HUMAN",
+      "atomicUserRootPersistence": true,
+      "deduplicated": true,
+      "redacted": true,
+      "neverAuthorizesMutation": true,
+      "neverControlsAttachedProcess": true,
+      "neverGrantsWriteLease": true
+    }
   }
 }
