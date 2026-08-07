@@ -111,6 +111,13 @@ try {
     if ($missingAuthorization.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED' -or $missingAuthorization.operatorActionRequired -ne $true) {
         throw "missing sandbox authorization was not required actual=$($missingAuthorization | ConvertTo-Json -Compress)"
     }
+    foreach ($property in @('recoverable', 'requiredAction', 'activationState', 'waitFor', 'keepRunning', 'retrySafe', 'operatorActionRequired', 'nextAction')) {
+        if (-not $missingAuthorization.PSObject.Properties[$property]) { throw "ensure response missing recovery field: $property" }
+    }
+    if ($missingAuthorization.reason -ne 'sandbox_authorization_missing' -or
+        $missingAuthorization.activationState -ne 'failed' -or $missingAuthorization.waitFor -ne 'none') {
+        throw "ensure response vocabulary was not canonical actual=$($missingAuthorization | ConvertTo-Json -Compress)"
+    }
     $wakeStart = Invoke-Client (@('wake', '--start') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--timeout-ms', '250', '--json')) 3
     if ($wakeStart.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED') {
         throw "wake start bypassed sandbox authorization actual=$($wakeStart | ConvertTo-Json -Compress)"

@@ -38,6 +38,90 @@ function New-ErrorResult([string] $reason, [string] $detail = $null) {
     return $result
 }
 
+function Set-ActivationRecoveryFields($result) {
+    $reason = [string]$result.reason
+    $ready = $result.ready -eq $true -or $reason -eq "bridge_ready"
+    $attached = $reason -eq "attached_live_process_requires_operator"
+    $authorization = $reason -eq "sandbox_authorization_missing"
+    $profile = $reason -eq "managed_profile_missing" -or $reason -eq "launch_profile_invalid"
+    $inProgress = $result.state -eq "activation_in_progress" -or $reason -eq "activation_timeout"
+    if ($ready) {
+        if ($reason -eq "activation_ready") { $result.legacyReason = $reason }
+        if ([string]$result.phase -eq "BRIDGE_READY") { $result.legacyPhase = $result.phase }
+        $result.reason = "bridge_ready"
+        $result.phase = "READY"
+    }
+    $result.activationState = if ($ready) { "ready" } elseif ($inProgress) { "activation_in_progress" } else { "failed" }
+    $result.recoverable = if ($ready -or $attached -or $authorization -or $profile) { $false } else { $true }
+    $result.waitFor = if ($ready -or $attached -or $authorization -or $profile) { "none" } else { "bridge" }
+    $result.keepRunning = -not $attached
+    $result.retrySafe = -not ($attached -or $authorization -or $profile)
+    $result.operatorActionRequired = $attached
+    if ($ready) {
+        $result.requiredAction = "none"
+        $result.nextAction = "none"
+    }
+    elseif ($attached) {
+        $result.requiredAction = "the process owner must manage the attached RimWorld process"
+        $result.nextAction = "wait for the attached process owner or use an explicitly authorized managed-test profile"
+    }
+    elseif ($authorization) {
+        $result.requiredAction = "authorize the validated managed-test profile"
+        $result.nextAction = "restart authorize-sandbox --confirm-disposable-sandbox"
+    }
+    elseif ($profile) {
+        $result.requiredAction = "provide a valid managed-test launch profile"
+        $result.nextAction = "supply --game-path and an existing --user-data-root"
+    }
+    elseif ($inProgress) {
+        $result.requiredAction = "wait for bridge readiness"
+        $result.nextAction = "wait for activation progress or retry restart ensure within the bounded policy"
+    }
+    else {
+        $result.requiredAction = "activate the authorized managed-test instance before retrying"
+        $result.nextAction = "restart ensure --readiness bridge --save-policy none --keep-running"
+    }
+    return $result
+}
+
+function Set-InactiveStatusRecoveryFields($result, [string] $userRoot) {
+    if ($result.available -eq $true) {
+        $result.activationState = "ready"
+        $result.recoverable = $false
+        $result.waitFor = "none"
+        $result.keepRunning = $true
+        $result.retrySafe = $true
+        $result.operatorActionRequired = $false
+        $result.requiredAction = "none"
+        $result.nextAction = "none"
+        return $result
+    }
+    $eligible = $false
+    try { $eligible = Test-ActivationEligibleReason ([string]$result.reason) } catch { $eligible = $false }
+    $activationState = "inactive"
+    if ($userRoot) {
+        try {
+            $activation = Read-ActivationState $userRoot
+            if ($activation -and $activation.state -eq "in_progress") { $activationState = "activation_in_progress" }
+        } catch { }
+    }
+    $result.activationState = $activationState
+    $result.recoverable = $eligible
+    $result.waitFor = if ($eligible) { "bridge" } else { "none" }
+    $result.keepRunning = $eligible
+    $result.retrySafe = $eligible
+    $result.operatorActionRequired = $false
+    if ($eligible) {
+        $result.requiredAction = "activate the authorized managed-test instance and wait for bridge readiness before retrying read-only verification"
+        $result.nextAction = "restart ensure --readiness bridge --save-policy none --keep-running"
+    }
+    else {
+        $result.requiredAction = "inspect the reported runtime status and configuration"
+        $result.nextAction = "refresh discover/context after correcting the runtime configuration"
+    }
+    return $result
+}
+
 function Read-KeyFile([string] $path) {
     $values = [ordered]@{}
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $values }
@@ -234,32 +318,32 @@ function Clear-LeaseState([string] $userRoot) {
 function Get-BridgeStatus([string] $bridgeRoot, [string] $userRoot, [string] $agentId, $config) {
     $result = [ordered]@{ available = $false; reason = "status_unavailable"; agentId = $agentId }
     $root = Resolve-UserRoot $userRoot $config
-    if ($null -eq $root) { $result.reason = "user_data_root_unavailable"; return $result }
+    if ($null -eq $root) { $result.reason = "user_data_root_unavailable"; return Set-InactiveStatusRecoveryFields $result $userRoot }
     $statusPath = Join-Path $root "RimWorld-DevBridge-Status.txt"
-    if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) { return $result }
-    try { $statusFile = Get-Item -LiteralPath $statusPath } catch { return $result }
+    if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) { return Set-InactiveStatusRecoveryFields $result $root }
+    try { $statusFile = Get-Item -LiteralPath $statusPath } catch { return Set-InactiveStatusRecoveryFields $result $root }
     if ([DateTime]::UtcNow - $statusFile.LastWriteTimeUtc -gt [TimeSpan]::FromMinutes(5)) {
-        $result.reason = "stale_status"; return $result
+        $result.reason = "stale_status"; return Set-InactiveStatusRecoveryFields $result $root
     }
     $status = Read-KeyFile $statusPath
     foreach ($required in @("bridge", "version", "protocol", "schema", "processId", "bootId", "session", "transportGeneration")) {
         if (-not $status.Contains($required) -or [string]::IsNullOrWhiteSpace($status[$required])) {
-            $result.reason = "invalid_status_$required"; return $result
+            $result.reason = "invalid_status_$required"; return Set-InactiveStatusRecoveryFields $result $root
         }
     }
-    if ($status["bridge"] -ne "ON") { $result.reason = "bridge_not_active"; return $result }
-    if ([int64]$status["transportGeneration"] -le 0) { $result.reason = "invalid_transport_generation"; return $result }
+    if ($status["bridge"] -ne "ON") { $result.reason = "bridge_not_active"; return Set-InactiveStatusRecoveryFields $result $root }
+    if ([int64]$status["transportGeneration"] -le 0) { $result.reason = "invalid_transport_generation"; return Set-InactiveStatusRecoveryFields $result $root }
     $process = Get-Process -Id ([int]$status["processId"]) -ErrorAction SilentlyContinue
-    if ($null -eq $process) { $result.reason = "process_not_running"; return $result }
+    if ($null -eq $process) { $result.reason = "process_not_running"; return Set-InactiveStatusRecoveryFields $result $root }
     if ([string]::IsNullOrWhiteSpace($status["token"]) -or [string]::IsNullOrWhiteSpace($status["port"])) {
-        $result.reason = "transport_credentials_unavailable"; return $result
+        $result.reason = "transport_credentials_unavailable"; return Set-InactiveStatusRecoveryFields $result $root
     }
     if (-not [string]::IsNullOrWhiteSpace($bridgeRoot)) {
         $manifest = Read-BridgeManifest $bridgeRoot
         if ($status["version"] -ne $manifest["bridge"] -or
             ($status["protocol"] -replace "^v", "") -ne ($manifest["protocol"] -replace "^v", "") -or
             $status["schema"] -ne $manifest["schema"]) {
-            $result.reason = "disk_runtime_mismatch"; return $result
+            $result.reason = "disk_runtime_mismatch"; return Set-InactiveStatusRecoveryFields $result $root
         }
         $corePath = Join-Path $bridgeRoot "1.6\Assemblies\RimWorldDevBridge.dll"
         if ((Test-Path -LiteralPath $corePath -PathType Leaf) -and $status.Contains("coreFingerprint")) {
@@ -267,7 +351,7 @@ function Get-BridgeStatus([string] $bridgeRoot, [string] $userRoot, [string] $ag
             $moduleId = [Reflection.Assembly]::ReflectionOnlyLoadFrom($corePath).ManifestModule.ModuleVersionId.ToString("N")
             $reported = "$($status["coreFingerprint"])".ToUpperInvariant()
             if ($fingerprint.ToUpperInvariant() -ne $reported -and $moduleId.ToUpperInvariant() -ne $reported) {
-                $result.reason = "core_fingerprint_mismatch"; return $result
+                $result.reason = "core_fingerprint_mismatch"; return Set-InactiveStatusRecoveryFields $result $root
             }
         }
     }
@@ -278,7 +362,7 @@ function Get-BridgeStatus([string] $bridgeRoot, [string] $userRoot, [string] $ag
     }
     $result.statusPath = $statusPath
     $result.bridgeRoot = $bridgeRoot
-    return $result
+    return Set-InactiveStatusRecoveryFields $result $root
 }
 
 function Redact-Text([string] $text) {
@@ -374,11 +458,12 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
     $status = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
     if (-not $status.available -and (Test-ActivationEligibleReason $status.reason)) {
         if ($mutation -or -not $AllowActivation) {
-            $wakeValues = @("--bridge-root", $bridgeRoot, "--user-root", $userRoot, "--timeout-ms", "5000")
-            $previousExit = $script:ExitCode
-            $wake = Invoke-Wake $wakeValues
-            $script:ExitCode = $previousExit
-            if ($wake.available) { $status = $wake }
+            $status.automaticActivation = $false
+            $status.requiredAction = "activate the authorized managed-test instance explicitly before retrying this non-read-only operation"
+            $status.nextAction = "restart ensure --readiness bridge --save-policy none --keep-running"
+            $status.retrySafe = $false
+            $script:ExitCode = 4
+            return $status
         }
         else {
             $activation = Invoke-ActivationRecovery $values $status.reason
@@ -386,7 +471,7 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
                 $script:ExitCode = 4
                 $failure = New-ErrorResult $activation.reason "Runtime activation did not complete."
                 $failure.activation = $activation
-                return $failure
+                return Set-ActivationRecoveryFields $failure
             }
             $status = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
             if (-not $status.available) {
@@ -394,7 +479,7 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
                 $failure = New-ErrorResult "bridge_load_failed" "Bridge status remained unavailable after activation."
                 $failure.activation = $activation
                 $failure.status = $status
-                return $failure
+                return Set-ActivationRecoveryFields $failure
             }
             $freshStatus = Invoke-BridgeCommand "STATUS" "" $values $false $null $null $false
             if (-not (Test-ResponseOk $freshStatus)) {
@@ -402,7 +487,7 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
                 $failure = New-ErrorResult "bridge_load_failed" "Fresh STATUS did not complete after activation."
                 $failure.activation = $activation
                 $failure.status = $freshStatus
-                return $failure
+                return Set-ActivationRecoveryFields $failure
             }
         }
     }
@@ -497,6 +582,15 @@ function Invoke-Help {
         secrets = "transport and lease tokens are redacted; use --unsafe-debug only for explicit local debugging"
         activation = "bridge_not_active is recoverable. Activate the authorized managed-test instance and wait for bridge readiness before abandoning runtime verification."
         activationOptions = @("--startup-timeout-ms <100..600000>", "--progress-interval-ms <100..10000>")
+        responseContract = [ordered]@{
+            activationState = @("inactive", "activation_in_progress", "ready", "failed")
+            waitFor = @("none", "bridge", "game", "map")
+            canonicalReady = "reason=bridge_ready;phase=READY"
+            canonicalAttached = "attached_live_process_requires_operator"
+            fields = @("recoverable", "requiredAction", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction")
+            automaticActivation = @("discover", "context", "describe", "read", "repo context", "lease inspect")
+            noAutomaticActivation = @("call", "mutate", "cancel", "lease acquire", "lease renew", "lease release", "adapter reload")
+        }
         managedLaunch = [ordered]@{
             maxAttempts = "--max-launch-attempts <1..5> (default 2)"
             backoff = "--launch-backoff-ms <0..10000> (default 500)"
@@ -976,8 +1070,13 @@ function Get-AttachedGameProcesses([string] $gamePath) {
 function New-RestartEnsureResult([string] $status, [bool] $requested, [bool] $performed,
     [string] $ownership, [string] $phase, [string] $operatorAction, [string] $nextAction,
     $details = $null, [string] $failureReason = $null) {
+    $attached = $failureReason -eq "attached_live_process_requires_operator" -or $status -eq "USER_RESTART_REQUIRED"
+    $authorization = $failureReason -eq "sandbox_authorization_missing" -or $status -eq "SANDBOX_AUTHORIZATION_REQUIRED"
+    $configuration = $status -eq "CONFIGURATION" -or $status -eq "configuration_error"
+    $ready = $status -eq "READY"
+    $inProgress = -not $ready -and -not $attached -and -not $authorization -and -not $configuration -and $requested
     $result = [ordered]@{
-        ok = $status -eq "READY"
+        ok = $ready
         status = $status
         restartRequested = $requested
         restartPerformed = $performed
@@ -985,11 +1084,18 @@ function New-RestartEnsureResult([string] $status, [bool] $requested, [bool] $pe
         ticket = $null
         phase = $phase
         readiness = $null
-        operatorActionRequired = -not [string]::IsNullOrWhiteSpace($operatorAction)
+        operatorActionRequired = $attached -or -not [string]::IsNullOrWhiteSpace($operatorAction)
         operatorAction = $operatorAction
         nextAction = $nextAction
         contextHandshake = $null
+        activationState = if ($ready) { "ready" } elseif ($inProgress) { "activation_in_progress" } else { "failed" }
+        recoverable = -not ($ready -or $attached -or $authorization -or $configuration)
+        requiredAction = if ($ready) { "none" } elseif ($attached) { "the process owner must manage the attached RimWorld process" } elseif ($authorization) { "authorize the validated managed-test profile" } elseif ($configuration) { "correct the managed-test launch configuration" } elseif ($inProgress) { "wait for bridge readiness" } else { "retry restart ensure within the bounded managed-launch policy" }
+        waitFor = if ($ready -or $attached -or $authorization -or $configuration) { "none" } else { "bridge" }
+        keepRunning = -not $attached
+        retrySafe = -not ($attached -or $authorization -or $configuration)
     }
+    if ($result.operatorActionRequired -and [string]::IsNullOrWhiteSpace($result.nextAction)) { $result.nextAction = "wait for the process owner or use an explicitly authorized managed-test profile" }
     if (-not [string]::IsNullOrWhiteSpace($failureReason)) { $result.reason = $failureReason }
     if ($details) { $result.details = $details }
     return $result
@@ -1043,9 +1149,7 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         "--user-data-root", $profile.userDataRoot, "--mod-configuration", $profile.modConfiguration,
         "--launch-profile", "managed-test", "--owned"
     )
-    if ($null -eq $ownership -or -not $ownership.owned -or -not $ownership.running) {
-        Clear-LeaseState $userRoot
-    }
+    Clear-LeaseState $userRoot
     $requestValues = @(
         "--bridge-root", $bridgeRoot, "--user-root", $userRoot,
         "--agent-id", $agent.value, "--package-id", (Get-Value $values "--package-id" "Lan.RimWorldDevBridge"),
@@ -1094,7 +1198,8 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
 
 function New-ActivationResult([bool] $ready, [string] $reason, [string] $phase,
     [bool] $coalesced, [int64] $elapsedMs, $details = $null) {
-    return [ordered]@{
+    if ($ready) { $reason = "bridge_ready"; $phase = "READY" }
+    $result = [ordered]@{
         ready = $ready
         state = if ($ready) { "ready" } elseif ($reason -eq "activation_timeout") { "activation_in_progress" } else { "failed" }
         reason = $reason
@@ -1103,6 +1208,11 @@ function New-ActivationResult([bool] $ready, [string] $reason, [string] $phase,
         elapsedMs = $elapsedMs
         details = $details
     }
+    if ($ready) {
+        $result.legacyReason = "activation_ready"
+        $result.legacyPhase = "BRIDGE_READY"
+    }
+    return Set-ActivationRecoveryFields $result
 }
 
 function Get-ActivationFailureReason($ensure) {
@@ -1118,7 +1228,7 @@ function Get-ActivationFailureReason($ensure) {
     if ($text -match "missing_build_tooling|runtime_tools|coordinator_.*missing") { return "runtime_build_required" }
     if ($text -match "disk_runtime_mismatch|core_fingerprint_mismatch|deployment_mismatch|fingerprint") { return "deployment_mismatch" }
     if ($text -match "attached_live_process_requires_operator") { return "attached_live_process_requires_operator" }
-    if ($text -match "attached_process|USER_RESTART_REQUIRED|manually attached") { return "attached_process_requires_operator" }
+    if ($text -match "attached_process|USER_RESTART_REQUIRED|manually attached") { return "attached_live_process_requires_operator" }
     if ($text -match "managed_launch_failed") { return "managed_launch_failed" }
     if ($text -match "managed_process_exited_before_ready|game_process_exited|process_exited|game.*exited") { return "managed_process_exited_before_ready" }
     if ($text -match "bridge_handshake_timeout") { return "bridge_handshake_timeout" }
@@ -1179,6 +1289,7 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
         return New-ActivationResult $false "activation_timeout" "activation_in_progress" $true ([int64]([DateTime]::UtcNow - $started).TotalMilliseconds)
     }
     try {
+        Clear-LeaseState $userRoot
         Write-ActivationState $userRoot "in_progress" "waking" $initialReason $operationId $started.ToString("o") | Out-Null
         Write-ActivationProgress "in_progress" "waking" 0 $initialReason $false
         $wakeValues = @("--bridge-root", $bridgeRoot, "--user-root", $userRoot,
@@ -1188,8 +1299,8 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
         $script:ExitCode = $previousExit
         if ($wake.available) {
             $elapsed = [int64]([DateTime]::UtcNow - $started).TotalMilliseconds
-            $ready = New-ActivationResult $true "activation_ready" "BRIDGE_READY" $false $elapsed $wake
-            Write-ActivationState $userRoot "ready" "BRIDGE_READY" $ready.reason $operationId $started.ToString("o") $ready | Out-Null
+            $ready = New-ActivationResult $true "bridge_ready" "READY" $false $elapsed $wake
+            Write-ActivationState $userRoot "ready" $ready.phase $ready.reason $operationId $started.ToString("o") $ready | Out-Null
             return $ready
         }
 
@@ -1215,9 +1326,9 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
             $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
             $freshStatus = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
             if ($freshStatus.available) {
-                $ready = New-ActivationResult $true "activation_ready" "BRIDGE_READY" $false $elapsed $ensure
+                $ready = New-ActivationResult $true "bridge_ready" "READY" $false $elapsed $ensure
                 $ready.status = $freshStatus
-                Write-ActivationState $userRoot "ready" "BRIDGE_READY" $ready.reason $operationId $started.ToString("o") $ready | Out-Null
+                Write-ActivationState $userRoot "ready" $ready.phase $ready.reason $operationId $started.ToString("o") $ready | Out-Null
                 return $ready
             }
             $failure = New-ActivationResult $false "bridge_load_failed" "REFRESH" $false $elapsed $freshStatus
@@ -1455,19 +1566,25 @@ try {
                             $result = New-ErrorResult "bridge_load_failed" "Fresh STATUS did not complete after activation."
                             $result.activation = $activation
                             $result.status = $freshStatus
+                            $result = Set-ActivationRecoveryFields $result
                         }
-                        else { $result.activationRecovered = $true }
+                        else {
+                            $result.activationRecovered = $true
+                            $result.activation = $activation
+                        }
                     }
                     else {
                         $postActivationStatus = $result
                         $result = New-ErrorResult "bridge_load_failed" "Bridge status remained unavailable after activation."
                         $result.activation = $activation
                         $result.status = $postActivationStatus
+                        $result = Set-ActivationRecoveryFields $result
                     }
                 }
                 else {
                     $result = New-ErrorResult $activation.reason "Runtime activation did not complete."
                     $result.activation = $activation
+                    $result = Set-ActivationRecoveryFields $result
                 }
             }
             $result.agentId = $agent.value
@@ -1493,25 +1610,25 @@ try {
         "call" {
             $command = Get-CallCommand $args
             if ([string]::IsNullOrWhiteSpace($command)) { throw "command_required: use call <command> or --command <name>" }
-            $result = Invoke-BridgeCommand $command (Get-Value $args "--argument" "") $args $false (Get-Value $args "--idempotency-key") (Get-Value $args "--lease-token")
+            $result = Invoke-BridgeCommand $command (Get-Value $args "--argument" "") $args $false (Get-Value $args "--idempotency-key") (Get-Value $args "--lease-token") $false
         }
         "mutate" {
             $command = Get-CallCommand $args
             if ([string]::IsNullOrWhiteSpace($command)) { throw "command_required: use mutate --command <name>" }
-            $result = Invoke-BridgeCommand $command (Get-Value $args "--argument" "") $args $true (Get-Value $args "--idempotency-key") (Get-Value $args "--lease-token")
+            $result = Invoke-BridgeCommand $command (Get-Value $args "--argument" "") $args $true (Get-Value $args "--idempotency-key") (Get-Value $args "--lease-token") $false
         }
         "cancel" {
             $requestId = Get-Value $args "--request-id" (Get-Value $args "--argument")
             if ([string]::IsNullOrWhiteSpace($requestId)) { throw "request_id_required: use --request-id" }
-            $result = Invoke-BridgeCommand "CANCEL" $requestId $args
+            $result = Invoke-BridgeCommand "CANCEL" $requestId $args $false $null $null $false
         }
         "lease" {
             if ($args.Count -lt 1) { throw "lease_operation_required: use acquire, inspect, renew, or release" }
             switch ($args[0].ToLowerInvariant()) {
-                "acquire" { $result = Invoke-BridgeCommand "WRITE_LEASE" (Get-Value $args "--context" "sandbox") $args }
+                "acquire" { $result = Invoke-BridgeCommand "WRITE_LEASE" (Get-Value $args "--context" "sandbox") $args $true $null $null $false }
                 "inspect" { $result = Invoke-BridgeCommand "STATUS" "" $args }
-                "renew" { $result = Invoke-BridgeCommand "RENEW_WRITE_LEASE" "" $args $false $null (Get-Value $args "--lease-token") }
-                "release" { $result = Invoke-BridgeCommand "REVOKE_WRITE_LEASE" "" $args $false $null (Get-Value $args "--lease-token") }
+                "renew" { $result = Invoke-BridgeCommand "RENEW_WRITE_LEASE" "" $args $true $null (Get-Value $args "--lease-token") $false }
+                "release" { $result = Invoke-BridgeCommand "REVOKE_WRITE_LEASE" "" $args $true $null (Get-Value $args "--lease-token") $false }
                 default { throw "lease_operation_invalid: use acquire, inspect, renew, or release" }
             }
         }
@@ -1525,7 +1642,7 @@ try {
         }
         "adapter" {
             if ($args.Count -lt 1) { throw "adapter_operation_required: use publish or reload" }
-            if ($args[0] -eq "reload") { $result = Invoke-BridgeCommand "RELOAD_ADAPTERS" "" $args; break }
+            if ($args[0] -eq "reload") { $result = Invoke-BridgeCommand "RELOAD_ADAPTERS" "" $args $true $null $null $false; break }
             if ($args[0] -eq "publish") {
                 $repoRoot = Get-Value $args "--repo-root"
                 if ([string]::IsNullOrWhiteSpace($repoRoot)) { throw "repo_root_required: use --repo-root" }
@@ -1552,7 +1669,8 @@ try {
                     if ($launchAuthorization.authorized -ne $true) { $result = $launchAuthorization; break }
                     if ((Get-AttachedGameProcesses $launchProfile.executable).Count -gt 0) {
                         $script:ExitCode = 4
-                        $result = New-ErrorResult "attached_process_user_restart_required" "The configured RimWorld process is attached; no process was claimed or stopped."
+                        $result = New-ErrorResult "attached_live_process_requires_operator" "The configured RimWorld process is attached; no process was claimed or stopped."
+                        $result = Set-ActivationRecoveryFields $result
                         break
                     }
                 }

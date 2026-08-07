@@ -10,6 +10,27 @@
     "bridgeNotActive": "bridge_not_active is recoverable. Activate the authorized managed-test instance and wait for bridge readiness before abandoning runtime verification.",
     "operation": "activate-and-wait",
     "readiness": "bridge",
+    "canonicalAttachedReason": "attached_live_process_requires_operator",
+    "canonicalReadyReason": "bridge_ready",
+    "canonicalReadyPhase": "READY",
+    "legacyAliases": {
+      "attached_process_user_restart_required": "attached_live_process_requires_operator",
+      "attached_process_requires_operator": "attached_live_process_requires_operator",
+      "activation_ready": "bridge_ready",
+      "BRIDGE_READY": "READY"
+    },
+    "responseFields": {
+      "activationState": ["inactive", "activation_in_progress", "ready", "failed"],
+      "waitFor": ["none", "bridge", "game", "map"],
+      "recoverable": "boolean",
+      "requiredAction": "string",
+      "keepRunning": "boolean",
+      "retrySafe": "boolean",
+      "operatorActionRequired": "boolean",
+      "nextAction": "string"
+    },
+    "automaticActivationOperations": ["discover", "context", "describe", "read", "repo context", "lease inspect"],
+    "noAutomaticActivationOperations": ["call", "mutate", "cancel", "lease acquire", "lease renew", "lease release", "adapter reload"],
     "savePolicy": "none",
     "keepRunning": true,
     "startupTimeoutArgument": "--startup-timeout-ms",

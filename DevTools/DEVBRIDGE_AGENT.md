@@ -19,7 +19,17 @@ A dead coordinator-owned PID is automatically validated, cleared, and retried wi
 configured attempt/backoff limit. Never report it as `USER_RESTART_REQUIRED`; that result is
 reserved for a live externally owned process. Never suggest manual launch for a configured
 managed-test profile unless it is explicitly human-owned.
-   After reload, restart, session rotation, or game transition, discard cached context, cursors, handles, and leases and query again.
+Responses use `activationState=inactive|activation_in_progress|ready|failed`,
+`waitFor=none|bridge|game|map`, and always include `recoverable`, `requiredAction`,
+`keepRunning`, `retrySafe`, `operatorActionRequired`, and `nextAction`. Use `bridge_ready`
+with phase `READY` as the canonical successful activation state; `activation_ready` and
+`BRIDGE_READY` are compatibility aliases. The canonical attached reason is
+`attached_live_process_requires_operator`.
+Automatic activation is limited to `discover`, `context`, `describe`, `read`, `repo context`,
+and `lease inspect`. Generic `call`, `mutate`, `cancel`, lease acquire/renew/release, and
+adapter reload return actionable inactive state without waking, activating, retrying, or
+reusing stale leases.
+    After reload, restart, session rotation, or game transition, discard cached context, cursors, handles, and leases and query again.
 
 Mutation denial codes distinguish disabled settings, missing games, missing in-game confirmation, and
 invalid, expired, or wrong-agent leases. A successful lease does not survive confirmation revocation,

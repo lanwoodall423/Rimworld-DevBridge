@@ -155,6 +155,15 @@ by a person or external orchestrator. Managed launch failures report bounded sta
 `managed_process_exited_before_ready`, `managed_launch_retrying`, `managed_launch_failed`,
 `bridge_handshake_timeout`, and `launch_profile_invalid`. `restart ensure` requires an existing user-data
 root and an explicit game path; it does not scan arbitrary installations.
+Runtime responses use `activationState=inactive|activation_in_progress|ready|failed` and
+`waitFor=none|bridge|game|map`, together with `recoverable`, `requiredAction`, `keepRunning`,
+`retrySafe`, `operatorActionRequired`, and `nextAction`. The canonical attached reason is
+`attached_live_process_requires_operator`; the canonical successful activation reason is
+`bridge_ready` with phase `READY`. Legacy attached and `BRIDGE_READY` spellings are aliases only.
+Automatic activation is restricted to unambiguously read-only operations: `discover`, `context`,
+`describe`, `read`, `repo context`, and `lease inspect`. Generic `call`, `mutate`, `cancel`, lease
+acquire/renew/release, and adapter reload return actionable state without automatic activation or
+stale-lease reuse.
 `RimWorldManagedDir is not configured` or a missing assembly error means the private dependency
 inputs are absent; do not copy those files into this repository. A fingerprint, boot, session, or
 transport mismatch requires discarding cached context, leases, cursors, and handles.

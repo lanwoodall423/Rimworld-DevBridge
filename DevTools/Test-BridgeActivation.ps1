@@ -56,6 +56,8 @@ try {
     while ($true) {
         if (Test-Path -LiteralPath $ResetPath -PathType Leaf) {
             Remove-Item -LiteralPath $ResetPath -Force -ErrorAction SilentlyContinue
+            $wakeAt = $null
+            Remove-Item -LiteralPath $wakePath -Force -ErrorAction SilentlyContinue
             Write-Status 'DORMANT' (Test-Path -LiteralPath $StalePath -PathType Leaf)
         }
         if (Test-Path -LiteralPath $wakePath -PathType Leaf) {
@@ -93,7 +95,11 @@ try {
     $server = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
         '-UserRoot', $root, '-Port', $port, '-ProcessId', $PID, '-Mvid', $coreFingerprint,
         '-WakeDelayMs', $wakeDelayMs, '-ResetPath', $resetPath, '-StalePath', $stalePath) -PassThru -WindowStyle Hidden
-    Start-Sleep -Milliseconds 250
+    $statusPath = Join-Path $root 'RimWorld-DevBridge-Status.txt'
+    for ($attempt = 0; $attempt -lt 40 -and -not (Test-Path -LiteralPath $statusPath -PathType Leaf); $attempt++) {
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not (Test-Path -LiteralPath $statusPath -PathType Leaf)) { throw 'mock bridge did not publish initial status' }
     return [pscustomobject]@{ Process = $server; Root = $root; ResetPath = $resetPath; StalePath = $stalePath; Port = $port }
 }
 
@@ -112,6 +118,8 @@ $corePath = Join-Path $BridgeRoot '1.6/Assemblies/RimWorldDevBridge.dll'
 $mvid = [Reflection.Assembly]::ReflectionOnlyLoadFrom($corePath).ManifestModule.ModuleVersionId.ToString('N')
 $root = New-TestRoot 'DevBridgeActivation-'
 $mock = $null
+$unsafeRoot = $null
+$unsafeMock = $null
 $timeoutRoot = $null
 $timeoutMock = $null
 try {
@@ -122,11 +130,39 @@ try {
     if ($delayed.available -ne $true -or $delayed.activationRecovered -ne $true) {
         throw "delayed activation failed actual=$($delayed | ConvertTo-Json -Compress)"
     }
+    foreach ($property in @('recoverable', 'requiredAction', 'activationState', 'waitFor', 'keepRunning', 'retrySafe', 'operatorActionRequired', 'nextAction')) {
+        if (-not $delayed.PSObject.Properties[$property]) { throw "ready status missing recovery field: $property" }
+    }
+    if ($delayed.activation.reason -ne 'bridge_ready' -or $delayed.activation.phase -ne 'READY' -or
+        $delayed.activation.activationState -ne 'ready' -or $delayed.activation.waitFor -ne 'none') {
+        throw "activation readiness vocabulary was not canonical actual=$($delayed.activation | ConvertTo-Json -Compress)"
+    }
 
     Set-Content -LiteralPath $mock.ResetPath -Value '' -Encoding UTF8
     Start-Sleep -Milliseconds 100
     $readRetry = Invoke-Client (@('read', '--command=STATUS') + $base + @('--json'))
     if ($readRetry.status -ne 'OK') { throw "original read-only command was not retried actual=$($readRetry | ConvertTo-Json -Compress)" }
+
+    $unsafeRoot = New-TestRoot 'DevBridgeActivationUnsafe-'
+    $unsafeMock = Start-MockBridge $unsafeRoot $mvid 0
+    $unsafeBase = @('--bridge-root', $BridgeRoot, '--user-root', $unsafeRoot, '--startup-timeout-ms', '5000', '--progress-interval-ms', '100')
+    $rawBeforeUnsafeCall = Get-Content -LiteralPath (Join-Path $unsafeRoot 'RimWorld-DevBridge-Status.txt') -Raw
+    if (-not $rawBeforeUnsafeCall.Contains('bridge=DORMANT')) { throw "unsafe mock did not start dormant raw=$rawBeforeUnsafeCall" }
+    $unsafeCall = Invoke-Client (@('call', '--command=PING') + $unsafeBase + @('--json')) 4
+    $rawDormant = Get-Content -LiteralPath (Join-Path $unsafeRoot 'RimWorld-DevBridge-Status.txt') -Raw
+    if ($unsafeCall.reason -ne 'bridge_not_active' -or $unsafeCall.automaticActivation -ne $false -or
+        $unsafeCall.retrySafe -ne $false -or [string]::IsNullOrWhiteSpace([string]$unsafeCall.nextAction)) {
+        throw "generic call incorrectly activated or lacked actionable inactive state actual=$($unsafeCall | ConvertTo-Json -Compress) raw=$rawDormant"
+    }
+    $unsafeMutate = Invoke-Client (@('mutate', '--command=PING') + $unsafeBase + @('--json')) 4
+    $unsafeReload = Invoke-Client (@('adapter', 'reload') + $unsafeBase + @('--json')) 4
+    foreach ($unsafeResult in @($unsafeMutate, $unsafeReload)) {
+        if ($unsafeResult.reason -ne 'bridge_not_active' -or $unsafeResult.automaticActivation -ne $false -or $unsafeResult.retrySafe -ne $false) {
+            throw "unsafe operation unexpectedly activated actual=$($unsafeResult | ConvertTo-Json -Compress)"
+        }
+    }
+    $rawAfterUnsafe = Get-Content -LiteralPath (Join-Path $unsafeRoot 'RimWorld-DevBridge-Status.txt') -Raw
+    if (-not $rawDormant.Contains('bridge=DORMANT') -or -not $rawAfterUnsafe.Contains('bridge=DORMANT')) { throw 'unsafe operation unexpectedly woke the dormant bridge' }
 
     Set-Content -LiteralPath $mock.ResetPath -Value '' -Encoding UTF8
     Start-Sleep -Milliseconds 100
@@ -161,10 +197,10 @@ try {
     Write-Output 'bridgeActivation=PASS delayed=PASS retry=PASS concurrent=PASS stale=PASS timeout=PASS'
 }
 finally {
-    foreach ($item in @($mock, $timeoutMock)) {
+    foreach ($item in @($mock, $unsafeMock, $timeoutMock)) {
         if ($item -and $item.Process) { Stop-Process -Id $item.Process.Id -Force -ErrorAction SilentlyContinue }
     }
-    foreach ($path in @($root, $timeoutRoot)) {
+    foreach ($path in @($root, $unsafeRoot, $timeoutRoot)) {
         if ($path -and (Test-Path -LiteralPath $path)) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }

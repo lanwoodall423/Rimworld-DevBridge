@@ -93,6 +93,16 @@ recoverable after identity validation and bounded replacement attempts; it never
 Activation never claims or terminates an unrelated manually launched RimWorld process and
 never grants mutation authorization or a write lease.
 
+Recovery responses always expose `activationState=inactive|activation_in_progress|ready|failed`,
+`waitFor=none|bridge|game|map`, `recoverable`, `requiredAction`, `keepRunning`, `retrySafe`,
+`operatorActionRequired`, and `nextAction`. The canonical attached-process reason is
+`attached_live_process_requires_operator`; the canonical ready reason is `bridge_ready` with
+phase `READY`. `attached_process_user_restart_required`, `attached_process_requires_operator`,
+`activation_ready`, and `BRIDGE_READY` are compatibility aliases only. Automatic activation is
+limited to `discover`, `context`, `describe`, `read`, `repo context`, and `lease inspect`.
+Generic `call`, `mutate`, `cancel`, lease acquire/renew/release, and adapter reload do not
+automatically wake, activate, retry, or reuse stale leases.
+
 Multiple clients have isolated request IDs and responses. RimWorld/Unity access is serialized on
 the main thread through a bounded, deadline-aware queue. Expensive commands require an explicit
 override. A timed-out or disconnected queued request is cancelled before execution.
