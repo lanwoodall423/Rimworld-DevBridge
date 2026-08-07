@@ -81,6 +81,20 @@
       "neverAuthorizesMutation": true,
       "neverControlsAttachedProcess": true,
       "neverGrantsWriteLease": true
+    },
+    "goalOperations": {
+      "commands": ["ensure", "status", "wait", "cancel", "checkpoint", "resume"],
+      "desiredStates": ["bridge", "map", "test_ready"],
+      "states": ["queued", "running", "succeeded", "failed", "cancelled", "checkpointed"],
+      "phases": ["QUEUED", "ACTIVATING", "WAITING_FOR_BRIDGE", "WAITING_FOR_GAME", "WAITING_FOR_MAP", "READY", "MAP_READY", "TEST_READY", "FAILED", "CANCELLED", "READY_AWAITING_HUMAN"],
+      "requiredIdentity": ["pid", "sessionId", "lifecycleGeneration", "coreFingerprint"],
+      "durableUserRootPersistence": true,
+      "coalescedByGoalId": true,
+      "boundedProgressWatchdog": true,
+      "safeCancellationReleasesResources": true,
+      "neverAuthorizesMutation": true,
+      "neverControlsAttachedProcess": true,
+      "neverGrantsWriteLease": true
     }
   },
   "mcpAdapter": {
@@ -100,6 +114,12 @@
       "run_read_only_query",
       "validate_owner_adapter",
       "request_managed_restart",
+      "ensure_runtime_goal",
+      "get_runtime_goal_status",
+      "wait_for_goal",
+      "cancel_runtime_goal",
+      "checkpoint_runtime_goal",
+      "resume_runtime_goal",
       "wait_for_runtime",
       "list_human_reviews",
       "create_human_review",

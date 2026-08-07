@@ -1,4 +1,4 @@
-# Optional Codex MCP Adapter
+# Optional OpenCode MCP Adapter
 
 `RimWorldDevBridge.McpServer` is an optional external local adapter. It is a .NET 8
 STDIO MCP server and never loads RimWorld, Unity, Harmony, or owner-mod assemblies.
@@ -89,6 +89,12 @@ tool_timeout_sec = 300
 default_tools_approval_mode = "prompt"
 enabled_tools = [
   "ensure_bridge_ready",
+  "ensure_runtime_goal",
+  "get_runtime_goal_status",
+  "wait_for_goal",
+  "cancel_runtime_goal",
+  "checkpoint_runtime_goal",
+  "resume_runtime_goal",
   "get_bridge_status",
   "get_fresh_context",
   "list_bridge_capabilities",
@@ -119,6 +125,24 @@ approval_mode = "prompt"
 
 [mcp_servers.rimworld_devbridge.tools.request_managed_restart]
 approval_mode = "prompt"
+
+[mcp_servers.rimworld_devbridge.tools.ensure_runtime_goal]
+approval_mode = "prompt"
+
+[mcp_servers.rimworld_devbridge.tools.get_runtime_goal_status]
+approval_mode = "auto"
+
+[mcp_servers.rimworld_devbridge.tools.wait_for_goal]
+approval_mode = "auto"
+
+[mcp_servers.rimworld_devbridge.tools.cancel_runtime_goal]
+approval_mode = "prompt"
+
+[mcp_servers.rimworld_devbridge.tools.checkpoint_runtime_goal]
+approval_mode = "prompt"
+
+[mcp_servers.rimworld_devbridge.tools.resume_runtime_goal]
+approval_mode = "prompt"
 ```
 
 The `auto` entries are bounded status/context reads only. Keep activation and restart
@@ -138,7 +162,7 @@ approval_mode = "auto"
 ```
 
 The server still requires the profile/hash/user-root authorization and coordinator
-ownership beneath this Codex setting. It never claims an attached process, enables
+ownership beneath this host setting. It never claims an attached process, enables
 gameplay mutation, confirms an in-game warning, or acquires a write lease. Keep
 `request_managed_restart`, owner validation, human-review resolution, and every
 destructive external operation at `prompt`; `get_bridge_status`, context reads, and
@@ -155,6 +179,12 @@ The server exposes focused tools rather than every CLI flag:
 | Tool | Operation | Safety |
 | --- | --- | --- |
 | `ensure_bridge_ready` | Authorized wake/ensure/retry/context refresh | External lifecycle; approval required |
+| `ensure_runtime_goal` | Durable bridge/map/test-ready postcondition | External lifecycle; approval required |
+| `get_runtime_goal_status` | Durable goal progress and identity | Read-only goal inspection |
+| `wait_for_goal` | Wait for a durable goal | Bounded observation |
+| `cancel_runtime_goal` | Cancel and release a goal's client resources | State-changing; no process claim |
+| `checkpoint_runtime_goal` | Persist a resumable goal checkpoint | State-changing; no safety approval |
+| `resume_runtime_goal` | Resume outstanding goal work | External lifecycle; approval required |
 | `get_bridge_status` | Discover with safe activation | Activation-capable; approval metadata is truthful |
 | `get_fresh_context` | Fresh package context | Activation-capable |
 | `list_bridge_capabilities` | Descriptor/capability discovery | Read-only external inspection |
@@ -179,6 +209,12 @@ lifecycle-generation/build identity before accepting a coalesced cycle. A reques
 process or assembly cannot succeed by joining a stale `WAITING_FOR_GAME` cycle. Stale cycles are
 watchdogged and may be superseded only for an authorized coordinator-owned managed instance; waiting
 callers follow the replacement cycle and receive fresh context before success.
+
+Durable goal tools use a stable goal ID and desired postcondition `bridge`, `map`, or `test_ready`.
+They persist progress and identity checkpoints through the canonical client, coalesce concurrent
+callers, bound no-progress waits, and expose `goal_ready`, `goal_timeout`, `runtime_progress_timeout`,
+`goal_cancelled`, and `goal_checkpointed` states. Resume runs only outstanding work. Goal tools never
+grant mutation authority, confirm an in-game warning, acquire a write lease, or claim an attached process.
 
 ## Verification
 

@@ -215,6 +215,14 @@ attached state with `USER_RESTART_REQUIRED`, and stops only a coordinator-owned 
 
 `%USERPROFILE%\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\RimWorldDevBridge\LauncherLogs`
 
+For a durable autonomous objective, use `goal ensure`, `goal status`, `goal wait`, `goal cancel`,
+`goal checkpoint`, and `goal resume` with a stable `--goal-id` and desired state `bridge`, `map`, or
+`test_ready`. Goal state is atomically persisted under the user root. Callers coalesce on the goal,
+follow replacement restart cycles, and receive fresh PID/session/lifecycle/build/context evidence.
+Progress watchdogs and bounded retries produce terminal structured failures; checkpoint/cancel releases
+client resources and resume does not repeat completed work. Goal operations never grant mutation,
+confirmation, a write lease, or control of an attached process.
+
 Run offline checks with:
 
 ```powershell

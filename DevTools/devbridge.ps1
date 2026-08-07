@@ -576,6 +576,7 @@ function Invoke-Help {
             "lease acquire|inspect|renew|release", "mutate --command <name>", "cancel --request-id <id>",
             "context --package-id <id>", "describe --package-id <id>", "repo context", "adapter publish|reload",
             "restart authorize-sandbox|revoke-sandbox|request|status|wait|register|launch|ensure",
+            "goal ensure|status|wait|cancel|checkpoint|resume",
             "review request|list|get|resolve|cancel|wait|checkpoint|resume",
             "validate --layout auto|source|package", "help"
         )
@@ -604,6 +605,14 @@ function Invoke-Help {
             backoff = "--launch-backoff-ms <0..10000> (default 500)"
             deadCoordinatorOwnedProcess = "automatically validate identity, clear stale ownership, and retry; never return USER_RESTART_REQUIRED for a dead coordinator-owned PID"
             states = @("managed_process_exited_before_ready", "stale_managed_ownership_recovered", "managed_launch_retrying", "managed_launch_failed", "bridge_handshake_timeout", "bridge_load_failed", "launch_profile_invalid", "attached_live_process_requires_operator", "bridge_ready")
+        }
+        goalOperations = [ordered]@{
+            states = @("queued", "running", "succeeded", "failed", "cancelled", "checkpointed")
+            phases = @("QUEUED", "ACTIVATING", "WAITING_FOR_BRIDGE", "WAITING_FOR_GAME", "WAITING_FOR_MAP", "READY", "MAP_READY", "TEST_READY", "FAILED", "CANCELLED", "READY_AWAITING_HUMAN")
+            desiredStates = @("bridge", "map", "test_ready")
+            commands = @("ensure", "status", "wait", "cancel", "checkpoint", "resume")
+            fields = @("goalId", "operationId", "operationState", "phase", "desiredState", "progressSequence", "pid", "sessionId", "lifecycleGeneration", "coreFingerprint", "contextFresh", "recoverable", "requiredAction", "waitFor", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction", "resourcesReleased")
+            safety = "Goal orchestration uses only authorized coordinator-owned managed-test instances; it never grants mutation authority or a write lease and never claims an attached process."
         }
     }
 }
@@ -1201,20 +1210,30 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
         "--agent-id", "--package-id", "--layout", "--coordinator-path", "--launch-profile-path",
         "--profile-user-root", "--game-path", "--working-directory", "--arguments", "--game-arguments",
         "--mod-configuration", "--sandbox-authorization-path", "--reason",
-        "--max-launch-attempts", "--launch-backoff-ms", "--required-core-fingerprint"
+        "--max-launch-attempts", "--launch-backoff-ms", "--required-core-fingerprint",
+        "--readiness", "--target-postcondition", "--requires-new-process", "--allow-supersede",
+        "--requested-pid", "--requested-session-id", "--requested-lifecycle-generation"
     )
     for ($index = 0; $index -lt $values.Count; $index++) {
         $value = [string]$values[$index]
         $name = if ($value.Contains("=")) { $value.Substring(0, $value.IndexOf("=")) } else { $value }
         if ($allowed -notcontains $name) { continue }
         $result += $value
+        $nextValue = if ($index + 1 -lt $values.Count) { [string]$values[$index + 1] } else { "" }
         if (-not $value.Contains("=") -and $index + 1 -lt $values.Count -and
-            -not [string]$values[$index + 1].StartsWith("--")) {
+            -not $nextValue.StartsWith("--", [StringComparison]::Ordinal)) {
             $index++
             $result += $values[$index]
         }
     }
-    $result += @("--readiness", "bridge", "--save-policy", "none", "--keep-running", "--timeout-ms", [string]$timeoutMs)
+    $requestedReadiness = Get-Value $values "--readiness" "bridge"
+    if ($requestedReadiness -notin @("bridge", "game", "map")) { $requestedReadiness = "bridge" }
+    $result += @("--readiness", $requestedReadiness, "--save-policy", "none", "--keep-running", "--timeout-ms", [string]$timeoutMs)
+    $targetPostcondition = Get-Value $values "--target-postcondition" $requestedReadiness
+    if (-not ($result -contains "--target-postcondition") -and
+        -not ($result | Where-Object { [string]$_ -like "--target-postcondition=*" })) {
+        $result += @("--target-postcondition", $targetPostcondition)
+    }
     if (-not ($result -contains "--max-launch-attempts") -and
         -not ($result | Where-Object { [string]$_ -like "--max-launch-attempts=*" })) {
         $result += @("--max-launch-attempts", (Get-Value $values "--max-launch-attempts" "2"))
@@ -1474,8 +1493,13 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     )
     Clear-LeaseState $userRoot
     $preStatus = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
-    $requiresNewProcess = [bool]($ownership -and $ownership.running -and $ownership.owned)
-    $targetPostcondition = $readiness
+    $requiresNewProcess = (Has-Flag $values "--requires-new-process") -or
+        [bool]($ownership -and $ownership.running -and $ownership.owned)
+    $targetPostcondition = Get-Value $values "--target-postcondition" $readiness
+    if ($targetPostcondition -notin @("bridge", "game", "map", "test_ready")) {
+        $script:ExitCode = 3
+        return New-ErrorResult "target_postcondition_invalid" "Use bridge, game, map, or test_ready."
+    }
     $explicitCoreFingerprint = Get-Value $values "--required-core-fingerprint"
     if (-not [string]::IsNullOrWhiteSpace($explicitCoreFingerprint) -and
         $explicitCoreFingerprint -notmatch '^[A-Fa-f0-9]{64}$') {
@@ -1711,6 +1735,321 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
     finally {
         if ($lock) { $lock.Dispose() }
     }
+}
+
+function Get-GoalRoot([string] $userRoot) {
+    $root = Join-Path $userRoot "RimWorld-DevBridge-Goals"
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    return $root
+}
+
+function Test-GoalId([string] $value) {
+    return -not [string]::IsNullOrWhiteSpace($value) -and $value.Length -le 128 -and
+        $value -match '^[A-Za-z0-9._:-]+$'
+}
+
+function Get-GoalOperationPath([string] $userRoot, [string] $goalId) {
+    return Join-Path (Get-GoalRoot $userRoot) ("goal-" + $goalId + ".json")
+}
+
+function Get-GoalLockPath([string] $userRoot, [string] $goalId) {
+    return Join-Path (Get-GoalRoot $userRoot) ("goal-" + $goalId + ".lock")
+}
+
+function Get-GoalDriverLockPath([string] $userRoot, [string] $goalId) {
+    return Join-Path (Get-GoalRoot $userRoot) ("goal-" + $goalId + ".driver.lock")
+}
+
+function Try-OpenGoalLock([string] $path) {
+    try { return [IO.FileStream]::new($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch [IO.IOException] { return $null }
+    catch [UnauthorizedAccessException] { return $null }
+}
+
+function Set-GoalProperty($state, [string] $name, $value) {
+    if ($state.PSObject.Properties[$name]) { $state.$name = $value }
+    else { $state | Add-Member -NotePropertyName $name -NotePropertyValue $value }
+}
+
+function Read-GoalOperation([string] $userRoot, [string] $goalId) {
+    try { return Read-JsonFile (Get-GoalOperationPath $userRoot $goalId) }
+    catch { return $null }
+}
+
+function Write-GoalOperation([string] $userRoot, $state) {
+    Set-GoalProperty $state "updatedUtc" ([DateTime]::UtcNow.ToString("o"))
+    Write-JsonAtomic (Get-GoalOperationPath $userRoot ([string]$state.goalId)) $state
+    return $state
+}
+
+function New-GoalOperation([string] $goalId, [string] $desiredState, [string] $packageId,
+    [int] $timeoutMs, [int] $noProgressTimeoutMs, [bool] $keepRunning) {
+    $now = [DateTime]::UtcNow
+    return [ordered]@{
+        schema = 1
+        operationKind = "runtime_goal"
+        goalId = $goalId
+        operationId = "goal-" + [Guid]::NewGuid().ToString("N")
+        packageId = $packageId
+        desiredState = $desiredState
+        operationState = "queued"
+        phase = "QUEUED"
+        code = "goal_queued"
+        startedUtc = $now.ToString("o")
+        updatedUtc = $now.ToString("o")
+        overallDeadlineUtc = $now.AddMilliseconds($timeoutMs).ToString("o")
+        noProgressTimeoutMs = $noProgressTimeoutMs
+        lastProgressUtc = $now.ToString("o")
+        progressSequence = 0
+        keepRunning = $keepRunning
+        recoverable = $true
+        waitFor = if ($desiredState -eq "bridge") { "bridge" } elseif ($desiredState -eq "map") { "map" } else { "game" }
+        requiredAction = "activate authorized managed-test instance"
+        retrySafe = $true
+        operatorActionRequired = $false
+        nextAction = "goal wait --goal-id $goalId"
+        resourcesReleased = $false
+        contextFresh = $false
+        cancellationRequested = $false
+        evidence = @()
+    }
+}
+
+function Get-GoalResponse($state, [string] $correlationId = $null) {
+    if ($null -eq $state) { return New-ErrorResult "goal_not_found" "The durable goal operation was not found." }
+    $result = [ordered]@{}
+    foreach ($property in @("ok", "code", "message", "correlationId", "goalId", "operationId", "operationState", "phase", "desiredState", "packageId", "startedUtc", "updatedUtc", "progressSequence", "pid", "sessionId", "lifecycleGeneration", "coreFingerprint", "cycleId", "ticket", "contextFresh", "recoverable", "requiredAction", "waitFor", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction", "resourcesReleased", "evidence", "details")) {
+        if ($state -is [System.Collections.IDictionary] -and $state.Contains($property)) { $result[$property] = $state[$property] }
+        elseif ($state.PSObject.Properties[$property]) { $result[$property] = $state.$property }
+    }
+    if (-not $result.Contains("ok")) { $result.ok = $state.operationState -eq "succeeded" }
+    if (-not $result.Contains("code")) { $result.code = if ($state.operationState -eq "succeeded") { "goal_ready" } else { "goal_in_progress" } }
+    if (-not $result.Contains("correlationId")) { $result.correlationId = $correlationId }
+    if ([string]$state.operationState -eq "succeeded") {
+        $result.ok = $true
+        $result.code = if ([string]$state.desiredState -eq "map") { "map_ready" } elseif ([string]$state.desiredState -eq "test_ready") { "test_ready" } else { "bridge_ready" }
+        $result.phase = if ([string]$state.desiredState -eq "map") { "MAP_READY" } elseif ([string]$state.desiredState -eq "test_ready") { "TEST_READY" } else { "READY" }
+        $result.recoverable = $false
+        $result.requiredAction = "none"
+        $result.waitFor = "none"
+        $result.retrySafe = $true
+        $result.operatorActionRequired = $false
+        $result.nextAction = "none"
+    }
+    return $result
+}
+
+function Get-GoalResultField($result, [string] $name) {
+    if ($null -eq $result) { return $null }
+    if ($result.PSObject.Properties[$name]) { return $result.$name }
+    foreach ($field in @($result.data)) {
+        if ($field.PSObject.Properties["name"] -and [string]$field.name -eq $name) { return [string]$field.value }
+    }
+    return $null
+}
+
+function Wait-GoalOperation([string] $userRoot, [string] $goalId, [int] $timeoutMs, [string] $correlationId) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $state = Read-GoalOperation $userRoot $goalId
+        if ($state -and [string]$state.operationState -in @("succeeded", "failed", "cancelled", "checkpointed")) {
+            return Get-GoalResponse $state $correlationId
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    $state = Read-GoalOperation $userRoot $goalId
+    $result = Get-GoalResponse $state $correlationId
+    $result.ok = $false
+    $result.code = "goal_wait_timeout"
+    $result.operationState = "running"
+    $result.recoverable = $true
+    $result.retrySafe = $true
+    $result.nextAction = "goal wait --goal-id $goalId"
+    return $result
+}
+
+function Invoke-GoalDriver([string[]] $values, [string] $bridgeRoot, [string] $userRoot,
+    $state, $agent, $config) {
+    $goalId = [string]$state.goalId
+    $desired = [string]$state.desiredState
+    $timeoutMs = 120000
+    [int]::TryParse((Get-Value $values "--timeout-ms" "120000"), [ref]$timeoutMs) | Out-Null
+    $noProgressMs = 120000
+    [int]::TryParse((Get-Value $values "--no-progress-timeout-ms" "120000"), [ref]$noProgressMs) | Out-Null
+    $goalReadiness = if ($desired -eq "bridge") { "bridge" } else { "map" }
+    $goalValues = @($values + @("--bridge-root", $bridgeRoot, "--user-root", $userRoot,
+        "--agent-id", $agent.value, "--package-id", [string]$state.packageId,
+        "--readiness", $goalReadiness, "--target-postcondition", $desired,
+        "--allow-supersede", "--requires-new-process"))
+    Set-GoalProperty $state "operationState" "running"
+    Set-GoalProperty $state "phase" "ACTIVATING"
+    Set-GoalProperty $state "code" "goal_activation_in_progress"
+    Write-GoalOperation $userRoot $state | Out-Null
+    try {
+        $activation = Invoke-ActivationRecovery $goalValues "goal_not_ready"
+        if (-not $activation.ready) {
+            $script:ExitCode = if ([string]$activation.reason -in @("sandbox_authorization_missing", "managed_profile_missing", "launch_profile_invalid")) { 3 } else { 4 }
+            Set-GoalProperty $state "operationState" "failed"
+            Set-GoalProperty $state "phase" ([string]$activation.phase)
+            Set-GoalProperty $state "code" ([string]$activation.reason)
+            Set-GoalProperty $state "details" $activation.details
+            Set-GoalProperty $state "nextAction" "goal resume --goal-id $goalId"
+            Write-GoalOperation $userRoot $state | Out-Null
+            return Get-GoalResponse $state
+        }
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+        $lastProgress = [DateTime]::UtcNow
+        $lastSignature = ""
+        do {
+            $status = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
+            if (-not $status.available) {
+                Set-GoalProperty $state "phase" "WAITING_FOR_BRIDGE"
+                Set-GoalProperty $state "code" ([string]$status.reason)
+                Set-GoalProperty $state "waitFor" "bridge"
+                Write-GoalOperation $userRoot $state | Out-Null
+            }
+            else {
+                Set-GoalProperty $state "pid" ([int]$status.processId)
+                Set-GoalProperty $state "sessionId" ([string]$status.session)
+                Set-GoalProperty $state "lifecycleGeneration" ([long]$status.lifecycleGeneration)
+                Set-GoalProperty $state "coreFingerprint" ([string]$status.coreFingerprint)
+                Set-GoalProperty $state "contextFresh" $false
+                if ($desired -eq "bridge") {
+                    Set-GoalProperty $state "operationState" "succeeded"
+                    Set-GoalProperty $state "phase" "READY"
+                    Set-GoalProperty $state "code" "bridge_ready"
+                    Set-GoalProperty $state "waitFor" "none"
+                    Set-GoalProperty $state "nextAction" "none"
+                    Set-GoalProperty $state "contextFresh" $true
+                    Set-GoalProperty $state "evidence" @([ordered]@{ phase = "READY"; processId = $status.processId; session = $status.session; lifecycleGeneration = $status.lifecycleGeneration; coreFingerprint = $status.coreFingerprint })
+                    Write-GoalOperation $userRoot $state | Out-Null
+                    return Get-GoalResponse $state
+                }
+                $context = Invoke-BridgeCommand "AGENT_CONTEXT" ("packageId=" + [string]$state.packageId) $goalValues
+                $gameLoaded = [string](Get-GoalResultField $context "gameLoaded") -eq "true"
+                $mapReady = [string](Get-GoalResultField $context "mapReady") -eq "true"
+                $ready = $gameLoaded -and $mapReady
+                $signature = "{0}|{1}|{2}|{3}|{4}" -f $status.processId, $status.session, $status.lifecycleGeneration, $gameLoaded, $mapReady
+                if ($signature -ne $lastSignature) {
+                    $lastSignature = $signature
+                    $lastProgress = [DateTime]::UtcNow
+                    Set-GoalProperty $state "progressSequence" ([int]$state.progressSequence + 1)
+                    Set-GoalProperty $state "lastProgressUtc" $lastProgress.ToString("o")
+                }
+                if ($ready) {
+                    Set-GoalProperty $state "contextFresh" $true
+                    Set-GoalProperty $state "operationState" "succeeded"
+                    Set-GoalProperty $state "phase" $(if ($desired -eq "test_ready") { "TEST_READY" } else { "MAP_READY" })
+                    Set-GoalProperty $state "code" $(if ($desired -eq "test_ready") { "test_ready" } else { "map_ready" })
+                    Set-GoalProperty $state "waitFor" "none"
+                    Set-GoalProperty $state "nextAction" "none"
+                    Set-GoalProperty $state "evidence" @([ordered]@{ phase = $state.phase; processId = $status.processId; session = $status.session; lifecycleGeneration = $status.lifecycleGeneration; gameLoaded = $gameLoaded; mapReady = $mapReady; coreFingerprint = $status.coreFingerprint })
+                    Write-GoalOperation $userRoot $state | Out-Null
+                    return Get-GoalResponse $state
+                }
+                Set-GoalProperty $state "phase" $(if ($gameLoaded) { "WAITING_FOR_MAP" } else { "WAITING_FOR_GAME" })
+                Set-GoalProperty $state "code" "runtime_loading"
+                Set-GoalProperty $state "waitFor" $(if ($gameLoaded) { "map" } else { "game" })
+                Set-GoalProperty $state "contextFresh" $true
+                Write-GoalOperation $userRoot $state | Out-Null
+            }
+            if ([DateTime]::UtcNow - $lastProgress -gt [TimeSpan]::FromMilliseconds($noProgressMs)) {
+                Set-GoalProperty $state "operationState" "failed"
+                Set-GoalProperty $state "phase" "FAILED"
+                Set-GoalProperty $state "code" "runtime_progress_timeout"
+                Set-GoalProperty $state "details" "No lifecycle or readiness progress within the bounded watchdog window."
+                Set-GoalProperty $state "nextAction" "goal resume --goal-id $goalId"
+                Write-GoalOperation $userRoot $state | Out-Null
+                return Get-GoalResponse $state
+            }
+            Start-Sleep -Milliseconds 500
+        } while ([DateTime]::UtcNow -lt $deadline)
+        Set-GoalProperty $state "operationState" "failed"
+        $script:ExitCode = 4
+        Set-GoalProperty $state "phase" "FAILED"
+        Set-GoalProperty $state "code" "goal_timeout"
+        Set-GoalProperty $state "details" "The requested runtime postcondition was not reached before the bounded deadline."
+        Set-GoalProperty $state "nextAction" "goal resume --goal-id $goalId"
+        Write-GoalOperation $userRoot $state | Out-Null
+        return Get-GoalResponse $state
+    }
+    catch {
+        Set-GoalProperty $state "operationState" "failed"
+        $script:ExitCode = 4
+        Set-GoalProperty $state "phase" "FAILED"
+        Set-GoalProperty $state "code" "goal_failed"
+        Set-GoalProperty $state "details" (Redact-Text $_.Exception.Message)
+        Set-GoalProperty $state "nextAction" "goal resume --goal-id $goalId"
+        Write-GoalOperation $userRoot $state | Out-Null
+        return Get-GoalResponse $state
+    }
+}
+
+function Invoke-Goal([string[]] $values) {
+    $config = Get-ClientConfig
+    $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
+    $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
+    if ($null -eq $userRoot -or $null -eq $bridgeRoot) { $script:ExitCode = 3; return New-ErrorResult "configuration_error" "bridge and user roots are required" }
+    if ($values.Count -lt 1) { throw "goal_operation_required: use ensure, status, wait, cancel, checkpoint, or resume" }
+    $operation = $values[0].ToLowerInvariant()
+    $goalId = Get-Value $values "--goal-id"
+    if ([string]::IsNullOrWhiteSpace($goalId) -and $operation -ne "list") { throw "goal_id_required: use --goal-id" }
+    if (-not [string]::IsNullOrWhiteSpace($goalId) -and -not (Test-GoalId $goalId)) { throw "goal_id_invalid" }
+    if ($operation -eq "status" -or $operation -eq "get") {
+        $statusState = Read-GoalOperation $userRoot $goalId
+        if ($statusState -and [string]$statusState.operationState -eq "failed") { $script:ExitCode = 3 }
+        return Get-GoalResponse $statusState (Get-Value $values "--correlation-id")
+    }
+    if ($operation -eq "cancel" -or $operation -eq "checkpoint") {
+        $lock = Try-OpenGoalLock (Get-GoalLockPath $userRoot $goalId)
+        if (-not $lock) { $script:ExitCode = 4; return New-ErrorResult "goal_operation_busy" "The goal state is being updated; retry safely." }
+        try {
+            $state = Read-GoalOperation $userRoot $goalId
+            if ($null -eq $state) { $script:ExitCode = 3; return New-ErrorResult "goal_not_found" "The goal operation was not found." }
+            Clear-LeaseState $userRoot
+            Set-GoalProperty $state "resourcesReleased" $true
+            Set-GoalProperty $state "cancellationRequested" ($operation -eq "cancel")
+            Set-GoalProperty $state "operationState" $(if ($operation -eq "cancel") { "cancelled" } else { "checkpointed" })
+            Set-GoalProperty $state "phase" $(if ($operation -eq "cancel") { "CANCELLED" } else { "READY_AWAITING_HUMAN" })
+            Set-GoalProperty $state "code" $(if ($operation -eq "cancel") { "goal_cancelled" } else { "goal_checkpointed" })
+            Set-GoalProperty $state "nextAction" $(if ($operation -eq "cancel") { "none" } else { "goal resume --goal-id $goalId" })
+            Write-GoalOperation $userRoot $state | Out-Null
+            return Get-GoalResponse $state (Get-Value $values "--correlation-id")
+        }
+        finally { $lock.Dispose() }
+    }
+    if ($operation -eq "wait") { return Wait-GoalOperation $userRoot $goalId ([int](Get-Value $values "--timeout-ms" "120000")) (Get-Value $values "--correlation-id") }
+    if ($operation -notin @("ensure", "resume")) { throw "goal_operation_invalid: use ensure, status, wait, cancel, checkpoint, or resume" }
+    $desired = Get-Value $values "--desired-state" "test_ready"
+    if ($desired -notin @("bridge", "map", "test_ready")) { throw "desired_state_invalid: use bridge, map, or test_ready" }
+    $packageId = Get-Value $values "--package-id" "Lan.RimWorldDevBridge"
+    $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
+    $lock = Try-OpenGoalLock (Get-GoalLockPath $userRoot $goalId)
+    if (-not $lock) { return Wait-GoalOperation $userRoot $goalId ([int](Get-Value $values "--timeout-ms" "120000")) (Get-Value $values "--correlation-id") }
+    try {
+        $state = Read-GoalOperation $userRoot $goalId
+        if ($null -eq $state -or $operation -eq "resume") {
+            if ($null -eq $state) { $state = New-GoalOperation $goalId $desired $packageId 120000 120000 $true }
+            else {
+                Set-GoalProperty $state "operationState" "queued"
+                Set-GoalProperty $state "phase" "QUEUED"
+                Set-GoalProperty $state "code" "goal_queued"
+                Set-GoalProperty $state "desiredState" $desired
+                Set-GoalProperty $state "resourcesReleased" $false
+            }
+            Write-GoalOperation $userRoot $state | Out-Null
+        }
+    }
+    finally { $lock.Dispose() }
+    if ($operation -eq "ensure" -and [string]$state.operationState -in @("succeeded", "failed", "cancelled", "checkpointed")) {
+        return Get-GoalResponse $state (Get-Value $values "--correlation-id")
+    }
+    $driverLock = Try-OpenGoalLock (Get-GoalDriverLockPath $userRoot $goalId)
+    if ($driverLock) {
+        try { return Invoke-GoalDriver $values $bridgeRoot $userRoot $state $agent $config }
+        finally { $driverLock.Dispose() }
+    }
+    return Wait-GoalOperation $userRoot $goalId ([int](Get-Value $values "--timeout-ms" "120000")) (Get-Value $values "--correlation-id")
 }
 
 function Invoke-Wake([string[]] $values) {
@@ -2023,6 +2362,7 @@ try {
             $agent = Get-AgentId $userRoot (Get-Value $args "--agent-id")
             $result = Invoke-Review $args $agent $userRoot
         }
+        "goal" { $result = Invoke-Goal $args }
         "adapter" {
             if ($args.Count -lt 1) { throw "adapter_operation_required: use publish or reload" }
             if ($args[0] -eq "reload") { $result = Invoke-BridgeCommand "RELOAD_ADAPTERS" "" $args $true $null $null $false; break }

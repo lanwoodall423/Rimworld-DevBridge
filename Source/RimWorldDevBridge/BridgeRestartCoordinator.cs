@@ -654,6 +654,7 @@ namespace RimWorldDevBridge
 
         private static int ReadinessRank(string value)
         {
+            if (string.Equals(value, "test_ready", StringComparison.OrdinalIgnoreCase)) return 4;
             if (string.Equals(value, "map", StringComparison.OrdinalIgnoreCase)) return 3;
             if (string.Equals(value, "game", StringComparison.OrdinalIgnoreCase)) return 2;
             return 1;
@@ -715,6 +716,7 @@ namespace RimWorldDevBridge
 
         private static string ReadinessValue(string value)
         {
+            if (string.Equals(value, "test_ready", StringComparison.OrdinalIgnoreCase)) return "test_ready";
             if (string.Equals(value, "bridge", StringComparison.OrdinalIgnoreCase)) return "bridge";
             if (string.Equals(value, "game", StringComparison.OrdinalIgnoreCase)) return "game";
             if (string.Equals(value, "map", StringComparison.OrdinalIgnoreCase)) return "map";
