@@ -103,9 +103,10 @@ $ensureRoot = Join-Path ([IO.Path]::GetTempPath()) ('DevBridgeEnsure-' + [Guid]:
 [IO.Directory]::CreateDirectory($ensureRoot) | Out-Null
 $ensureProcessId = 0
 try {
-    $fakePowerShell = (Get-Process -Id $PID).Path
-    $profileArguments = @('--game-path', $fakePowerShell, '--working-directory', (Split-Path -Parent $fakePowerShell),
-        '--arguments', '-NoProfile -Command "Start-Sleep -Seconds 30"', '--mod-configuration', 'managed-test')
+    $fakeGamePath = Join-Path $ensureRoot 'RimWorldWin64.exe'
+    Copy-Item -LiteralPath $env:ComSpec -Destination $fakeGamePath -Force
+    $profileArguments = @('--game-path', $fakeGamePath, '--working-directory', (Split-Path -Parent $env:ComSpec),
+        '--arguments', '/c ping -n 30 127.0.0.1 >nul', '--mod-configuration', 'managed-test')
     $ensureBase = @('--bridge-root', $BridgeRoot, '--user-root', $ensureRoot) + $profileArguments
     $missingAuthorization = Invoke-Client (@('restart', 'ensure') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--timeout-ms', '250', '--json')) 3
     if ($missingAuthorization.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED' -or $missingAuthorization.operatorActionRequired -ne $true) {
@@ -152,6 +153,15 @@ try {
         if ([string]::IsNullOrWhiteSpace([string]$profile.$property)) { throw "managed profile field missing: $property" }
     }
     if ($ensure.details -and $ensure.details.ownership) { $ensureProcessId = [int]$ensure.details.ownership.ProcessId }
+    $ownedRetry = Invoke-Client (@('restart', 'ensure') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--keep-running', '--timeout-ms', '250', '--json')) 4
+    if ($ownedRetry.ownership -eq 'attached' -or
+        $ownedRetry.reason -eq 'attached_live_process_requires_operator' -or
+        $ownedRetry.status -eq 'USER_RESTART_REQUIRED') {
+        throw "coordinator-owned RimWorld process was misclassified as attached actual=$($ownedRetry | ConvertTo-Json -Compress)"
+    }
+    if ($ownedRetry.details -and $ownedRetry.details.ownership -and [int]$ownedRetry.details.ownership.ProcessId -gt 0) {
+        $ensureProcessId = [int]$ownedRetry.details.ownership.ProcessId
+    }
 }
 finally {
     if ($ensureProcessId -gt 0) { Stop-Process -Id $ensureProcessId -Force -ErrorAction SilentlyContinue }

@@ -1455,7 +1455,12 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     }
     $heartbeat = Invoke-Coordinator "heartbeat" $values
     $ownership = $heartbeat.ownership
-    $attached = Get-AttachedGameProcesses $profile.executable
+    $ownedProcessId = 0
+    if ($ownership -and $ownership.running -and $ownership.owned) {
+        $ownedProcessId = [int]$ownership.ProcessId
+    }
+    $attached = @(Get-AttachedGameProcesses $profile.executable |
+        Where-Object { $_.Id -ne $ownedProcessId })
     if (($ownership -and $ownership.running -and -not $ownership.owned) -or $attached.Count -gt 0) {
         $script:ExitCode = 4
         return New-RestartEnsureResult "USER_RESTART_REQUIRED" $false $false "attached" "USER_RESTART_REQUIRED" "A human or external orchestrator must manage the attached RimWorld process." "rerun restart ensure after the attached process is stopped by its owner" $heartbeat "attached_live_process_requires_operator"
@@ -1748,12 +1753,31 @@ function Invoke-CoordinatorWaitWithProgress([string[]] $values, [bool] $EnsureRu
         if ([string]$last.phase -in @("READY", "FAILED", "USER_RESTART_REQUIRED")) { return $last }
         Start-Sleep -Milliseconds $ProgressIntervalMs
     }
+    $finalValues = @()
+    $skipTimeoutValue = $false
+    for ($index = 0; $index -lt $values.Count; $index++) {
+        if ($skipTimeoutValue) { $skipTimeoutValue = $false; continue }
+        $value = [string]$values[$index]
+        if ($value -eq "--timeout-ms") {
+            $finalValues += @("--timeout-ms", "1000")
+            $skipTimeoutValue = $true
+        } elseif ($value.StartsWith("--timeout-ms=", [StringComparison]::OrdinalIgnoreCase)) {
+            $finalValues += "--timeout-ms=1000"
+        } else {
+            $finalValues += $values[$index]
+        }
+    }
+    $previousExit = $script:ExitCode
+    $final = Invoke-Coordinator "status" $finalValues $EnsureRuntimeTools
+    $script:ExitCode = $previousExit
+    if ($ProgressCallback) { & $ProgressCallback ([string]$final.phase) $final }
+    if ([string]$final.phase -in @("READY", "FAILED", "USER_RESTART_REQUIRED")) { return $final }
     return [ordered]@{
         ok = $false
         error = "coordinator_wait_timeout"
-        phase = if ($last) { $last.phase } else { "WAITING_FOR_BRIDGE" }
-        ticket = if ($last) { $last.ticket } else { Get-Value $values "--ticket" }
-        details = $last
+        phase = if ($final) { $final.phase } elseif ($last) { $last.phase } else { "WAITING_FOR_BRIDGE" }
+        ticket = if ($final) { $final.ticket } elseif ($last) { $last.ticket } else { Get-Value $values "--ticket" }
+        details = if ($final) { $final } else { $last }
     }
 }
 

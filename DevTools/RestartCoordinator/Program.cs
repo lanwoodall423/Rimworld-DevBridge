@@ -496,26 +496,38 @@ namespace RimWorldDevBridge.RestartCoordinator
                     Persist("draining cycle=" + cycle.CycleId);
                     break;
                 case BridgeRestartPhase.DRAINING:
+                    Dictionary<string, string> beforeDrain = ReadStatus();
                     if (string.IsNullOrEmpty(cycle.OldPid) && string.IsNullOrEmpty(cycle.OldBootId))
                     {
-                        Dictionary<string, string> beforeDrain = ReadStatus();
                         machine.SetCycleIdentity(cycle.CycleId, Get(beforeDrain, "processId"),
                             Get(beforeDrain, "bootId"));
                         cycle = machine.Cycle(cycle.CycleId);
-
-                        string observedPid = Get(beforeDrain, "processId");
-                        bool observedProcessRunning = IsProcessRunning(observedPid);
-                        bool ownedObservedProcess = launchRecord != null && launchRecord.Owned &&
-                            observedPid == launchRecord.ProcessId.ToString() && observedProcessRunning;
-                        bool bridgeActive = string.Equals(Get(beforeDrain, "bridge"), "ON",
-                            StringComparison.OrdinalIgnoreCase);
-                        if (!observedProcessRunning || (ownedObservedProcess && !bridgeActive))
+                    }
+                    string observedPid = Get(beforeDrain, "processId");
+                    bool observedProcessRunning = IsProcessRunning(observedPid);
+                    bool ownedObservedProcess = launchRecord != null && launchRecord.Owned &&
+                        observedPid == launchRecord.ProcessId.ToString() && observedProcessRunning;
+                    bool bridgeActive = string.Equals(Get(beforeDrain, "bridge"), "ON",
+                        StringComparison.OrdinalIgnoreCase);
+                    if (!observedProcessRunning || (ownedObservedProcess && !bridgeActive))
+                    {
+                        machine.SetPhase(cycle.CycleId, BridgeRestartPhase.DRAINED,
+                            "no_active_bridge_to_drain");
+                        Persist("drained without active bridge");
+                        break;
+                    }
+                    if (cycle.BarrierId <= 0)
+                    {
+                        if (TryBridge("RESTART_DRAIN", cycle, out string beginDrainResponse))
                         {
-                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.DRAINED,
-                                "no_active_bridge_to_drain");
-                            Persist("drained without active bridge");
-                            break;
+                            long barrierId = ParseLong(ResponseValue(beginDrainResponse, "barrierId"));
+                            if (barrierId > 0)
+                            {
+                                machine.SetBarrierId(cycle.CycleId, barrierId, beginDrainResponse);
+                                Persist("restart drain barrier=" + barrierId);
+                            }
                         }
+                        break;
                     }
                     if (TryBridge("RESTART_DRAIN_STATUS", cycle, out string drainResponse) &&
                         drainResponse.IndexOf("drained=true", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -1154,6 +1166,23 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             string value;
             return values.TryGetValue(key, out value) ? value : string.Empty;
+        }
+
+        private static string ResponseValue(string response, string key)
+        {
+            foreach (string line in (response ?? string.Empty).Split(new[] { '\r', '\n' },
+                StringSplitOptions.RemoveEmptyEntries))
+            {
+                string prefix = key + "=";
+                if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    return line.Substring(prefix.Length);
+            }
+            return string.Empty;
+        }
+
+        private static long ParseLong(string value)
+        {
+            return long.TryParse(value, out long parsed) ? parsed : 0L;
         }
     }
 }
