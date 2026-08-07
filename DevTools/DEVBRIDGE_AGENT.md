@@ -51,4 +51,12 @@ Use the durable human-work queue for dependencies that genuinely require a perso
 continue independent work, and wait at most 60 seconds only after autonomous work is exhausted.
 Timeout persists a checkpoint and transitions to `READY_AWAITING_HUMAN` while releasing resources.
 Resume uses the stored exact operation and does not repeat completed work. Review and approval never
-grant mutation, attached-process control, or a write lease.
+ grant mutation, attached-process control, or a write lease.
+
+The optional `DevTools/McpServer` is an external .NET 8 STDIO adapter for local Codex.
+It invokes the canonical client, keeps MCP messages on stdout, sends sanitized diagnostics
+to stderr, and exposes no gameplay mutation. Use `DevTools/MCP_SERVER.md` for reproducible
+publish and current Codex configuration. MCP approval metadata is truthful: status/context
+reads may be configured for zero-touch use, while activation, restart, owner validation,
+human review resolution, and any external lifecycle action retain their required approval
+or safety boundaries.

@@ -10,6 +10,7 @@
 # Generated mod, coordinator, harness, and package outputs
 1.6/Assemblies/
 Release/
+McpServerArtifact/
 Source/Build/
 DevTools/StagedCore/
 DevTools/FeatureTests/Pending/

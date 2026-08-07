@@ -147,6 +147,18 @@ release package. Source validation reports coordinator `available`, `buildable`,
 `missing_build_tooling` states; `--ensure-runtime-tools` may build the coordinator into the documented
 source output path. It never treats a missing source-build output as a valid package.
 
+## Optional Codex MCP Adapter
+
+`DevTools/McpServer` is an optional external .NET 8 STDIO adapter for local Codex. It
+invokes `DevTools/devbridge.ps1` and never connects to RimWorld internals or embeds MCP
+in the game. The reproducible Windows publish and current Codex configuration examples
+are in `DevTools/MCP_SERVER.md`. MCP stdout is protocol-only; sanitized diagnostics use
+stderr. The adapter exposes goal-level status, context, pure-read, authorized managed
+restart, owner validation, and durable review tools. It exposes no gameplay mutation.
+Activation and restart annotations remain truthful and approval is not disabled for
+external lifecycle control. Review resolution never grants mutation, confirmation,
+attached-process control, or a write lease.
+
 For unattended managed verification, persist and validate a `managed-test` launch profile, then use:
 
 ```powershell
