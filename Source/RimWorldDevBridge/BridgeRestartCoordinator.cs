@@ -210,6 +210,20 @@ namespace RimWorldDevBridge
             }
         }
 
+        public BridgeRestartCoordinatorState SetBarrierId(string cycleId, long barrierId, string diagnostics = null)
+        {
+            lock (gate)
+            {
+                BridgeRestartCycleRecord cycle = FindCycle(cycleId);
+                if (cycle == null) throw new InvalidOperationException("unknown_restart_cycle");
+                if (barrierId > 0) cycle.BarrierId = barrierId;
+                cycle.Diagnostics = Bound(diagnostics, 512);
+                cycle.UpdatedUtc = DateTime.UtcNow;
+                Touch();
+                return Clone(state);
+            }
+        }
+
         public BridgeRestartTicketRecord Ticket(string ticketId)
         {
             lock (gate)
