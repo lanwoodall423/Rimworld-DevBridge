@@ -5,5 +5,55 @@
   "adapterSource": "Source/RimWorldDevBridge/BridgeAdapterCatalog.cs",
   "buildEntrypoint": "DevTools/Package-RimWorldDevBridge.ps1",
   "validateEntrypoint": "DevTools/Test-RimWorldDevBridgePackage.ps1",
-  "runtimeGuide": "DevTools/DEVBRIDGE_AGENT.md"
+  "runtimeGuide": "DevTools/DEVBRIDGE_AGENT.md",
+  "runtimeRecovery": {
+    "bridgeNotActive": "bridge_not_active is recoverable. Activate the authorized managed-test instance and wait for bridge readiness before abandoning runtime verification.",
+    "operation": "activate-and-wait",
+    "readiness": "bridge",
+    "canonicalAttachedReason": "attached_live_process_requires_operator",
+    "canonicalReadyReason": "bridge_ready",
+    "canonicalReadyPhase": "READY",
+    "legacyAliases": {
+      "attached_process_user_restart_required": "attached_live_process_requires_operator",
+      "attached_process_requires_operator": "attached_live_process_requires_operator",
+      "activation_ready": "bridge_ready",
+      "BRIDGE_READY": "READY"
+    },
+    "responseFields": {
+      "activationState": ["inactive", "activation_in_progress", "ready", "failed"],
+      "waitFor": ["none", "bridge", "game", "map"],
+      "recoverable": "boolean",
+      "requiredAction": "string",
+      "keepRunning": "boolean",
+      "retrySafe": "boolean",
+      "operatorActionRequired": "boolean",
+      "nextAction": "string"
+    },
+    "automaticActivationOperations": ["discover", "context", "describe", "read", "repo context", "lease inspect"],
+    "noAutomaticActivationOperations": ["call", "mutate", "cancel", "lease acquire", "lease renew", "lease release", "adapter reload"],
+    "savePolicy": "none",
+    "keepRunning": true,
+    "startupTimeoutArgument": "--startup-timeout-ms",
+    "progressIntervalArgument": "--progress-interval-ms",
+    "maxLaunchAttemptsArgument": "--max-launch-attempts",
+    "launchBackoffArgument": "--launch-backoff-ms",
+    "deadManagedProcessPolicy": "verify identity, clear stale ownership, and retry within bounded limits; never return USER_RESTART_REQUIRED for a dead coordinator-owned PID",
+    "failureReasons": [
+      "activation_in_progress",
+      "activation_timeout",
+      "managed_profile_missing",
+      "sandbox_authorization_missing",
+      "runtime_build_required",
+      "deployment_mismatch",
+      "managed_process_exited_before_ready",
+      "stale_managed_ownership_recovered",
+      "managed_launch_retrying",
+      "managed_launch_failed",
+      "bridge_handshake_timeout",
+      "bridge_load_failed",
+      "launch_profile_invalid",
+      "attached_live_process_requires_operator",
+      "bridge_ready"
+    ]
+  }
 }

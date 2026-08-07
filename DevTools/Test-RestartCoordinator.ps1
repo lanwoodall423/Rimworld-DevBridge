@@ -52,6 +52,74 @@ try {
     $status = Invoke-Coordinator 'status' @('--ticket', $first.Ticket)
     if (-not $status.OwnershipJson) { throw 'status did not preserve ownership projection' }
 
+    $failedRoot = Join-Path $root 'failed-game'
+    [IO.Directory]::CreateDirectory($failedRoot) | Out-Null
+    Start-CoordinatorServer $failedRoot $CoordinatorPath
+    $failedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('exit 7'))
+    $failedArguments = "-NoProfile -EncodedCommand $failedCommand"
+    $failedLaunch = & $CoordinatorPath launch '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--game-path' $game '--working-directory' $working '--arguments' $failedArguments '--user-data-root' $userRoot `
+        '--mod-configuration' 'managed-test' '--launch-profile' 'managed-test' '--owned' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "failed-game launch failed: $failedLaunch" }
+    $failedEnsure = & $CoordinatorPath ensure '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--agent-id' 'failed-game-agent' '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
+        '--timeout-ms' '3000' '--owned' 2>&1 | Out-String
+    $failedEnsureJson = $failedEnsure.Trim() | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace($failedEnsureJson.Ticket)) { throw "failed-game ensure returned no ticket: $failedEnsure" }
+    $failedWait = & $CoordinatorPath wait '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--ticket' $failedEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
+    $failedWaitJson = $failedWait.Trim() | ConvertFrom-Json
+    if ($failedWaitJson.Phase -ne 'FAILED' -or $failedWaitJson.Error -ne 'managed_launch_failed' -or
+        [string]$failedWaitJson.Json -notmatch 'managed_process_exited_before_ready') {
+        throw "failed-game exit was not classified safely: $failedWait"
+    }
+    $failedTicket = $failedWaitJson.Json | ConvertFrom-Json
+    if ([string]$failedTicket.Completion -notmatch 'exitCode=7') {
+        throw "failed-game diagnostics omitted the observed exit code: $failedWait"
+    }
+
+    $retryRoot = Join-Path $root 'retry-game'
+    [IO.Directory]::CreateDirectory($retryRoot) | Out-Null
+    Start-CoordinatorServer $retryRoot $CoordinatorPath
+    $marker = Join-Path $retryRoot 'retry.marker'
+    $retryScript = "`$marker = '$marker'; if (Test-Path -LiteralPath `$marker) { Start-Sleep -Seconds 30 } else { New-Item -ItemType File -Path `$marker | Out-Null; exit 7 }"
+    $retryCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($retryScript))
+    $retryArguments = "-NoProfile -EncodedCommand $retryCommand"
+    $retryLaunch = & $CoordinatorPath launch '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--game-path' $game '--working-directory' $working '--arguments' $retryArguments '--user-data-root' $userRoot `
+        '--mod-configuration' 'managed-test' '--launch-profile' 'managed-test' '--owned' 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "retry launch failed: $retryLaunch" }
+    $retryLaunchJson = $retryLaunch.Trim() | ConvertFrom-Json
+    $firstRetryPid = [int]($retryLaunchJson.OwnershipJson | ConvertFrom-Json).ProcessId
+    $processIds.Add($firstRetryPid)
+    $retryEnsure = & $CoordinatorPath ensure '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--agent-id' 'retry-agent' '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
+        '--timeout-ms' '5000' '--max-launch-attempts' '2' '--launch-backoff-ms' '100' '--owned' 2>&1 | Out-String
+    $retryEnsureJson = $retryEnsure.Trim() | ConvertFrom-Json
+    $retryWait = & $CoordinatorPath wait '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--ticket' $retryEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
+    $retryWaitJson = $retryWait.Trim() | ConvertFrom-Json
+    if ($retryWaitJson.Error -ne 'bridge_handshake_timeout') { throw "bounded retry did not reach handshake timeout: $retryWait" }
+    $retryOwnership = $retryWaitJson.OwnershipJson | ConvertFrom-Json
+    if (-not $retryOwnership.Running -or [int]$retryOwnership.ProcessId -eq $firstRetryPid) {
+        throw "bounded retry did not replace the exited managed process: $retryWait"
+    }
+    $replacementPid = [int]$retryOwnership.ProcessId
+    $processIds.Add($replacementPid)
+
+    foreach ($serverId in @($serverIds)) { Stop-Process -Id $serverId -Force -ErrorAction SilentlyContinue }
+    $serverIds.Clear()
+    Start-CoordinatorServer $retryRoot $CoordinatorPath
+    Stop-Process -Id $replacementPid -Force -ErrorAction SilentlyContinue
+    $restartedWait = & $CoordinatorPath wait '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
+        '--ticket' $retryEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
+    $restartedWaitJson = $restartedWait.Trim() | ConvertFrom-Json
+    if ($restartedWaitJson.Error -ne 'bridge_handshake_timeout' -or
+        [int]($restartedWaitJson.OwnershipJson | ConvertFrom-Json).ProcessId -eq $replacementPid) {
+        throw "coordinator restart did not recover stale managed ownership: $restartedWait"
+    }
+    $processIds.Add([int]($restartedWaitJson.OwnershipJson | ConvertFrom-Json).ProcessId)
+
     $staleOutput = Join-Path $root 'stale-output'
     [IO.Directory]::CreateDirectory($staleOutput) | Out-Null
     $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
@@ -89,9 +157,9 @@ try {
         '--agent-id' 'attached-test-agent' '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' '--timeout-ms' '1000' 2>&1 | Out-String
     if ($LASTEXITCODE -ne 4) { throw "attached ensure exit expected=4 actual=$LASTEXITCODE output=$attached" }
     $attachedResult = $attached.Trim() | ConvertFrom-Json
-    if ($attachedResult.Error -ne 'attached_process_user_restart_required') { throw 'attached ensure did not fail closed' }
+    if ($attachedResult.Error -ne 'attached_live_process_requires_operator') { throw 'attached ensure did not fail closed' }
 
-    Write-Output 'restartCoordinator=PASS launch=owned ensure=coalesced stale=rotated attached=protected'
+    Write-Output 'restartCoordinator=PASS launch=owned ensure=coalesced failed=classified stale=rotated attached=protected'
 }
 finally {
     foreach ($processId in $processIds) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }

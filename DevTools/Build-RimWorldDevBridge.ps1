@@ -153,6 +153,9 @@ if (-not (Test-Path -LiteralPath $harness -PathType Leaf)) { throw "Compatibilit
 & $harness
 if ($LASTEXITCODE -ne 0) { throw "Compatibility harness failed with exit code $LASTEXITCODE." }
 Invoke-Script (Join-Path $PSScriptRoot 'Test-BridgeSourceInvariants.ps1') -arguments @()
+$activationTest = Join-Path $PSScriptRoot 'Test-BridgeActivation.ps1'
+& $activationTest -BridgeRoot $root
+if (-not $?) { throw 'Bridge activation recovery validation failed.' }
 $restartCoordinatorTest = Join-Path $PSScriptRoot 'Test-RestartCoordinator.ps1'
 $restartCoordinator = Join-Path $root '1.6/Assemblies/RestartCoordinator/net472/RimWorldDevBridge.RestartCoordinator.exe'
 & $restartCoordinatorTest -CoordinatorPath $restartCoordinator

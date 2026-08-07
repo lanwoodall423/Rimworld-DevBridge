@@ -42,6 +42,8 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 21)] public string Environment;
         [DataMember(Order = 22)] public string LaunchProfile;
         [DataMember(Order = 23)] public string UserDataRoot;
+        [DataMember(Order = 24)] public int MaxLaunchAttempts = 2;
+        [DataMember(Order = 25)] public int LaunchBackoffMs = 500;
     }
 
     [DataContract]
@@ -73,6 +75,10 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 10)] public string LaunchProfile;
         [DataMember(Order = 11)] public string UserDataRoot;
         [DataMember(Order = 12)] public DateTime ProfileValidatedUtc;
+        [DataMember(Order = 13)] public string ProfileFingerprint;
+        [DataMember(Order = 14)] public int LastExitCode;
+        [DataMember(Order = 15)] public bool LastExitCodeKnown;
+        [DataMember(Order = 16)] public DateTime LastExitUtc;
     }
 
     [DataContract]
@@ -145,7 +151,9 @@ namespace RimWorldDevBridge.RestartCoordinator
                 ModConfiguration = Get(options, "mod-configuration"),
                 Environment = Get(options, "environment"),
                 LaunchProfile = Get(options, "launch-profile"),
-                UserDataRoot = Get(options, "user-data-root")
+                UserDataRoot = Get(options, "user-data-root"),
+                MaxLaunchAttempts = ParseInt(Get(options, "max-launch-attempts", "2"), 2),
+                LaunchBackoffMs = ParseInt(Get(options, "launch-backoff-ms", "500"), 500)
             };
         }
 
@@ -228,6 +236,7 @@ namespace RimWorldDevBridge.RestartCoordinator
         private FileStream lockStream;
         private string secret;
         private LaunchRecord launchRecord;
+        private Process monitoredProcess;
 
         internal CoordinatorHost(string root, string userRoot, string bridgeRoot, bool forceKillTestOnly,
             bool acquireWriterLock)
@@ -294,6 +303,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 return new CoordinatorResponse { Ok = false, Error = "coordinator_authentication_failed", ExitCode = 3 };
             lock (gate)
             {
+                RecoverStaleOwnedProcess();
                 switch ((message.Operation ?? string.Empty).ToLowerInvariant())
                 {
                     case "request": return Request(message);
@@ -310,11 +320,17 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse Request(CoordinatorMessage message)
         {
+            return Request(message, false);
+        }
+
+        private CoordinatorResponse Request(CoordinatorMessage message, bool processAlreadyStarted)
+        {
             bool owned = launchRecord != null && launchRecord.Owned;
             BridgeRestartTicketRecord ticket = machine.Request(message.AgentId, message.PackageId,
                 message.Reason, message.Readiness, message.SavePolicy, message.RequiredCoreFingerprint,
                 message.RequiredAdapterFingerprint, owned, message.LiveConfirmedAuthorized,
-                message.LiveConfirmed);
+                message.LiveConfirmed, processAlreadyStarted, message.MaxLaunchAttempts,
+                message.LaunchBackoffMs);
             Persist("request " + ticket.Ticket);
             return TicketResponse(ticket);
         }
@@ -323,10 +339,11 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             Pump();
             BridgeRestartTicketRecord ticket = string.IsNullOrEmpty(message.Ticket) ? null : machine.Ticket(message.Ticket);
+            string terminalError = TerminalError(ticket);
             return new CoordinatorResponse
             {
-                Ok = ticket != null,
-                Error = ticket == null ? "unknown_restart_ticket" : null,
+                Ok = ticket != null && string.IsNullOrWhiteSpace(terminalError),
+                Error = ticket == null ? "unknown_restart_ticket" : terminalError,
                 Ticket = ticket?.Ticket,
                 CycleId = ticket?.CycleId,
                 Phase = ticket?.Phase,
@@ -364,7 +381,11 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Thread.Sleep(250);
             }
             BridgeRestartTicketRecord timeout = machine.Ticket(message.Ticket);
-            return TicketResponse(timeout, "coordinator_wait_timeout");
+            string timeoutError = timeout != null &&
+                (timeout.Phase == BridgeRestartPhase.STARTING.ToString() ||
+                 timeout.Phase == BridgeRestartPhase.WAITING_FOR_BRIDGE.ToString()) ?
+                "bridge_handshake_timeout" : "coordinator_wait_timeout";
+            return TicketResponse(timeout, timeoutError);
         }
 
         private CoordinatorResponse Ensure(CoordinatorMessage message)
@@ -374,7 +395,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 return new CoordinatorResponse
                 {
                     Ok = false,
-                    Error = "attached_process_user_restart_required",
+                    Error = "attached_live_process_requires_operator",
                     Phase = BridgeRestartPhase.USER_RESTART_REQUIRED.ToString(),
                     OwnershipJson = Program.Json(GetOwnership()),
                     ExitCode = 4
@@ -387,7 +408,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     return new CoordinatorResponse
                     {
                         Ok = false,
-                        Error = "attached_process_user_restart_required",
+                        Error = "attached_live_process_requires_operator",
                         Phase = BridgeRestartPhase.USER_RESTART_REQUIRED.ToString(),
                         OwnershipJson = Program.Json(GetOwnership()),
                         ExitCode = 4
@@ -395,6 +416,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 }
                 CoordinatorResponse launched = Launch(message);
                 if (!launched.Ok) return launched;
+                return Request(message, true);
             }
             return Request(message);
         }
@@ -422,6 +444,8 @@ namespace RimWorldDevBridge.RestartCoordinator
                 UserDataRoot = userDataRoot,
                 ProfileValidatedUtc = DateTime.UtcNow
             };
+            launchRecord.ProfileFingerprint = ProfileFingerprint(launchRecord);
+            monitoredProcess = null;
             Persist("register launch");
             return new CoordinatorResponse
             {
@@ -440,8 +464,12 @@ namespace RimWorldDevBridge.RestartCoordinator
             CoordinatorResponse registered = Register(message);
             if (!registered.Ok) return registered;
             Process process = StartOwned();
+            monitoredProcess = process;
             launchRecord.ProcessId = process.Id;
             launchRecord.ProcessStartTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks;
+            launchRecord.LastExitCodeKnown = false;
+            launchRecord.LastExitCode = 0;
+            launchRecord.LastExitUtc = default(DateTime);
             Persist("launch pid=" + process.Id);
             return new CoordinatorResponse
             {
@@ -474,6 +502,20 @@ namespace RimWorldDevBridge.RestartCoordinator
                         machine.SetCycleIdentity(cycle.CycleId, Get(beforeDrain, "processId"),
                             Get(beforeDrain, "bootId"));
                         cycle = machine.Cycle(cycle.CycleId);
+
+                        string observedPid = Get(beforeDrain, "processId");
+                        bool observedProcessRunning = IsProcessRunning(observedPid);
+                        bool ownedObservedProcess = launchRecord != null && launchRecord.Owned &&
+                            observedPid == launchRecord.ProcessId.ToString() && observedProcessRunning;
+                        bool bridgeActive = string.Equals(Get(beforeDrain, "bridge"), "ON",
+                            StringComparison.OrdinalIgnoreCase);
+                        if (!observedProcessRunning || (ownedObservedProcess && !bridgeActive))
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.DRAINED,
+                                "no_active_bridge_to_drain");
+                            Persist("drained without active bridge");
+                            break;
+                        }
                     }
                     if (TryBridge("RESTART_DRAIN_STATUS", cycle, out string drainResponse) &&
                         drainResponse.IndexOf("drained=true", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -487,7 +529,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     if (launchRecord == null || !launchRecord.Owned)
                     {
                         machine.SetPhase(cycle.CycleId, BridgeRestartPhase.USER_RESTART_REQUIRED,
-                            "attached_process_user_restart_required");
+                            "attached_live_process_requires_operator");
                         Persist("user restart required");
                     }
                     else
@@ -503,10 +545,24 @@ namespace RimWorldDevBridge.RestartCoordinator
                     StartOwnedForCycle(cycle);
                     break;
                 case BridgeRestartPhase.WAITING_FOR_BRIDGE:
+                    if (!TryGetOwnedProcess(out Process waitingProcess))
+                    {
+                        HandleManagedProcessExit(cycle);
+                        break;
+                    }
                     if (ReadyForBridge(cycle))
                     {
-                        machine.SetPhase(cycle.CycleId, BridgeRestartPhase.WAITING_FOR_GAME);
-                        Persist("bridge ready cycle=" + cycle.CycleId);
+                        if (string.Equals(cycle.Readiness, "bridge", StringComparison.OrdinalIgnoreCase))
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.READY,
+                                "bridge_ready");
+                            Persist("bridge ready cycle=" + cycle.CycleId);
+                        }
+                        else
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.WAITING_FOR_GAME);
+                            Persist("bridge ready; waiting for game cycle=" + cycle.CycleId);
+                        }
                     }
                     break;
                 case BridgeRestartPhase.WAITING_FOR_GAME:
@@ -524,14 +580,17 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             try
             {
-                Process process = launchRecord == null || launchRecord.ProcessId == 0 ? null :
-                    Process.GetProcessById(launchRecord.ProcessId);
+                Process process = null;
+                if (launchRecord != null && launchRecord.ProcessId != 0 &&
+                    IsProcessRunning(launchRecord.ProcessId.ToString()))
+                    process = Process.GetProcessById(launchRecord.ProcessId);
                 if (process != null && !process.HasExited)
                 {
                     if (!OwnsProcess(process))
                     {
-                        machine.Fail(cycle.CycleId, "owned_process_identity_mismatch");
-                        Persist("stop identity mismatch");
+                        machine.SetPhase(cycle.CycleId, BridgeRestartPhase.USER_RESTART_REQUIRED,
+                            "attached_live_process_requires_operator;owned_process_identity_mismatch");
+                        Persist("attached live process identity mismatch");
                         return;
                     }
                     process.CloseMainWindow();
@@ -545,6 +604,11 @@ namespace RimWorldDevBridge.RestartCoordinator
                 }
                 machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STARTING);
                 Persist("stopped cycle=" + cycle.CycleId);
+            }
+            catch (ArgumentException)
+            {
+                machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STARTING);
+                Persist("owned process exited before stop");
             }
             catch (Exception exception)
             {
@@ -578,20 +642,198 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private void StartOwnedForCycle(BridgeRestartCycleRecord cycle)
         {
+            if (cycle.NextLaunchUtc > DateTime.UtcNow) return;
+            int attempt = cycle.LaunchAttempts + 1;
+            Process startedProcess = null;
             try
             {
-                Process process = StartOwned();
-                launchRecord.ProcessId = process.Id;
-                launchRecord.ProcessStartTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks;
-                machine.SetStartedPid(cycle.CycleId, process.Id.ToString());
+                machine.SetLaunchAttempt(cycle.CycleId, attempt);
+                startedProcess = StartOwned();
+                monitoredProcess = startedProcess;
+                launchRecord.ProcessId = startedProcess.Id;
+                launchRecord.ProcessStartTimeUtcTicks = startedProcess.StartTime.ToUniversalTime().Ticks;
+                launchRecord.LastExitCodeKnown = false;
+                launchRecord.LastExitCode = 0;
+                launchRecord.LastExitUtc = default(DateTime);
+                machine.SetStartedPid(cycle.CycleId, startedProcess.Id.ToString());
                 machine.SetPhase(cycle.CycleId, BridgeRestartPhase.WAITING_FOR_BRIDGE);
-                Persist("started pid=" + process.Id);
+                Persist("started pid=" + startedProcess.Id);
             }
             catch (Exception exception)
             {
-                machine.Fail(cycle.CycleId, "start_failed:" + exception.GetType().Name);
-                Persist("start exception");
+                CloseStartedProcess(startedProcess);
+                HandleManagedLaunchFailure(cycle, "launch_profile_invalid:" + exception.GetType().Name);
             }
+        }
+
+        private static void CloseStartedProcess(Process process)
+        {
+            if (process == null) return;
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.CloseMainWindow();
+                    process.WaitForExit(5000);
+                }
+            }
+            catch { }
+            try { process.Dispose(); } catch { }
+        }
+
+        private void HandleManagedProcessExit(BridgeRestartCycleRecord cycle)
+        {
+            string diagnostics = "managed_process_exited_before_ready;" + ExitDiagnostics();
+            ClearLaunchProcessIdentity();
+            if (cycle.LaunchAttempts < cycle.MaxLaunchAttempts)
+            {
+                DateTime next = DateTime.UtcNow.AddMilliseconds(cycle.LaunchBackoffMs);
+                machine.PrepareLaunchRetry(cycle.CycleId, cycle.LaunchAttempts, cycle.MaxLaunchAttempts,
+                    cycle.LaunchBackoffMs, next, "managed_launch_retrying;" + diagnostics);
+                Persist("managed launch retrying attempt=" + (cycle.LaunchAttempts + 1));
+                return;
+            }
+            machine.Fail(cycle.CycleId, "managed_launch_failed;" + diagnostics);
+            Persist("managed launch failed;" + diagnostics);
+        }
+
+        private void HandleManagedLaunchFailure(BridgeRestartCycleRecord cycle, string failure)
+        {
+            ClearLaunchProcessIdentity();
+            if (cycle.LaunchAttempts < cycle.MaxLaunchAttempts)
+            {
+                DateTime next = DateTime.UtcNow.AddMilliseconds(cycle.LaunchBackoffMs);
+                machine.PrepareLaunchRetry(cycle.CycleId, cycle.LaunchAttempts, cycle.MaxLaunchAttempts,
+                    cycle.LaunchBackoffMs, next, "managed_launch_retrying;" + failure);
+                Persist("managed launch retrying;" + failure);
+                return;
+            }
+            machine.Fail(cycle.CycleId, "managed_launch_failed;" + failure);
+            Persist("managed launch failed;" + failure);
+        }
+
+        private string ExitDiagnostics()
+        {
+            string exit = launchRecord != null && launchRecord.LastExitCodeKnown ?
+                launchRecord.LastExitCode.ToString() : "unknown";
+            string profile = launchRecord == null ? "unknown" :
+                Path.GetFileName(launchRecord.GamePath ?? string.Empty);
+            return "exitCode=" + Limit(exit, 32) + ";profile=" + Limit(profile, 128);
+        }
+
+        private void ClearLaunchProcessIdentity()
+        {
+            if (launchRecord != null)
+            {
+                launchRecord.ProcessId = 0;
+                launchRecord.ProcessStartTimeUtcTicks = 0;
+            }
+            if (monitoredProcess != null)
+            {
+                monitoredProcess.Dispose();
+                monitoredProcess = null;
+            }
+            machine.ClearOwnedProcess();
+        }
+
+        private bool TryGetOwnedProcess(out Process process)
+        {
+            process = null;
+            if (launchRecord == null || !launchRecord.Owned || launchRecord.ProcessId <= 0) return false;
+            if (monitoredProcess != null && monitoredProcess.Id == launchRecord.ProcessId)
+            {
+                if (monitoredProcess.HasExited)
+                {
+                    CaptureExitCode(monitoredProcess);
+                    return false;
+                }
+                if (!OwnsProcess(monitoredProcess)) return false;
+                process = monitoredProcess;
+                return true;
+            }
+            try
+            {
+                Process candidate = Process.GetProcessById(launchRecord.ProcessId);
+                if (candidate.HasExited)
+                {
+                    CaptureExitCode(candidate);
+                    candidate.Dispose();
+                    return false;
+                }
+                if (!OwnsProcess(candidate))
+                {
+                    candidate.Dispose();
+                    return false;
+                }
+                monitoredProcess = candidate;
+                process = candidate;
+                return true;
+            }
+            catch (ArgumentException) { return false; }
+            catch { return false; }
+        }
+
+        private void RecoverStaleOwnedProcess()
+        {
+            if (launchRecord == null || !launchRecord.Owned) return;
+            BridgeRestartCoordinatorState snapshot = machine.Snapshot;
+            BridgeRestartCycleRecord active = snapshot.Cycles.LastOrDefault(item =>
+                item.Phase != BridgeRestartPhase.READY.ToString() &&
+                item.Phase != BridgeRestartPhase.FAILED.ToString() &&
+                item.Phase != BridgeRestartPhase.USER_RESTART_REQUIRED.ToString());
+            if (launchRecord.ProcessId <= 0)
+            {
+                if (active != null && active.Phase == BridgeRestartPhase.WAITING_FOR_BRIDGE.ToString())
+                    HandleManagedProcessExit(active);
+                return;
+            }
+            if (TryGetOwnedProcess(out Process ownedProcess)) return;
+
+            bool liveIdentityConflict = false;
+            try
+            {
+                Process candidate = Process.GetProcessById(launchRecord.ProcessId);
+                if (!candidate.HasExited)
+                {
+                    liveIdentityConflict = IsExpectedExecutable(candidate);
+                    candidate.Dispose();
+                }
+            }
+            catch { }
+
+            if (liveIdentityConflict)
+            {
+                ClearLaunchProcessIdentity();
+                launchRecord.Owned = false;
+                string diagnostics = "attached_live_process_requires_operator;pid_reuse_or_external_process";
+                if (active != null) machine.Fail(active.CycleId, diagnostics);
+                machine.SetLastError(diagnostics);
+                Persist("live ownership conflict recovered");
+                return;
+            }
+
+            if (active != null)
+            {
+                HandleManagedProcessExit(active);
+                return;
+            }
+            string stale = "stale_managed_ownership_recovered;" + ExitDiagnostics();
+            ClearLaunchProcessIdentity();
+            machine.RecoverStaleOwnership(stale);
+            Persist("stale managed ownership recovered");
+        }
+
+        private void CaptureExitCode(Process process)
+        {
+            if (launchRecord == null || process == null) return;
+            try
+            {
+                if (!process.HasExited) return;
+                launchRecord.LastExitCode = process.ExitCode;
+                launchRecord.LastExitCodeKnown = true;
+                launchRecord.LastExitUtc = DateTime.UtcNow;
+            }
+            catch { launchRecord.LastExitCodeKnown = false; }
         }
 
         private Process StartOwned()
@@ -636,9 +878,40 @@ namespace RimWorldDevBridge.RestartCoordinator
             if (launchRecord.ProcessStartTimeUtcTicks == 0) return false;
             try
             {
-                return process.StartTime.ToUniversalTime().Ticks == launchRecord.ProcessStartTimeUtcTicks;
+                return process.StartTime.ToUniversalTime().Ticks == launchRecord.ProcessStartTimeUtcTicks &&
+                    IsExpectedExecutable(process) &&
+                    (string.IsNullOrEmpty(launchRecord.ProfileFingerprint) ||
+                     string.Equals(launchRecord.ProfileFingerprint, ProfileFingerprint(launchRecord),
+                         StringComparison.OrdinalIgnoreCase));
             }
             catch { return false; }
+        }
+
+        private bool IsExpectedExecutable(Process process)
+        {
+            if (process == null || launchRecord == null || string.IsNullOrWhiteSpace(launchRecord.GamePath)) return false;
+            try
+            {
+                string actual = process.MainModule.FileName;
+                return string.Equals(Path.GetFullPath(actual), Path.GetFullPath(launchRecord.GamePath),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        private static string ProfileFingerprint(LaunchRecord record)
+        {
+            string value = string.Join("|", new[]
+            {
+                record.GamePath ?? string.Empty,
+                record.WorkingDirectory ?? string.Empty,
+                record.Arguments ?? string.Empty,
+                record.ModConfiguration ?? string.Empty,
+                record.LaunchProfile ?? string.Empty,
+                record.UserDataRoot ?? string.Empty
+            });
+            using (SHA256 sha = SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(value))).Replace("-", string.Empty);
         }
 
         private bool ReadyForBridge(BridgeRestartCycleRecord cycle)
@@ -723,6 +996,19 @@ namespace RimWorldDevBridge.RestartCoordinator
                 using (FileStream stream = File.OpenRead(launchPath))
                     launchRecord = (LaunchRecord)new DataContractJsonSerializer(typeof(LaunchRecord)).ReadObject(stream);
             }
+            if (launchRecord != null && string.IsNullOrEmpty(launchRecord.ProfileFingerprint))
+                launchRecord.ProfileFingerprint = ProfileFingerprint(launchRecord);
+            RecoverStaleOwnedProcess();
+        }
+
+        private static bool IsProcessRunning(string processId)
+        {
+            if (!int.TryParse(processId, out int pid) || pid <= 0) return false;
+            try
+            {
+                using (Process process = Process.GetProcessById(pid)) return !process.HasExited;
+            }
+            catch { return false; }
         }
 
         private void Persist(string journal)
@@ -758,17 +1044,29 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse TicketResponse(BridgeRestartTicketRecord ticket, string error = null)
         {
+            string terminalError = string.IsNullOrWhiteSpace(error) ? TerminalError(ticket) : error;
             return new CoordinatorResponse
             {
-                Ok = ticket != null && error == null,
-                Error = error,
+                Ok = ticket != null && string.IsNullOrWhiteSpace(terminalError),
+                Error = terminalError,
                 Ticket = ticket?.Ticket,
                 CycleId = ticket?.CycleId,
                 Phase = ticket?.Phase,
                 Json = ticket == null ? null : Program.Json(ticket),
                 OwnershipJson = Program.Json(GetOwnership()),
-                ExitCode = error == null ? 0 : 4
+                ExitCode = string.IsNullOrWhiteSpace(terminalError) ? 0 : 4
             };
+        }
+
+        private static string TerminalError(BridgeRestartTicketRecord ticket)
+        {
+            if (ticket == null ||
+                (ticket.Phase != BridgeRestartPhase.FAILED.ToString() &&
+                 ticket.Phase != BridgeRestartPhase.USER_RESTART_REQUIRED.ToString())) return null;
+            string value = string.IsNullOrWhiteSpace(ticket.Completion) ? ticket.Reason : ticket.Completion;
+            if (string.IsNullOrWhiteSpace(value)) return "managed_launch_failed";
+            int separator = value.IndexOf(';');
+            return separator > 0 ? value.Substring(0, separator) : value;
         }
 
         private CoordinatorOwnership GetOwnership()
@@ -783,14 +1081,16 @@ namespace RimWorldDevBridge.RestartCoordinator
             result.ProcessStartTimeUtcTicks = launchRecord.ProcessStartTimeUtcTicks;
             try
             {
-                Process process = Process.GetProcessById(launchRecord.ProcessId);
-                result.Running = !process.HasExited && OwnsProcess(process);
-                if (result.Running)
+                using (Process process = Process.GetProcessById(launchRecord.ProcessId))
                 {
-                    Dictionary<string, string> status = ReadStatus();
-                    if (status.ContainsKey("processId") &&
-                        status["processId"] == launchRecord.ProcessId.ToString())
-                        result.BootId = Get(status, "bootId");
+                    result.Running = !process.HasExited && OwnsProcess(process);
+                    if (result.Running)
+                    {
+                        Dictionary<string, string> status = ReadStatus();
+                        if (status.ContainsKey("processId") &&
+                            status["processId"] == launchRecord.ProcessId.ToString())
+                            result.BootId = Get(status, "bootId");
+                    }
                 }
             }
             catch { result.Running = false; }

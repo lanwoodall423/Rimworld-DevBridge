@@ -68,13 +68,13 @@ try {
     }
     $wait = Invoke-Client @('restart', 'wait', '--bridge-root', $BridgeRoot, '--user-root', $testUserRoot,
         '--ticket', $restart.ticket, '--timeout-ms', '250', '--json') 4
-    if ($wait.error -ne 'coordinator_wait_timeout' -or $wait.ticket -ne $restart.ticket) {
-        throw "durable restart wait failed expected=timeout for ticket actual=$($wait | ConvertTo-Json -Compress)"
+    if ($wait.ticket -ne $restart.ticket -or $wait.error -notin @('coordinator_wait_timeout', 'attached_live_process_requires_operator')) {
+        throw "durable restart wait failed expected=timeout or protected attached refusal for ticket actual=$($wait | ConvertTo-Json -Compress)"
     }
     $unauthorized = Invoke-Client @('restart', 'request', '--bridge-root', $BridgeRoot, '--user-root', $testUserRoot,
         '--agent-id', 'client-live-agent', '--package-id', 'client.test', '--reason', 'live test',
-        '--readiness', 'game', '--live-confirmed', '--save-policy', 'none', '--json')
-    if ($unauthorized.ok -ne $true -or $unauthorized.phase -ne 'FAILED') {
+        '--readiness', 'game', '--live-confirmed', '--save-policy', 'none', '--json') 4
+    if ($unauthorized.ok -ne $false -or $unauthorized.phase -ne 'FAILED') {
         throw "live restart authorization was not rejected expected=FAILED actual=$($unauthorized | ConvertTo-Json -Compress)"
     }
 }
@@ -110,6 +110,13 @@ try {
     $missingAuthorization = Invoke-Client (@('restart', 'ensure') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--timeout-ms', '250', '--json')) 3
     if ($missingAuthorization.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED' -or $missingAuthorization.operatorActionRequired -ne $true) {
         throw "missing sandbox authorization was not required actual=$($missingAuthorization | ConvertTo-Json -Compress)"
+    }
+    foreach ($property in @('recoverable', 'requiredAction', 'activationState', 'waitFor', 'keepRunning', 'retrySafe', 'operatorActionRequired', 'nextAction')) {
+        if (-not $missingAuthorization.PSObject.Properties[$property]) { throw "ensure response missing recovery field: $property" }
+    }
+    if ($missingAuthorization.reason -ne 'sandbox_authorization_missing' -or
+        $missingAuthorization.activationState -ne 'failed' -or $missingAuthorization.waitFor -ne 'none') {
+        throw "ensure response vocabulary was not canonical actual=$($missingAuthorization | ConvertTo-Json -Compress)"
     }
     $wakeStart = Invoke-Client (@('wake', '--start') + $ensureBase + @('--readiness', 'bridge', '--save-policy', 'none', '--timeout-ms', '250', '--json')) 3
     if ($wakeStart.status -ne 'SANDBOX_AUTHORIZATION_REQUIRED') {
@@ -220,6 +227,11 @@ $server = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-Execution
     '-UserRoot', $mockRoot, '-Port', $mockPort, '-ProcessId', $PID, '-Mvid', $mockMvid, '-LogPath', $serverLog) -PassThru -WindowStyle Hidden
 try {
     Start-Sleep -Milliseconds 250
+    $inactiveRecovery = Invoke-Client @('discover', '--bridge-root', $BridgeRoot, '--user-root', $mockRoot,
+        '--startup-timeout-ms', '3000', '--progress-interval-ms', '100', '--json')
+    if ($inactiveRecovery.available -ne $true -or $inactiveRecovery.activationRecovered -ne $true) {
+        throw "inactive bridge recovery failed expected=activationRecovered actual=$($inactiveRecovery | ConvertTo-Json -Compress)"
+    }
     $wake = Invoke-Client @('wake', '--bridge-root', $BridgeRoot, '--user-root', $mockRoot,
         '--timeout-ms', '5000', '--json')
     if ($wake.available -ne $true -or $wake.woke -ne $true) {

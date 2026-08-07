@@ -184,7 +184,7 @@ $process = Get-Process -Name $GameProcessName -ErrorAction SilentlyContinue | Se
 if ($process) {
     $attachedStatus = Read-KeyFile $statusPath
     if ($attachedStatus["processId"] -ne "$($process.Id)" -or [string]::IsNullOrWhiteSpace($attachedStatus["bootId"])) {
-        Write-Output '{"ok":false,"status":"USER_RESTART_REQUIRED","ownership":"attached","operatorActionRequired":true,"nextAction":"stop the manually attached RimWorld process, then rerun"}'
+        Write-Output '{"ok":false,"status":"USER_RESTART_REQUIRED","reason":"attached_live_process_requires_operator","ownership":"attached","operatorActionRequired":true,"operatorAction":"the process owner must manage the attached RimWorld process","activationState":"failed","recoverable":false,"requiredAction":"the process owner must manage the attached RimWorld process","waitFor":"none","keepRunning":true,"retrySafe":false,"nextAction":"rerun after the attached process is stopped by its owner"}'
         exit 4
     }
     if ($Command.ToUpperInvariant() -eq "RUN_FEATURE_TESTS") {
