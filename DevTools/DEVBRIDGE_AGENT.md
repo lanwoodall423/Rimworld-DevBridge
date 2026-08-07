@@ -64,3 +64,10 @@ Restart requests carry an explicit postcondition and current identity. Do not ac
 ticket as success unless its PID, session, lifecycle generation, and required core/adapter identity
 are fresh. A stale `WAITING_FOR_GAME` cycle is bounded and may be superseded; waiters follow the
 replacement cycle. Never claim an attached process.
+
+Durable goals let one agent state a runtime objective once:
+`goal ensure|status|wait|cancel|checkpoint|resume --goal-id <id> --desired-state bridge|map|test_ready`.
+Goal state is atomically persisted under the user root, callers coalesce by stable goal ID, and
+progress requires fresh PID/session/lifecycle/core identity and context. Watchdogs and retries are
+bounded. Checkpoint and cancel release client resources; resume performs only outstanding work. Goals
+never grant mutation, confirmation, a write lease, or attached-process control.

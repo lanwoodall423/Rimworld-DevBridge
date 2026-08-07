@@ -198,6 +198,22 @@ persisted under the user root, deduplicated, and retain exact resume operations.
 60-second response window, the client checkpoints as `READY_AWAITING_HUMAN`, releases resources, and
 ends successfully awaiting input. Review and approval never authorize mutation, attached-process
 control, or a write lease.
+
+## Durable Runtime Goals
+
+State a runtime objective once and let the canonical client drive safe authorized work:
+
+```powershell
+& ".\DevTools\devbridge.ps1" goal ensure --goal-id wildlife-map --desired-state map --timeout-ms 300000 --json
+& ".\DevTools\devbridge.ps1" goal wait --goal-id wildlife-map --timeout-ms 120000 --json
+```
+
+Supported postconditions are `bridge`, `map`, and `test_ready`. Goal files are atomically persisted
+under the existing user root and include progress, PID/session/lifecycle/build identity, context
+freshness, retry safety, and resource-release state. Concurrent callers follow one goal operation;
+stale progress is bounded and resumable. `goal checkpoint` and `goal cancel` release client resources,
+and `goal resume` does not repeat completed work. Goals never authorize mutation, confirm an in-game
+warning, acquire a write lease, or claim an attached process.
 `RimWorldManagedDir is not configured` or a missing assembly error means the private dependency
 inputs are absent; do not copy those files into this repository. A fingerprint, boot, session, or
 transport mismatch requires discarding cached context, leases, cursors, and handles.

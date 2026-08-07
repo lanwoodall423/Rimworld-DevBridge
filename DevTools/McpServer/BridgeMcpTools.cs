@@ -47,6 +47,96 @@ public sealed class BridgeMcpTools
         }, correlation!, startupTimeoutMs, cancellationToken);
     }
 
+    [McpServerTool(ReadOnly = false, Destructive = true, OpenWorld = false, Idempotent = true,
+        UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
+    [Description("Drive one durable runtime goal to bridge, map, or test-ready completion through the authorized managed-test coordinator workflow." )]
+    public Task<McpToolResponse> EnsureRuntimeGoalAsync(
+        [Description("Stable durable goal identifier.")] string goalId,
+        [Description("Desired terminal postcondition: bridge, map, or test_ready.")] string desiredState = "test_ready",
+        [Description("Bounded total goal timeout in milliseconds.")] int timeoutMs = 300000,
+        [Description("Bounded no-progress watchdog timeout in milliseconds.")] int noProgressTimeoutMs = 120000,
+        [Description("Caller correlation identifier.")] string? correlationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var correlation = Correlation(correlationId);
+        if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
+        if (desiredState is not ("bridge" or "map" or "test_ready")) return Task.FromResult(McpToolResponse.Error("desired_state_invalid", "Use bridge, map, or test_ready.", correlation));
+        if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error) ||
+            !TryBounds(noProgressTimeoutMs, 1000, 600000, "noProgressTimeoutMs", correlation, out error)) return Task.FromResult(error!);
+        return _client.InvokeAsync("goal", new[] { "ensure", $"--goal-id={goalId}", $"--desired-state={desiredState}", $"--timeout-ms={timeoutMs}", $"--no-progress-timeout-ms={noProgressTimeoutMs}" }, correlation, timeoutMs, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true, Destructive = false, OpenWorld = false, Idempotent = true,
+        UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
+    [Description("Read durable runtime-goal progress, identity, postcondition, and recovery state without starting or stopping RimWorld.")]
+    public Task<McpToolResponse> GetRuntimeGoalStatusAsync(
+        [Description("Stable durable goal identifier.")] string goalId,
+        [Description("Caller correlation identifier.")] string? correlationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var correlation = Correlation(correlationId);
+        if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
+        return _client.InvokeAsync("goal", new[] { "status", $"--goal-id={goalId}" }, correlation, _options.DefaultTimeoutMs, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = true, Destructive = false, OpenWorld = false, Idempotent = true,
+        UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
+    [Description("Wait for a durable runtime goal to reach its requested postcondition or a bounded terminal result.")]
+    public Task<McpToolResponse> WaitForGoalAsync(
+        [Description("Stable durable goal identifier.")] string goalId,
+        [Description("Bounded wait timeout in milliseconds.")] int timeoutMs = 120000,
+        [Description("Caller correlation identifier.")] string? correlationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var correlation = Correlation(correlationId);
+        if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
+        if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error)) return Task.FromResult(error!);
+        return _client.InvokeAsync("goal", new[] { "wait", $"--goal-id={goalId}", $"--timeout-ms={timeoutMs}" }, correlation, timeoutMs, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = false, Idempotent = true,
+        UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
+    [Description("Cancel a durable runtime goal and release its client-side lease state without claiming or terminating an attached process.")]
+    public Task<McpToolResponse> CancelRuntimeGoalAsync(
+        [Description("Stable durable goal identifier.")] string goalId,
+        [Description("Caller correlation identifier.")] string? correlationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var correlation = Correlation(correlationId);
+        if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
+        return _client.InvokeAsync("goal", new[] { "cancel", $"--goal-id={goalId}" }, correlation, _options.DefaultTimeoutMs, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = false, Idempotent = true,
+        UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
+    [Description("Persist a durable runtime-goal checkpoint and release optional client resources without granting human safety approval.")]
+    public Task<McpToolResponse> CheckpointRuntimeGoalAsync(
+        [Description("Stable durable goal identifier.")] string goalId,
+        [Description("Caller correlation identifier.")] string? correlationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var correlation = Correlation(correlationId);
+        if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
+        return _client.InvokeAsync("goal", new[] { "checkpoint", $"--goal-id={goalId}" }, correlation, _options.DefaultTimeoutMs, cancellationToken);
+    }
+
+    [McpServerTool(ReadOnly = false, Destructive = true, OpenWorld = false, Idempotent = true,
+        UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
+    [Description("Resume only the outstanding work of a durable runtime goal using its persisted desired postcondition and safety checks.")]
+    public Task<McpToolResponse> ResumeRuntimeGoalAsync(
+        [Description("Stable durable goal identifier.")] string goalId,
+        [Description("Desired terminal postcondition: bridge, map, or test_ready.")] string desiredState = "test_ready",
+        [Description("Bounded total goal timeout in milliseconds.")] int timeoutMs = 300000,
+        [Description("Caller correlation identifier.")] string? correlationId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var correlation = Correlation(correlationId);
+        if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
+        if (desiredState is not ("bridge" or "map" or "test_ready")) return Task.FromResult(McpToolResponse.Error("desired_state_invalid", "Use bridge, map, or test_ready.", correlation));
+        if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error)) return Task.FromResult(error!);
+        return _client.InvokeAsync("goal", new[] { "resume", $"--goal-id={goalId}", $"--desired-state={desiredState}", $"--timeout-ms={timeoutMs}" }, correlation, timeoutMs, cancellationToken);
+    }
+
     [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = false, Idempotent = true,
         UseStructuredContent = true, OutputSchemaType = typeof(McpToolResponse))]
     [Description("Get current bridge status. This may perform the documented safe managed-test activation recovery when the bridge is inactive.")]

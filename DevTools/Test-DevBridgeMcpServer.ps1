@@ -72,11 +72,13 @@ try {
     Send-Message @{ jsonrpc = '2.0'; id = 2; method = 'tools/list'; params = @{} }
     $tools = Read-Message
     $toolNames = @($tools.result.tools | ForEach-Object { $_.name })
-    foreach ($name in @('ensure_bridge_ready', 'get_bridge_status', 'get_fresh_context', 'list_bridge_capabilities', 'run_read_only_query', 'validate_owner_adapter', 'request_managed_restart', 'wait_for_runtime', 'list_human_reviews', 'create_human_review', 'resolve_human_review', 'get_resume_checkpoint')) {
+    foreach ($name in @('ensure_bridge_ready', 'ensure_runtime_goal', 'get_runtime_goal_status', 'wait_for_goal', 'cancel_runtime_goal', 'checkpoint_runtime_goal', 'resume_runtime_goal', 'get_bridge_status', 'get_fresh_context', 'list_bridge_capabilities', 'run_read_only_query', 'validate_owner_adapter', 'request_managed_restart', 'wait_for_runtime', 'list_human_reviews', 'create_human_review', 'resolve_human_review', 'get_resume_checkpoint')) {
         Assert-True ($toolNames -contains $name) "missing MCP tool $name"
     }
     $ensureTool = @($tools.result.tools | Where-Object name -eq 'ensure_bridge_ready')[0]
     Assert-True ($ensureTool.annotations.readOnlyHint -eq $false -and $ensureTool.annotations.destructiveHint -eq $true) 'activation annotations are not truthful'
+    $goalTool = @($tools.result.tools | Where-Object name -eq 'ensure_runtime_goal')[0]
+    Assert-True ($goalTool.annotations.readOnlyHint -eq $false -and $goalTool.annotations.destructiveHint -eq $true) 'goal annotations are not truthful'
     $readTool = @($tools.result.tools | Where-Object name -eq 'run_read_only_query')[0]
     Assert-True ($readTool.annotations.readOnlyHint -eq $false) 'activation-capable read tool was incorrectly marked read-only'
     Assert-True ($null -ne $readTool.inputSchema -and $null -ne $readTool.outputSchema) 'tool schemas are incomplete'
