@@ -56,6 +56,8 @@ internal static class Program
         Run("shared runtime lane fairness", SharedRuntimeLaneFairness);
         Run("restart drain barrier", RestartDrainBarrier);
         Run("restart coordinator state machine", RestartCoordinatorStateMachineTest);
+        Run("restart postcondition does not coalesce stale cycle", RestartPostconditionDoesNotCoalesceStaleCycle);
+        Run("restart supersession and identity contract", RestartSupersessionAndIdentityContract);
         Run("session context transitions", SessionContextTransitions);
         Run("bridge indicator state transitions", BridgeIndicatorStateTransitions);
         Run("event-driven state publication", EventDrivenStatePublication);
@@ -741,6 +743,49 @@ internal static class Program
                 "coordinator secret was not created");
         }
         finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    private static void RestartPostconditionDoesNotCoalesceStaleCycle()
+    {
+        BridgeRestartCoordinatorStateMachine machine = new BridgeRestartCoordinatorStateMachine();
+        BridgeRestartTicketRecord old = machine.Request("agent-old", "owner.a", "old assembly is loaded",
+            "game", "none", "core-old", "adapter-old", true, false, false, true);
+        machine.SetPhase(old.CycleId, BridgeRestartPhase.WAITING_FOR_GAME, "waiting for old game context");
+
+        BridgeRestartTicketRecord replacement = machine.Request("agent-new", "owner.a",
+            "new assembly requires replacement process", "game", "none", "core-old", "adapter-old",
+            true, false, false, false);
+        Check(replacement.CycleId != old.CycleId,
+            "replacement postcondition incorrectly joined stale WAITING_FOR_GAME cycle");
+    }
+
+    private static void RestartSupersessionAndIdentityContract()
+    {
+        BridgeRestartCoordinatorStateMachine machine = new BridgeRestartCoordinatorStateMachine();
+        BridgeRestartTicketRecord old = machine.Request("agent-old", "owner.a", "runtime verification",
+            "game", "none", "core-old", "adapter-old", true, false, false, true,
+            2, 500, "game", false, 4, "41", "session-old", false, 1000);
+        machine.SetCycleIdentity(old.CycleId, "41", "boot-old", "session-old", 4);
+        machine.SetPhase(old.CycleId, BridgeRestartPhase.WAITING_FOR_GAME, "waiting for context");
+
+        BridgeRestartCoordinatorState stale = machine.Snapshot;
+        stale.Cycles.Single(item => item.CycleId == old.CycleId).ProgressDeadlineUtc = DateTime.UtcNow.AddMilliseconds(-1);
+        machine = new BridgeRestartCoordinatorStateMachine(stale);
+        Check(machine.IsProgressExpired(old.CycleId, DateTime.UtcNow), "stale cycle watchdog did not expire");
+
+        BridgeRestartTicketRecord replacement = machine.Request("agent-new", "owner.a",
+            "new assembly requires replacement process", "game", "none", "core-new", "adapter-old",
+            true, false, false, false, 2, 500, "game", true, 5, "42", "session-new", true, 1000);
+        Check(replacement.CycleId != old.CycleId, "stale cycle was not superseded");
+        Equal(replacement.CycleId, machine.Ticket(old.Ticket).CycleId,
+            "old waiter did not move to replacement cycle");
+        Equal(replacement.CycleId, machine.Ticket(old.Ticket).ReplacementCycleId,
+            "old waiter did not retain replacement link");
+        Check(replacement.RequiresNewProcess && replacement.RequestedPid == "42" &&
+            replacement.RequestedSessionId == "session-new" && replacement.RequestedLifecycleGeneration == 5,
+            "replacement identity contract was not persisted");
+        Check(machine.Snapshot.Cycles.Single(item => item.CycleId == old.CycleId).Phase ==
+            BridgeRestartPhase.FAILED.ToString(), "superseded cycle was not terminal");
     }
 
     private static void SessionContextTransitions()

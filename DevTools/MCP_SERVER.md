@@ -174,6 +174,12 @@ Canonical values are `bridge_ready` with phase `READY` and
 `attached_live_process_requires_operator`. Review resolution never confirms an
 in-game warning, grants a lease, or authorizes attached-process control.
 
+`request_managed_restart` validates the requested bridge postcondition and current PID/session/
+lifecycle-generation/build identity before accepting a coalesced cycle. A request requiring a new
+process or assembly cannot succeed by joining a stale `WAITING_FOR_GAME` cycle. Stale cycles are
+watchdogged and may be superseded only for an authorized coordinator-owned managed instance; waiting
+callers follow the replacement cycle and receive fresh context before success.
+
 ## Verification
 
 The protocol test starts the server over STDIO and verifies initialization instructions,

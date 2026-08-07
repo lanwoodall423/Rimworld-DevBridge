@@ -186,6 +186,11 @@ Lifecycle callbacks are bounded/coalesced to the newest sequence and expose
 `lifecyclePending`, `lifecycleCoalesced`, and `lifecycleDroppedStale` in scheduler metrics. Compatible
 pure reads may run concurrently; restart, save/load, adapter reload, stateful setup, mutation, and
 lease writes use a fair serialized runtime lane.
+Restart coalescing is postcondition-aware: readiness, save policy, requested assembly/build identity,
+restart reason, PID/session/lifecycle generation, and progress deadlines are checked. Requests that
+require a new process or assembly cannot complete with the prior PID/session. A stale
+`WAITING_FOR_GAME` cycle is watchdogged, safely superseded when authorized, and its waiters follow the
+replacement cycle.
 
 For work that genuinely needs a person, use the durable queue:
 `review request|list|get|resolve|cancel|wait|checkpoint|resume`. Tickets are redacted and atomically

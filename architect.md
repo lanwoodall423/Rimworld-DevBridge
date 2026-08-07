@@ -125,6 +125,11 @@ processes or gameplay mutation.
       reload, stateful setup, mutation, and lease writes acquire the fair
       serialized runtime lane. Requests waiting for optional human feedback
       never hold that lane.
+     - Restart cycles persist the requested postcondition, restart reason, build identity, requested
+       PID/session/lifecycle generation, and progress deadline. Coalescing is permitted only for
+       compatible forward-progressing cycles. A stale `WAITING_FOR_GAME` cycle can be atomically
+       superseded; its waiters migrate to the replacement and completion requires a fresh PID,
+       session, lifecycle generation, context, and expected fingerprint.
 
 4. **Durable human work**
    - `review request|list|get|resolve|cancel|wait|checkpoint|resume` stores

@@ -1201,7 +1201,7 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
         "--agent-id", "--package-id", "--layout", "--coordinator-path", "--launch-profile-path",
         "--profile-user-root", "--game-path", "--working-directory", "--arguments", "--game-arguments",
         "--mod-configuration", "--sandbox-authorization-path", "--reason",
-        "--max-launch-attempts", "--launch-backoff-ms"
+        "--max-launch-attempts", "--launch-backoff-ms", "--required-core-fingerprint"
     )
     for ($index = 0; $index -lt $values.Count; $index++) {
         $value = [string]$values[$index]
@@ -1473,6 +1473,26 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         "--launch-profile", "managed-test", "--owned"
     )
     Clear-LeaseState $userRoot
+    $preStatus = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
+    $requiresNewProcess = [bool]($ownership -and $ownership.running -and $ownership.owned)
+    $targetPostcondition = $readiness
+    $explicitCoreFingerprint = Get-Value $values "--required-core-fingerprint"
+    if (-not [string]::IsNullOrWhiteSpace($explicitCoreFingerprint) -and
+        $explicitCoreFingerprint -notmatch '^[A-Fa-f0-9]{64}$') {
+        $script:ExitCode = 3
+        return New-ErrorResult "required_core_fingerprint_invalid" "The required core fingerprint must be a SHA-256 value."
+    }
+    $corePath = Join-Path $bridgeRoot "1.6\Assemblies\RimWorldDevBridge.dll"
+    $localCoreFingerprint = if (Test-Path -LiteralPath $corePath -PathType Leaf) {
+        (Get-FileHash -LiteralPath $corePath -Algorithm SHA256).Hash
+    } else { "" }
+    $requiredCoreFingerprint = if (-not [string]::IsNullOrWhiteSpace($explicitCoreFingerprint)) {
+        $explicitCoreFingerprint.ToUpperInvariant()
+    } elseif (-not [string]::IsNullOrWhiteSpace($localCoreFingerprint)) {
+        $localCoreFingerprint
+    } elseif ($preStatus -and -not [string]::IsNullOrWhiteSpace([string]$preStatus.coreFingerprint)) {
+        [string]$preStatus.coreFingerprint
+    } else { "" }
     $requestValues = @(
         "--bridge-root", $bridgeRoot, "--user-root", $userRoot,
         "--agent-id", $agent.value, "--package-id", (Get-Value $values "--package-id" "Lan.RimWorldDevBridge"),
@@ -1482,6 +1502,20 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         "--max-launch-attempts", (Get-Value $values "--max-launch-attempts" "2"),
         "--launch-backoff-ms", (Get-Value $values "--launch-backoff-ms" "500")
     )
+    if (-not [string]::IsNullOrWhiteSpace($requiredCoreFingerprint)) {
+        $requestValues += @("--required-core-fingerprint", $requiredCoreFingerprint)
+    }
+    $requestValues += @("--target-postcondition", $targetPostcondition, "--allow-supersede")
+    if ($requiresNewProcess) { $requestValues += "--requires-new-process" }
+    if ($ownedProcessId -gt 0) { $requestValues += @("--requested-pid", [string]$ownedProcessId) }
+    if ($preStatus -and $preStatus.available) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$preStatus.session)) {
+            $requestValues += @("--requested-session-id", [string]$preStatus.session)
+        }
+        if ([long]$preStatus.lifecycleGeneration -gt 0) {
+            $requestValues += @("--requested-lifecycle-generation", [string]$preStatus.lifecycleGeneration)
+        }
+    }
     if (Has-Flag $values "--keep-running") { $requestValues += "--keep-running" }
     $ensureValues = @($launchValues + $requestValues)
     $ensure = Invoke-Coordinator "ensure" $ensureValues
