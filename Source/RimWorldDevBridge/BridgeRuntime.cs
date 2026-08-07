@@ -179,11 +179,12 @@ namespace RimWorldDevBridge
                     current != null && active,
                     current != null && active && transportReady,
                     current == null ? 0 : current.Generation,
-                    current == null ? 0 : Math.Max(0, Volatile.Read(ref current.ActiveClients)),
-                    Settings.ConnectedClientLimit,
-                    Volatile.Read(ref port),
-                    current?.Token ?? string.Empty,
-                    context, Settings.RemoteMutationEnabled, confirmation);
+                     current == null ? 0 : Math.Max(0, Volatile.Read(ref current.ActiveClients)),
+                     Settings.ConnectedClientLimit,
+                     Volatile.Read(ref port),
+                     current?.Token ?? string.Empty,
+                     Interlocked.Read(ref gameTransitionSequence),
+                     context, Settings.RemoteMutationEnabled, confirmation);
             }
         }
 
@@ -828,13 +829,14 @@ namespace RimWorldDevBridge
             internal readonly int ConnectedClientLimit;
             internal readonly int Port;
             internal readonly string TransportToken;
+            internal readonly long LifecycleGeneration;
             internal readonly BridgeSessionContextSnapshot Context;
             internal readonly bool RemoteMutationEnabled;
             internal readonly BridgeMutationConfirmationSnapshot MutationConfirmation;
 
             internal BridgeRuntimeStateSnapshot(long version, bool transportActive, bool transportReady,
                 int transportGeneration, int connectedClients, int connectedClientLimit, int port,
-                string transportToken, BridgeSessionContextSnapshot context, bool remoteMutationEnabled,
+                string transportToken, long lifecycleGeneration, BridgeSessionContextSnapshot context, bool remoteMutationEnabled,
                 BridgeMutationConfirmationSnapshot mutationConfirmation)
             {
                 Version = version;
@@ -845,6 +847,7 @@ namespace RimWorldDevBridge
                 ConnectedClientLimit = connectedClientLimit;
                 Port = port;
                 TransportToken = transportToken ?? string.Empty;
+                LifecycleGeneration = lifecycleGeneration;
                 Context = context;
                 RemoteMutationEnabled = remoteMutationEnabled;
                 MutationConfirmation = mutationConfirmation;

@@ -161,7 +161,9 @@ public sealed class BridgeMcpTools
         return _client.InvokeAsync("restart", new[]
         {
             "ensure", "--readiness=bridge", "--save-policy=none", "--keep-running",
-            $"--startup-timeout-ms={timeoutMs}", $"--progress-interval-ms=2000",
+            $"--startup-timeout-ms={timeoutMs}", $"--timeout-ms={timeoutMs}",
+            "--target-postcondition=bridge", "--requires-new-process", "--allow-supersede",
+            $"--progress-interval-ms=2000",
             $"--max-launch-attempts={maxLaunchAttempts}", $"--launch-backoff-ms={launchBackoffMs}"
         }, correlation, timeoutMs, cancellationToken);
     }

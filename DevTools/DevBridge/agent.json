@@ -38,6 +38,14 @@
     "maxLaunchAttemptsArgument": "--max-launch-attempts",
     "launchBackoffArgument": "--launch-backoff-ms",
     "deadManagedProcessPolicy": "verify identity, clear stale ownership, and retry within bounded limits; never return USER_RESTART_REQUIRED for a dead coordinator-owned PID",
+    "restartCoalescing": {
+      "requiresCompatiblePostcondition": true,
+      "requiredIdentity": ["pid", "session", "lifecycleGeneration", "coreFingerprint", "adapterFingerprint"],
+      "requiresForwardProgress": true,
+      "staleWaitingForGameWatchdog": true,
+      "allowsAuthorizedSupersession": true,
+      "requiresFreshContextBeforeReady": true
+    },
     "failureReasons": [
       "activation_in_progress",
       "activation_timeout",

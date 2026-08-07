@@ -309,3 +309,9 @@ Every core edit must update `BRIDGE_MANIFEST.txt`, add a compact `BRIDGE_CHANGEL
 and restart RimWorld. Adapter-only changes use a unique generation plus manifest and can be reloaded
 without restarting. Gameplay assemblies, defs, Harmony patches, and serialized types still require
 a normal restart.
+
+Restart coalescing is postcondition-aware. Compatible cycles must match readiness, save policy,
+requested assembly/build identity, restart-reason category, and requested PID/session/lifecycle
+generation while making bounded progress. A new-process or new-assembly request cannot succeed by
+retaining the old PID or session. Stale `WAITING_FOR_GAME` cycles are watchdogged and may be
+superseded atomically; their waiters follow the replacement cycle and receive fresh context.

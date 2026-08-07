@@ -13,6 +13,7 @@ $coordinatorRoot = Join-Path $root 'coordinator'
 [IO.Directory]::CreateDirectory($coordinatorRoot) | Out-Null
 $processIds = New-Object System.Collections.Generic.List[int]
 $serverIds = New-Object System.Collections.Generic.List[int]
+$clientIds = New-Object System.Collections.Generic.List[int]
 
 function Start-CoordinatorServer([string]$root, [string]$path = $CoordinatorPath) {
     $server = Start-Process -FilePath $path -ArgumentList @('--serve', '--root', $root,
@@ -66,16 +67,38 @@ try {
         '--timeout-ms' '3000' '--owned' 2>&1 | Out-String
     $failedEnsureJson = $failedEnsure.Trim() | ConvertFrom-Json
     if ([string]::IsNullOrWhiteSpace($failedEnsureJson.Ticket)) { throw "failed-game ensure returned no ticket: $failedEnsure" }
-    $failedWait = & $CoordinatorPath wait '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
-        '--ticket' $failedEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
-    $failedWaitJson = $failedWait.Trim() | ConvertFrom-Json
-    if ($failedWaitJson.Phase -ne 'FAILED' -or $failedWaitJson.Error -ne 'managed_launch_failed' -or
-        [string]$failedWaitJson.Json -notmatch 'managed_process_exited_before_ready') {
-        throw "failed-game exit was not classified safely: $failedWait"
+    $waitOnePath = Join-Path $failedRoot 'wait-one.json'
+    $waitTwoPath = Join-Path $failedRoot 'wait-two.json'
+    $waitOneError = Join-Path $failedRoot 'wait-one.err'
+    $waitTwoError = Join-Path $failedRoot 'wait-two.err'
+    $waitArguments = @('wait', '--root', $failedRoot, '--user-root', $userRoot,
+        '--bridge-root', (Split-Path -Parent $PSScriptRoot), '--ticket', $failedEnsureJson.Ticket,
+        '--timeout-ms', '10000')
+    $waitOne = Start-Process -FilePath $CoordinatorPath -ArgumentList $waitArguments -RedirectStandardOutput $waitOnePath `
+        -RedirectStandardError $waitOneError -WindowStyle Hidden -PassThru
+    $waitTwo = Start-Process -FilePath $CoordinatorPath -ArgumentList $waitArguments -RedirectStandardOutput $waitTwoPath `
+        -RedirectStandardError $waitTwoError -WindowStyle Hidden -PassThru
+    $clientIds.Add($waitOne.Id)
+    $clientIds.Add($waitTwo.Id)
+    if (-not $waitOne.WaitForExit(30000) -or -not $waitTwo.WaitForExit(30000)) {
+        throw 'concurrent failed-game waiters exceeded the bounded wait'
     }
-    $failedTicket = $failedWaitJson.Json | ConvertFrom-Json
+    $failedWaitJson = @(
+        (Get-Content -LiteralPath $waitOnePath -Raw | ConvertFrom-Json),
+        (Get-Content -LiteralPath $waitTwoPath -Raw | ConvertFrom-Json)
+    )
+    foreach ($waitResult in $failedWaitJson) {
+        if ($waitResult.Phase -ne 'FAILED' -or $waitResult.Error -ne 'managed_launch_failed' -or
+            [string]$waitResult.Json -notmatch 'managed_process_exited_before_ready') {
+            throw ('concurrent failed-game wait was not classified safely: {0}' -f ($waitResult | ConvertTo-Json -Compress))
+        }
+    }
+    if ($failedWaitJson[0].Ticket -ne $failedWaitJson[1].Ticket) {
+        throw 'concurrent failed-game waiters did not follow the same ticket'
+    }
+    $failedTicket = $failedWaitJson[0].Json | ConvertFrom-Json
     if ([string]$failedTicket.Completion -notmatch 'exitCode=7') {
-        throw "failed-game diagnostics omitted the observed exit code: $failedWait"
+        throw ('failed-game diagnostics omitted the observed exit code: {0}' -f ($failedWaitJson[0] | ConvertTo-Json -Compress))
     }
 
     $retryRoot = Join-Path $root 'retry-game'
@@ -163,6 +186,7 @@ try {
 }
 finally {
     foreach ($processId in $processIds) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
+    foreach ($clientId in $clientIds) { Stop-Process -Id $clientId -Force -ErrorAction SilentlyContinue }
     foreach ($serverId in $serverIds) { Stop-Process -Id $serverId -Force -ErrorAction SilentlyContinue }
     try {
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |

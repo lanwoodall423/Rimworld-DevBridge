@@ -5,6 +5,8 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Net.Sockets;
+using System.Globalization;
+using System.Reflection;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Security.AccessControl;
@@ -44,6 +46,12 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 23)] public string UserDataRoot;
         [DataMember(Order = 24)] public int MaxLaunchAttempts = 2;
         [DataMember(Order = 25)] public int LaunchBackoffMs = 500;
+        [DataMember(Order = 26)] public string TargetPostcondition;
+        [DataMember(Order = 27)] public bool RequiresNewProcess;
+        [DataMember(Order = 28)] public long RequestedLifecycleGeneration;
+        [DataMember(Order = 29)] public string RequestedPid;
+        [DataMember(Order = 30)] public string RequestedSessionId;
+        [DataMember(Order = 31)] public bool AllowSupersede;
     }
 
     [DataContract]
@@ -153,7 +161,13 @@ namespace RimWorldDevBridge.RestartCoordinator
                 LaunchProfile = Get(options, "launch-profile"),
                 UserDataRoot = Get(options, "user-data-root"),
                 MaxLaunchAttempts = ParseInt(Get(options, "max-launch-attempts", "2"), 2),
-                LaunchBackoffMs = ParseInt(Get(options, "launch-backoff-ms", "500"), 500)
+                LaunchBackoffMs = ParseInt(Get(options, "launch-backoff-ms", "500"), 500),
+                TargetPostcondition = Get(options, "target-postcondition"),
+                RequiresNewProcess = options.ContainsKey("requires-new-process"),
+                RequestedLifecycleGeneration = ParseLong(Get(options, "requested-lifecycle-generation", "0"), 0),
+                RequestedPid = Get(options, "requested-pid"),
+                RequestedSessionId = Get(options, "requested-session-id"),
+                AllowSupersede = options.ContainsKey("allow-supersede")
             };
         }
 
@@ -190,6 +204,12 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             int result;
             return int.TryParse(value, out result) ? result : fallback;
+        }
+
+        private static long ParseLong(string value, long fallback)
+        {
+            long result;
+            return long.TryParse(value, out result) ? result : fallback;
         }
 
         internal static string Json(object value)
@@ -320,17 +340,25 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse Request(CoordinatorMessage message)
         {
-            return Request(message, false);
+            return Request(message, false, message.RequiresNewProcess);
         }
 
         private CoordinatorResponse Request(CoordinatorMessage message, bool processAlreadyStarted)
+        {
+            return Request(message, processAlreadyStarted, message.RequiresNewProcess);
+        }
+
+        private CoordinatorResponse Request(CoordinatorMessage message, bool processAlreadyStarted,
+            bool requiresNewProcess)
         {
             bool owned = launchRecord != null && launchRecord.Owned;
             BridgeRestartTicketRecord ticket = machine.Request(message.AgentId, message.PackageId,
                 message.Reason, message.Readiness, message.SavePolicy, message.RequiredCoreFingerprint,
                 message.RequiredAdapterFingerprint, owned, message.LiveConfirmedAuthorized,
                 message.LiveConfirmed, processAlreadyStarted, message.MaxLaunchAttempts,
-                message.LaunchBackoffMs);
+                message.LaunchBackoffMs, message.TargetPostcondition, requiresNewProcess,
+                message.RequestedLifecycleGeneration, message.RequestedPid, message.RequestedSessionId,
+                message.AllowSupersede, message.TimeoutMs);
             Persist("request " + ticket.Ticket);
             return TicketResponse(ticket);
         }
@@ -416,9 +444,24 @@ namespace RimWorldDevBridge.RestartCoordinator
                 }
                 CoordinatorResponse launched = Launch(message);
                 if (!launched.Ok) return launched;
-                return Request(message, true);
+                return Request(message, true, false);
             }
-            return Request(message);
+            bool processAlreadyStarted = ActiveCycleUsesCurrentLaunch();
+            bool requiresNewProcess = message.RequiresNewProcess || !processAlreadyStarted;
+            return Request(message, processAlreadyStarted, requiresNewProcess);
+        }
+
+        private bool ActiveCycleUsesCurrentLaunch()
+        {
+            if (launchRecord == null || launchRecord.ProcessId <= 0) return false;
+            string pid = launchRecord.ProcessId.ToString(CultureInfo.InvariantCulture);
+            return machine.Snapshot.Cycles.Any(c =>
+            {
+                BridgeRestartPhase phase = ParsePhase(c.Phase);
+                return phase != BridgeRestartPhase.READY && phase != BridgeRestartPhase.FAILED &&
+                    phase != BridgeRestartPhase.USER_RESTART_REQUIRED &&
+                    string.Equals(c.NewPid, pid, StringComparison.Ordinal);
+            });
         }
 
         private CoordinatorResponse Register(CoordinatorMessage message)
@@ -500,7 +543,8 @@ namespace RimWorldDevBridge.RestartCoordinator
                     if (string.IsNullOrEmpty(cycle.OldPid) && string.IsNullOrEmpty(cycle.OldBootId))
                     {
                         machine.SetCycleIdentity(cycle.CycleId, Get(beforeDrain, "processId"),
-                            Get(beforeDrain, "bootId"));
+                            Get(beforeDrain, "bootId"), Get(beforeDrain, "session"),
+                            ParseLong(Get(beforeDrain, "lifecycleGeneration"), 0));
                         cycle = machine.Cycle(cycle.CycleId);
                     }
                     string observedPid = Get(beforeDrain, "processId");
@@ -562,8 +606,13 @@ namespace RimWorldDevBridge.RestartCoordinator
                         HandleManagedProcessExit(cycle);
                         break;
                     }
-                    if (ReadyForBridge(cycle))
+                    if (ReadyForBridge(cycle, out Dictionary<string, string> bridgeStatus))
                     {
+                        machine.SetReadyContext(cycle.CycleId, Get(bridgeStatus, "processId"),
+                            Get(bridgeStatus, "bootId"), Get(bridgeStatus, "session"),
+                            Get(bridgeStatus, "transportGeneration"), Get(bridgeStatus, "coreFingerprint"),
+                            cycle.RequiredAdapterFingerprint,
+                            ParseLong(Get(bridgeStatus, "lifecycleGeneration"), 0));
                         if (string.Equals(cycle.Readiness, "bridge", StringComparison.OrdinalIgnoreCase))
                         {
                             machine.SetPhase(cycle.CycleId, BridgeRestartPhase.READY,
@@ -578,6 +627,20 @@ namespace RimWorldDevBridge.RestartCoordinator
                     }
                     break;
                 case BridgeRestartPhase.WAITING_FOR_GAME:
+                    if (machine.IsProgressExpired(cycle.CycleId, DateTime.UtcNow))
+                    {
+                        if (!TryGetOwnedProcess(out Process stalledProcess))
+                        {
+                            HandleManagedProcessExit(cycle);
+                        }
+                        else
+                        {
+                            machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STOPPING,
+                                "bridge_handshake_timeout;managed_launch_retrying;wait_for_game_timeout");
+                            Persist("waiting for game watchdog stopping owned process");
+                        }
+                        break;
+                    }
                     if (ReadyForGame(cycle))
                     {
                         machine.SetPhase(cycle.CycleId, BridgeRestartPhase.READY,
@@ -609,16 +672,18 @@ namespace RimWorldDevBridge.RestartCoordinator
                     if (!process.WaitForExit(15000) && forceKillTestOnly) process.Kill();
                     if (!process.HasExited)
                     {
-                        machine.Fail(cycle.CycleId, "owned_process_did_not_exit_without_force_kill");
+                        machine.Fail(cycle.CycleId, "managed_launch_failed;managed_process_stop_timeout");
                         Persist("stop failed");
                         return;
                     }
                 }
+                ClearLaunchProcessIdentity();
                 machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STARTING);
                 Persist("stopped cycle=" + cycle.CycleId);
             }
             catch (ArgumentException)
             {
+                ClearLaunchProcessIdentity();
                 machine.SetPhase(cycle.CycleId, BridgeRestartPhase.STARTING);
                 Persist("owned process exited before stop");
             }
@@ -795,7 +860,11 @@ namespace RimWorldDevBridge.RestartCoordinator
                 item.Phase != BridgeRestartPhase.USER_RESTART_REQUIRED.ToString());
             if (launchRecord.ProcessId <= 0)
             {
-                if (active != null && active.Phase == BridgeRestartPhase.WAITING_FOR_BRIDGE.ToString())
+                // A retry deliberately clears the PID while waiting for its backoff. Do not
+                // reinterpret that expected gap as another exit on every status poll.
+                if (active != null && active.Phase == BridgeRestartPhase.STARTING.ToString()) return;
+                if (active != null && (active.Phase == BridgeRestartPhase.WAITING_FOR_BRIDGE.ToString() ||
+                    active.Phase == BridgeRestartPhase.WAITING_FOR_GAME.ToString()))
                     HandleManagedProcessExit(active);
                 return;
             }
@@ -818,7 +887,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 ClearLaunchProcessIdentity();
                 launchRecord.Owned = false;
                 string diagnostics = "attached_live_process_requires_operator;pid_reuse_or_external_process";
-                if (active != null) machine.Fail(active.CycleId, diagnostics);
+                if (active != null) machine.SetPhase(active.CycleId, BridgeRestartPhase.USER_RESTART_REQUIRED, diagnostics);
                 machine.SetLastError(diagnostics);
                 Persist("live ownership conflict recovered");
                 return;
@@ -926,9 +995,9 @@ namespace RimWorldDevBridge.RestartCoordinator
                 return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(value))).Replace("-", string.Empty);
         }
 
-        private bool ReadyForBridge(BridgeRestartCycleRecord cycle)
+        private bool ReadyForBridge(BridgeRestartCycleRecord cycle, out Dictionary<string, string> status)
         {
-            Dictionary<string, string> status = ReadStatus();
+            status = ReadStatus();
             if (!string.Equals(Get(status, "bridge"), "ON", StringComparison.OrdinalIgnoreCase)) return false;
             if (launchRecord != null && launchRecord.ProcessId > 0 &&
                 Get(status, "processId") != launchRecord.ProcessId.ToString()) return false;
@@ -937,9 +1006,46 @@ namespace RimWorldDevBridge.RestartCoordinator
             if (!string.IsNullOrEmpty(cycle.NewPid) &&
                 !string.Equals(Get(status, "processId"), cycle.NewPid, StringComparison.OrdinalIgnoreCase)) return false;
             if (!string.IsNullOrEmpty(cycle.RequiredCoreFingerprint) &&
-                !string.Equals(Get(status, "coreFingerprint"), cycle.RequiredCoreFingerprint,
-                    StringComparison.OrdinalIgnoreCase)) return false;
+                !CoreFingerprintMatches(cycle.RequiredCoreFingerprint, Get(status, "coreFingerprint"))) return false;
+            if (!ReplacementIdentitySatisfied(cycle, status)) return false;
             return true;
+        }
+
+        private bool CoreFingerprintMatches(string required, string reported)
+        {
+            if (string.IsNullOrEmpty(required) || string.IsNullOrEmpty(reported)) return false;
+            if (string.Equals(required, reported, StringComparison.OrdinalIgnoreCase)) return true;
+            string path = Path.Combine(bridgeRoot, "1.6", "Assemblies", "RimWorldDevBridge.dll");
+            if (!File.Exists(path)) return false;
+            try
+            {
+                string fileHash;
+                using (SHA256 sha = SHA256.Create())
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                    fileHash = string.Concat(sha.ComputeHash(stream).Select(value => value.ToString("X2")));
+                string moduleId = Assembly.ReflectionOnlyLoadFrom(path).ManifestModule.ModuleVersionId.ToString("N");
+                return (string.Equals(required, fileHash, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(reported, moduleId, StringComparison.OrdinalIgnoreCase)) ||
+                    (string.Equals(required, moduleId, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(reported, fileHash, StringComparison.OrdinalIgnoreCase));
+            }
+            catch { return false; }
+        }
+
+        private static bool ReplacementIdentitySatisfied(BridgeRestartCycleRecord cycle,
+            Dictionary<string, string> status)
+        {
+            if (!cycle.RequiresNewProcess) return true;
+            if (!string.IsNullOrEmpty(cycle.OldPid) &&
+                string.Equals(Get(status, "processId"), cycle.OldPid, StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.IsNullOrEmpty(cycle.OldBootId) &&
+                string.Equals(Get(status, "bootId"), cycle.OldBootId, StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.IsNullOrEmpty(cycle.OldSessionId) &&
+                string.Equals(Get(status, "session"), cycle.OldSessionId, StringComparison.OrdinalIgnoreCase)) return false;
+            if (cycle.OldLifecycleGeneration > 0 &&
+                ParseLong(Get(status, "lifecycleGeneration"), 0) <= cycle.OldLifecycleGeneration) return false;
+            return !string.IsNullOrEmpty(Get(status, "session"));
         }
 
         private bool ReadyForGame(BridgeRestartCycleRecord cycle)
@@ -951,9 +1057,10 @@ namespace RimWorldDevBridge.RestartCoordinator
             if (!string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint) &&
                 response.IndexOf(cycle.RequiredAdapterFingerprint, StringComparison.OrdinalIgnoreCase) < 0) return false;
             Dictionary<string, string> status = ReadStatus();
+            if (!ReplacementIdentitySatisfied(cycle, status)) return false;
             machine.SetReadyContext(cycle.CycleId, Get(status, "processId"), Get(status, "bootId"),
                 Get(status, "session"), Get(status, "transportGeneration"), Get(status, "coreFingerprint"),
-                cycle.RequiredAdapterFingerprint);
+                cycle.RequiredAdapterFingerprint, ParseLong(Get(status, "lifecycleGeneration"), 0));
             return true;
         }
 
@@ -1180,9 +1287,15 @@ namespace RimWorldDevBridge.RestartCoordinator
             return string.Empty;
         }
 
-        private static long ParseLong(string value)
+        private static BridgeRestartPhase ParsePhase(string value)
         {
-            return long.TryParse(value, out long parsed) ? parsed : 0L;
+            BridgeRestartPhase phase;
+            return Enum.TryParse(value, true, out phase) ? phase : BridgeRestartPhase.FAILED;
+        }
+
+        private static long ParseLong(string value, long fallback = 0L)
+        {
+            return long.TryParse(value, out long parsed) ? parsed : fallback;
         }
     }
 }

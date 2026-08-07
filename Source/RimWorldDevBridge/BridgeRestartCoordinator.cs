@@ -50,6 +50,13 @@ namespace RimWorldDevBridge
         [DataMember(Order = 18)] public string NewCoreFingerprint;
         [DataMember(Order = 19)] public string NewAdapterFingerprint;
         [DataMember(Order = 20)] public bool RequiresWriteReacquire = true;
+        [DataMember(Order = 21)] public long NewLifecycleGeneration;
+        [DataMember(Order = 22)] public string TargetPostcondition;
+        [DataMember(Order = 23)] public bool RequiresNewProcess;
+        [DataMember(Order = 24)] public long RequestedLifecycleGeneration;
+        [DataMember(Order = 25)] public string RequestedPid;
+        [DataMember(Order = 26)] public string RequestedSessionId;
+        [DataMember(Order = 27)] public string ReplacementCycleId;
     }
 
     [DataContract]
@@ -81,6 +88,19 @@ namespace RimWorldDevBridge
         [DataMember(Order = 24)] public int MaxLaunchAttempts = 2;
         [DataMember(Order = 25)] public int LaunchBackoffMs = 500;
         [DataMember(Order = 26)] public DateTime NextLaunchUtc;
+        [DataMember(Order = 27)] public string TargetPostcondition;
+        [DataMember(Order = 28)] public bool RequiresNewProcess;
+        [DataMember(Order = 29)] public long RequestedLifecycleGeneration;
+        [DataMember(Order = 30)] public string RequestedPid;
+        [DataMember(Order = 31)] public string RequestedSessionId;
+        [DataMember(Order = 32)] public string RestartReason;
+        [DataMember(Order = 33)] public DateTime ProgressDeadlineUtc;
+        [DataMember(Order = 34)] public DateTime LastProgressUtc;
+        [DataMember(Order = 35)] public string SupersededByCycleId;
+        [DataMember(Order = 36)] public long NewLifecycleGeneration;
+        [DataMember(Order = 37)] public string OldSessionId;
+        [DataMember(Order = 38)] public long OldLifecycleGeneration;
+        [DataMember(Order = 39)] public int ProgressTimeoutMs = 120000;
     }
 
     [DataContract]
@@ -111,6 +131,17 @@ namespace RimWorldDevBridge
             if (state.Cycles == null) state.Cycles = new List<BridgeRestartCycleRecord>();
             if (state.Tickets == null) state.Tickets = new List<BridgeRestartTicketRecord>();
             if (string.IsNullOrEmpty(state.InstanceId)) state.InstanceId = "rc-" + Guid.NewGuid().ToString("N");
+            DateTime now = DateTime.UtcNow;
+            foreach (BridgeRestartCycleRecord cycle in state.Cycles)
+            {
+                if (string.IsNullOrEmpty(cycle.TargetPostcondition)) cycle.TargetPostcondition = ReadinessValue(cycle.Readiness);
+                if (string.IsNullOrEmpty(cycle.RestartReason)) cycle.RestartReason = "runtime-verification";
+                if (cycle.ProgressTimeoutMs <= 0) cycle.ProgressTimeoutMs = 120000;
+                if (cycle.LastProgressUtc == default(DateTime)) cycle.LastProgressUtc =
+                    cycle.UpdatedUtc == default(DateTime) ? now : cycle.UpdatedUtc;
+                if (cycle.ProgressDeadlineUtc == default(DateTime)) cycle.ProgressDeadlineUtc =
+                    cycle.LastProgressUtc.AddMilliseconds(ClampProgressTimeout(cycle.ProgressTimeoutMs));
+            }
         }
 
         public BridgeRestartCoordinatorState Snapshot
@@ -122,48 +153,97 @@ namespace RimWorldDevBridge
             string readiness, string savePolicy, string requiredCoreFingerprint,
             string requiredAdapterFingerprint, bool ownedSandbox, bool liveConfirmedAuthorized,
             bool liveConfirmed = false, bool processAlreadyStarted = false,
-            int maxLaunchAttempts = 2, int launchBackoffMs = 500)
+            int maxLaunchAttempts = 2, int launchBackoffMs = 500,
+            string targetPostcondition = null, bool requiresNewProcess = false,
+            long requestedLifecycleGeneration = 0, string requestedPid = null,
+            string requestedSessionId = null, bool allowSupersede = false,
+            int progressTimeoutMs = 120000)
         {
             lock (gate)
             {
                 ValidateRequest(readiness, savePolicy);
+                string target = ReadinessValue(targetPostcondition) ?? ReadinessValue(readiness);
+                string safeReason = SafeReason(reason);
+                int boundedProgressTimeout = ClampProgressTimeout(progressTimeoutMs);
                 if (liveConfirmed && !liveConfirmedAuthorized)
                 {
                     BridgeRestartTicketRecord unauthorized = NewTicket(null, agentId, packageId, reason,
                         readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
-                        BridgeRestartPhase.FAILED, "live_confirmed_restart_authorization_required");
+                        BridgeRestartPhase.FAILED, "live_confirmed_restart_authorization_required",
+                        target, requiresNewProcess, requestedLifecycleGeneration, requestedPid,
+                        requestedSessionId);
                     state.Tickets.Add(unauthorized);
                     Touch();
                     return Clone(unauthorized);
                 }
 
                 BridgeRestartCycleRecord cycle = state.Cycles.LastOrDefault(item =>
-                    IsOpenCompatible(item) && Compatible(item, readiness, savePolicy,
-                        requiredCoreFingerprint, requiredAdapterFingerprint));
+                    IsOpenCompatible(item) && Compatible(item, target, savePolicy,
+                        requiredCoreFingerprint, requiredAdapterFingerprint, safeReason,
+                        requiresNewProcess, processAlreadyStarted, requestedPid,
+                        requestedSessionId, requestedLifecycleGeneration));
                 if (cycle == null)
                 {
+                    BridgeRestartCycleRecord active = state.Cycles.LastOrDefault(IsOpenCycle);
+                    BridgeRestartCycleRecord stale = active != null && IsProgressStale(active) ? active : null;
+                    if (stale != null && (!allowSupersede || !ownedSandbox))
+                    {
+                        BridgeRestartTicketRecord staleBlocked = NewTicket(null, agentId, packageId, reason,
+                            readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
+                            BridgeRestartPhase.FAILED,
+                            ownedSandbox ? "restart_cycle_stale_in_progress" :
+                                "attached_live_process_requires_operator",
+                            target, requiresNewProcess, requestedLifecycleGeneration, requestedPid,
+                            requestedSessionId);
+                        state.Tickets.Add(staleBlocked);
+                        Touch();
+                        return Clone(staleBlocked);
+                    }
+                    if (active != null && stale == null)
+                    {
+                        BridgeRestartTicketRecord blocked = NewTicket(null, agentId, packageId, reason,
+                            readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
+                            BridgeRestartPhase.FAILED, "restart_cycle_incompatible_in_progress",
+                            target, requiresNewProcess, requestedLifecycleGeneration, requestedPid,
+                            requestedSessionId);
+                        state.Tickets.Add(blocked);
+                        Touch();
+                        return Clone(blocked);
+                    }
                     cycle = new BridgeRestartCycleRecord
                     {
                         CycleId = "cycle-" + Guid.NewGuid().ToString("N"),
                         Readiness = ReadinessValue(readiness),
+                        TargetPostcondition = target,
                         SavePolicy = savePolicy,
                         RequiredCoreFingerprint = requiredCoreFingerprint ?? string.Empty,
                         RequiredAdapterFingerprint = requiredAdapterFingerprint ?? string.Empty,
-                         Phase = (processAlreadyStarted ? BridgeRestartPhase.WAITING_FOR_BRIDGE :
-                              BridgeRestartPhase.REQUESTED).ToString(),
-                         OwnedProcess = ownedSandbox,
-                         LaunchAttempts = processAlreadyStarted ? 1 : 0,
-                         MaxLaunchAttempts = ClampAttempts(maxLaunchAttempts),
-                         LaunchBackoffMs = ClampBackoff(launchBackoffMs),
-                         LiveConfirmed = liveConfirmed,
+                        Phase = (processAlreadyStarted ? BridgeRestartPhase.WAITING_FOR_BRIDGE :
+                            BridgeRestartPhase.REQUESTED).ToString(),
+                        OwnedProcess = ownedSandbox,
+                        RequiresNewProcess = requiresNewProcess && !processAlreadyStarted,
+                        RequestedLifecycleGeneration = requestedLifecycleGeneration,
+                        RequestedPid = Bound(requestedPid, 32),
+                        RequestedSessionId = Bound(requestedSessionId, 128),
+                        RestartReason = safeReason,
+                        LaunchAttempts = processAlreadyStarted ? 1 : 0,
+                        MaxLaunchAttempts = ClampAttempts(maxLaunchAttempts),
+                        LaunchBackoffMs = ClampBackoff(launchBackoffMs),
+                        ProgressTimeoutMs = boundedProgressTimeout,
+                        ProgressDeadlineUtc = DateTime.UtcNow.AddMilliseconds(boundedProgressTimeout),
+                        LastProgressUtc = DateTime.UtcNow,
+                        LiveConfirmed = liveConfirmed,
                         CreatedUtc = DateTime.UtcNow,
                         UpdatedUtc = DateTime.UtcNow
                     };
                     state.Cycles.Add(cycle);
+                    if (stale != null && allowSupersede && ownedSandbox)
+                        Supersede(stale, cycle);
                 }
                 else
                 {
-                    cycle.Readiness = MaxReadiness(cycle.Readiness, ReadinessValue(readiness));
+                    cycle.Readiness = MaxReadiness(cycle.Readiness, target);
+                    cycle.TargetPostcondition = MaxReadiness(cycle.TargetPostcondition, target);
                     if (string.IsNullOrEmpty(cycle.RequiredCoreFingerprint))
                         cycle.RequiredCoreFingerprint = requiredCoreFingerprint ?? string.Empty;
                     if (string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint))
@@ -172,7 +252,8 @@ namespace RimWorldDevBridge
                 BridgeRestartPhase ticketPhase = ParsePhase(cycle.Phase);
                 BridgeRestartTicketRecord ticket = NewTicket(cycle.CycleId, agentId, packageId, reason,
                     readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
-                    ticketPhase, "restart_requested");
+                    ticketPhase, "restart_requested", target, cycle.RequiresNewProcess || requiresNewProcess,
+                    requestedLifecycleGeneration, requestedPid, requestedSessionId);
                 cycle.TicketIds.Add(ticket.Ticket);
                 state.Tickets.Add(ticket);
                 cycle.UpdatedUtc = DateTime.UtcNow;
@@ -194,6 +275,11 @@ namespace RimWorldDevBridge
                 if (barrierId > 0) cycle.BarrierId = barrierId;
                 cycle.Diagnostics = Bound(diagnostics, 512);
                 cycle.UpdatedUtc = DateTime.UtcNow;
+                cycle.LastProgressUtc = cycle.UpdatedUtc;
+                if (cycle.ProgressTimeoutMs <= 0) cycle.ProgressTimeoutMs = 120000;
+                if (phase == BridgeRestartPhase.STARTING || phase == BridgeRestartPhase.WAITING_FOR_BRIDGE ||
+                    phase == BridgeRestartPhase.WAITING_FOR_GAME)
+                    cycle.ProgressDeadlineUtc = cycle.UpdatedUtc.AddMilliseconds(ClampProgressTimeout(cycle.ProgressTimeoutMs));
                 state.Phase = cycle.Phase;
                 foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == cycleId))
                 {
@@ -221,6 +307,16 @@ namespace RimWorldDevBridge
                 cycle.UpdatedUtc = DateTime.UtcNow;
                 Touch();
                 return Clone(state);
+            }
+        }
+
+        public bool IsProgressExpired(string cycleId, DateTime nowUtc)
+        {
+            lock (gate)
+            {
+                BridgeRestartCycleRecord cycle = FindCycle(cycleId);
+                return cycle != null && cycle.ProgressDeadlineUtc != default(DateTime) &&
+                    nowUtc >= cycle.ProgressDeadlineUtc;
             }
         }
 
@@ -263,6 +359,8 @@ namespace RimWorldDevBridge
                 cycle.NextLaunchUtc = nextLaunchUtc;
                 cycle.Phase = BridgeRestartPhase.STARTING.ToString();
                 cycle.Diagnostics = Bound(diagnostics, 512);
+                cycle.LastProgressUtc = DateTime.UtcNow;
+                cycle.ProgressDeadlineUtc = cycle.LastProgressUtc.AddMilliseconds(ClampProgressTimeout(cycle.ProgressTimeoutMs));
                 state.Phase = cycle.Phase;
                 foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == cycleId))
                 {
@@ -320,7 +418,8 @@ namespace RimWorldDevBridge
             }
         }
 
-        public void SetCycleIdentity(string cycleId, string oldPid, string oldBootId)
+        public void SetCycleIdentity(string cycleId, string oldPid, string oldBootId,
+            string oldSessionId = null, long oldLifecycleGeneration = 0)
         {
             lock (gate)
             {
@@ -328,12 +427,15 @@ namespace RimWorldDevBridge
                 if (cycle == null) return;
                 cycle.OldPid = Bound(oldPid, 32);
                 cycle.OldBootId = Bound(oldBootId, 128);
+                cycle.OldSessionId = Bound(oldSessionId, 128);
+                cycle.OldLifecycleGeneration = oldLifecycleGeneration;
                 Touch();
             }
         }
 
         public void SetReadyContext(string cycleId, string pid, string bootId, string session,
-            string transportGeneration, string coreFingerprint, string adapterFingerprint)
+            string transportGeneration, string coreFingerprint, string adapterFingerprint,
+            long lifecycleGeneration = 0)
         {
             lock (gate)
             {
@@ -345,6 +447,7 @@ namespace RimWorldDevBridge
                 cycle.NewTransportGeneration = Bound(transportGeneration, 32);
                 cycle.NewCoreFingerprint = Bound(coreFingerprint, 128);
                 cycle.NewAdapterFingerprint = Bound(adapterFingerprint, 128);
+                cycle.NewLifecycleGeneration = lifecycleGeneration;
                 foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == cycleId))
                 {
                     ticket.NewPid = cycle.NewPid;
@@ -353,6 +456,7 @@ namespace RimWorldDevBridge
                     ticket.NewTransportGeneration = cycle.NewTransportGeneration;
                     ticket.NewCoreFingerprint = cycle.NewCoreFingerprint;
                     ticket.NewAdapterFingerprint = cycle.NewAdapterFingerprint;
+                    ticket.NewLifecycleGeneration = cycle.NewLifecycleGeneration;
                 }
                 Touch();
             }
@@ -465,21 +569,80 @@ namespace RimWorldDevBridge
 
         private bool IsOpenCompatible(BridgeRestartCycleRecord cycle)
         {
-            BridgeRestartPhase phase = ParsePhase(cycle.Phase);
-            if (phase == BridgeRestartPhase.READY || phase == BridgeRestartPhase.FAILED ||
-                phase == BridgeRestartPhase.USER_RESTART_REQUIRED) return false;
-            return true;
+            return IsOpenCycle(cycle) && !IsProgressStale(cycle);
         }
 
-        private static bool Compatible(BridgeRestartCycleRecord cycle, string readiness, string savePolicy,
-            string core, string adapter)
+        private static bool IsOpenCycle(BridgeRestartCycleRecord cycle)
+        {
+            BridgeRestartPhase phase = ParsePhase(cycle.Phase);
+            return phase != BridgeRestartPhase.READY && phase != BridgeRestartPhase.FAILED &&
+                phase != BridgeRestartPhase.USER_RESTART_REQUIRED;
+        }
+
+        private static bool Compatible(BridgeRestartCycleRecord cycle, string targetPostcondition,
+            string savePolicy, string core, string adapter, string reason, bool requiresNewProcess,
+            bool processAlreadyStarted, string requestedPid, string requestedSessionId,
+            long requestedLifecycleGeneration)
         {
             if (!string.Equals(cycle.SavePolicy, savePolicy, StringComparison.OrdinalIgnoreCase)) return false;
             if (!string.IsNullOrEmpty(cycle.RequiredCoreFingerprint) && !string.IsNullOrEmpty(core) &&
                 !string.Equals(cycle.RequiredCoreFingerprint, core, StringComparison.OrdinalIgnoreCase)) return false;
             if (!string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint) && !string.IsNullOrEmpty(adapter) &&
                 !string.Equals(cycle.RequiredAdapterFingerprint, adapter, StringComparison.OrdinalIgnoreCase)) return false;
+            if (ReadinessRank(cycle.TargetPostcondition ?? cycle.Readiness) < ReadinessRank(targetPostcondition)) return false;
+            bool cycleRequiresReplacement = cycle.RequiresNewProcess || IsReplacementReason(cycle.RestartReason);
+            bool requestRequiresReplacement = requiresNewProcess || IsReplacementReason(reason);
+            if (cycleRequiresReplacement != requestRequiresReplacement) return false;
+            if (cycleRequiresReplacement && !string.Equals(cycle.RestartReason ?? string.Empty,
+                reason ?? string.Empty, StringComparison.Ordinal)) return false;
+            bool replacementAlreadyStarted = cycle.RequiresNewProcess && processAlreadyStarted &&
+                !string.IsNullOrEmpty(requestedPid) &&
+                string.Equals(cycle.NewPid, requestedPid, StringComparison.Ordinal);
+            if (requiresNewProcess && !cycle.RequiresNewProcess && !replacementAlreadyStarted) return false;
+            if (!string.IsNullOrEmpty(requestedPid) && string.IsNullOrEmpty(cycle.NewPid) &&
+                !string.IsNullOrEmpty(cycle.RequestedPid) &&
+                !string.Equals(cycle.RequestedPid, requestedPid, StringComparison.Ordinal)) return false;
+            if (!string.IsNullOrEmpty(requestedSessionId) && string.IsNullOrEmpty(cycle.NewSessionId) &&
+                !string.IsNullOrEmpty(cycle.RequestedSessionId) &&
+                !string.Equals(cycle.RequestedSessionId, requestedSessionId, StringComparison.Ordinal)) return false;
+            if (requestedLifecycleGeneration > 0 && cycle.RequestedLifecycleGeneration > 0 &&
+                cycle.RequestedLifecycleGeneration != requestedLifecycleGeneration &&
+                string.IsNullOrEmpty(cycle.NewPid)) return false;
             return true;
+        }
+
+        private static bool IsProgressStale(BridgeRestartCycleRecord cycle)
+        {
+            return cycle.ProgressDeadlineUtc != default(DateTime) && DateTime.UtcNow >= cycle.ProgressDeadlineUtc;
+        }
+
+        private static bool IsReplacementReason(string reason)
+        {
+            string value = (reason ?? string.Empty).ToLowerInvariant();
+            return value.Contains("assembly") || value.Contains("replacement") ||
+                value.Contains("new process") || value.Contains("new pid") ||
+                value.Contains("new session") || value.Contains("restart-required");
+        }
+
+        private void Supersede(BridgeRestartCycleRecord oldCycle, BridgeRestartCycleRecord replacement)
+        {
+            string diagnostics = "restart_cycle_superseded;replacementCycle=" + replacement.CycleId;
+            oldCycle.SupersededByCycleId = replacement.CycleId;
+            oldCycle.Phase = BridgeRestartPhase.FAILED.ToString();
+            oldCycle.Diagnostics = Bound(diagnostics, 512);
+            oldCycle.UpdatedUtc = DateTime.UtcNow;
+            foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == oldCycle.CycleId).ToList())
+            {
+                oldCycle.TicketIds.Remove(ticket.Ticket);
+                replacement.TicketIds.Add(ticket.Ticket);
+                ticket.ReplacementCycleId = replacement.CycleId;
+                ticket.CycleId = replacement.CycleId;
+                ticket.TargetPostcondition = replacement.TargetPostcondition;
+                ticket.RequiresNewProcess = replacement.RequiresNewProcess;
+                ticket.Phase = replacement.Phase;
+                ticket.Completion = Bound(diagnostics, 512);
+                ticket.UpdatedUtc = replacement.UpdatedUtc;
+            }
         }
 
         private static string MaxReadiness(string first, string second)
@@ -496,6 +659,11 @@ namespace RimWorldDevBridge
             return 1;
         }
 
+        private static int ClampProgressTimeout(int value)
+        {
+            return Math.Max(1000, Math.Min(600000, value <= 0 ? 120000 : value));
+        }
+
         private BridgeRestartCycleRecord FindCycle(string cycleId)
         {
             return state.Cycles.FirstOrDefault(item => string.Equals(item.CycleId, cycleId,
@@ -510,7 +678,9 @@ namespace RimWorldDevBridge
 
         private static BridgeRestartTicketRecord NewTicket(string cycleId, string agentId, string packageId,
             string reason, string readiness, string savePolicy, string core, string adapter,
-            BridgeRestartPhase phase, string completion)
+            BridgeRestartPhase phase, string completion, string targetPostcondition = null,
+            bool requiresNewProcess = false, long requestedLifecycleGeneration = 0,
+            string requestedPid = null, string requestedSessionId = null)
         {
             return new BridgeRestartTicketRecord
             {
@@ -523,6 +693,11 @@ namespace RimWorldDevBridge
                 SavePolicy = savePolicy,
                 RequiredCoreFingerprint = Bound(core, 128),
                 RequiredAdapterFingerprint = Bound(adapter, 128),
+                TargetPostcondition = ReadinessValue(targetPostcondition) ?? ReadinessValue(readiness),
+                RequiresNewProcess = requiresNewProcess,
+                RequestedLifecycleGeneration = requestedLifecycleGeneration,
+                RequestedPid = Bound(requestedPid, 32),
+                RequestedSessionId = Bound(requestedSessionId, 128),
                 Phase = phase.ToString(),
                 Completion = Bound(completion, 512),
                 CreatedUtc = DateTime.UtcNow,
@@ -568,7 +743,9 @@ namespace RimWorldDevBridge
             if (from == BridgeRestartPhase.WAITING_FOR_BRIDGE &&
                 (to == BridgeRestartPhase.STARTING || to == BridgeRestartPhase.WAITING_FOR_GAME ||
                  to == BridgeRestartPhase.READY)) return true;
-            if (from == BridgeRestartPhase.WAITING_FOR_GAME && to == BridgeRestartPhase.READY) return true;
+            if (from == BridgeRestartPhase.WAITING_FOR_GAME &&
+                (to == BridgeRestartPhase.STOPPING || to == BridgeRestartPhase.STARTING ||
+                 to == BridgeRestartPhase.READY)) return true;
             return false;
         }
 

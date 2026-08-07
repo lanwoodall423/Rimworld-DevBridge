@@ -60,3 +60,7 @@ publish and current Codex configuration. MCP approval metadata is truthful: stat
 reads may be configured for zero-touch use, while activation, restart, owner validation,
 human review resolution, and any external lifecycle action retain their required approval
 or safety boundaries.
+Restart requests carry an explicit postcondition and current identity. Do not accept a coalesced
+ticket as success unless its PID, session, lifecycle generation, and required core/adapter identity
+are fresh. A stale `WAITING_FOR_GAME` cycle is bounded and may be superseded; waiters follow the
+replacement cycle. Never claim an attached process.
