@@ -142,6 +142,24 @@ The package verifier checks exact declared entries, raw ZIP paths, core identity
 forbidden artifacts, manifest declarations, and absence of external adapters. Generated output is
 ignored and must not be committed.
 
+## Optional Codex MCP Adapter
+
+The repository includes an optional external local MCP server for Codex. It is not
+embedded in RimWorld and does not replace the canonical client or coordinator:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DevTools\Build-RimWorldDevBridgeMcpServer.ps1 `
+  -OutputDirectory .\McpServerArtifact -RuntimeIdentifier win-x64
+```
+
+Use `DevTools/MCP_SERVER.md` for verified `codex mcp add`, `codex mcp list`, `/mcp`,
+project `.codex/config.toml`, enable/disable/remove, and per-tool approval examples.
+The optional server uses local STDIO only, requires no public endpoint or API key, and
+invokes only `DevTools/devbridge.ps1`. It exposes status, context, pure reads, managed
+restart, owner validation, and human-review tools; it intentionally exposes no gameplay
+mutation. MCP stdout is protocol-only and stderr is sanitized diagnostics. A real Codex
+or MCP Inspector test is unrun unless those tools and a managed instance are available.
+
 ## Troubleshooting
 
 `status_unavailable` or `bridge_not_active` means the process is absent, dormant, stale, or the

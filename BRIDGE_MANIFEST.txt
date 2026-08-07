@@ -7,6 +7,6 @@ compatibilityWrapper=DevTools/Send-RimWorldBridge.ps1
 agentGuide=DevTools/DEVBRIDGE_AGENT.md
 license=MIT
 licenseFile=LICENSE
-changes=Deferred main-thread FinalizeInit, lifecycle-generation stale-work rejection, remote mutation confirmation hardening, extracted runtime/adapter/diagnostic responsibilities, immutable query snapshots, fair scheduling, and portable Dev Bridge-only release packaging
+changes=Deferred main-thread FinalizeInit, lifecycle-generation stale-work rejection, remote mutation confirmation hardening, extracted runtime/adapter/diagnostic responsibilities, immutable query snapshots, fair scheduling, durable human work, and optional external Codex MCP adapter; portable package remains Dev Bridge-only
 remoteMutation=disabled-by-default; in-game-confirmation-required; client-context-is-intent-only
 mutationIdentity=game-process-local;save=server-observed-save-v1-digest-or-none;raw-save-metadata=never-published

@@ -74,5 +74,32 @@
       "neverControlsAttachedProcess": true,
       "neverGrantsWriteLease": true
     }
+  },
+  "mcpAdapter": {
+    "optional": true,
+    "project": "DevTools/McpServer/RimWorldDevBridge.McpServer.csproj",
+    "documentation": "DevTools/MCP_SERVER.md",
+    "transport": "stdio",
+    "runtime": ".NET 8",
+    "canonicalClientOnly": true,
+    "stdout": "MCP JSON-RPC only",
+    "stderr": "sanitized diagnostics",
+    "tools": [
+      "ensure_bridge_ready",
+      "get_bridge_status",
+      "get_fresh_context",
+      "list_bridge_capabilities",
+      "run_read_only_query",
+      "validate_owner_adapter",
+      "request_managed_restart",
+      "wait_for_runtime",
+      "list_human_reviews",
+      "create_human_review",
+      "resolve_human_review",
+      "get_resume_checkpoint"
+    ],
+    "gameplayMutation": false,
+    "reviewNeverAuthorizesMutation": true,
+    "requiresLocalApprovalForLifecycle": true
   }
 }

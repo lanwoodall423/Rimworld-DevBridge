@@ -144,15 +144,21 @@ Validate-Dependencies $managed $harmony | Out-Null
 $coreProject = Join-Path $root 'Source/RimWorldDevBridge/RimWorldDevBridge.csproj'
 $harnessProject = Join-Path $root 'DevTools/CompatibilityHarness/CompatibilityHarness.csproj'
 $coordinatorProject = Join-Path $root 'DevTools/RestartCoordinator/RimWorldDevBridge.RestartCoordinator.csproj'
+$mcpProject = Join-Path $root 'DevTools/McpServer/RimWorldDevBridge.McpServer.csproj'
 Invoke-Build $coreProject $managed $harmony
 Invoke-Build $coordinatorProject $managed $harmony
 Invoke-Build $harnessProject $managed $harmony
+Invoke-Build $mcpProject $managed $harmony
 
 $harness = Join-Path $root ('DevTools/CompatibilityHarness/bin/{0}/net472/RimWorldDevBridge.CompatibilityHarness.exe' -f $Configuration)
 if (-not (Test-Path -LiteralPath $harness -PathType Leaf)) { throw "Compatibility harness output is missing: $harness" }
 & $harness
 if ($LASTEXITCODE -ne 0) { throw "Compatibility harness failed with exit code $LASTEXITCODE." }
 Invoke-Script (Join-Path $PSScriptRoot 'Test-BridgeSourceInvariants.ps1') -arguments @()
+$mcpTest = Join-Path $PSScriptRoot 'Test-DevBridgeMcpServer.ps1'
+$mcpAssembly = Join-Path $root ('DevTools/McpServer/bin/{0}/net8.0/RimWorldDevBridge.McpServer.dll' -f $Configuration)
+& $mcpTest -ServerDll $mcpAssembly -ClientPath (Join-Path $root 'DevTools/devbridge.ps1')
+if (-not $?) { throw 'MCP protocol validation failed.' }
 $reviewQueueTest = Join-Path $PSScriptRoot 'Test-DevBridgeReviewQueue.ps1'
 & $reviewQueueTest -BridgeRoot $root
 if (-not $?) { throw 'Durable review queue validation failed.' }

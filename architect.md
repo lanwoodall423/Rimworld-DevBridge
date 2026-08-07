@@ -137,6 +137,17 @@ processes or gameplay mutation.
    - Review and safety approval are separate from mutation authority, attached
      process control, and write leases.
 
+5. **Optional external MCP adapter**
+   - `DevTools/McpServer` is a .NET 8 local STDIO process. It invokes the canonical
+     PowerShell client and never loads RimWorld, Unity, Harmony, or owner-mod code.
+   - MCP tool schemas and annotations are goal-level and truthful. Activation/restart
+     remains external lifecycle control, while gameplay mutation is intentionally absent.
+   - STDIO stdout is reserved for MCP JSON-RPC; sanitized diagnostics go to stderr.
+     Cancellation kills only the adapter's canonical-client child tree. Correlation IDs,
+     bounded timeouts, stable Dev Bridge codes, and recovery fields cross the adapter.
+   - Codex configuration is optional and local. Review resolution cannot authorize
+     mutation, attached-process control, in-game confirmation, or a write lease.
+
 ## Runtime boundaries and threading
 
 - `BridgeRuntime` owns lifecycle, session and transport-generation invalidation,
