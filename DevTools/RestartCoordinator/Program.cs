@@ -1026,14 +1026,33 @@ namespace RimWorldDevBridge.RestartCoordinator
                     using (FileStream stream = new FileStream(temporary, FileMode.CreateNew,
                         FileAccess.Write, FileShare.None))
                         new DataContractJsonSerializer(typeof(LaunchRecord)).WriteObject(stream, launchRecord);
-                    if (File.Exists(launchPath)) File.Replace(temporary, launchPath, null);
-                    else File.Move(temporary, launchPath);
+                    ReplaceAtomic(temporary, launchPath);
                 }
                 finally
                 {
                     if (File.Exists(temporary)) File.Delete(temporary);
                 }
             }
+        }
+
+        private static void ReplaceAtomic(string temporary, string path)
+        {
+            IOException last = null;
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path)) File.Replace(temporary, path, null);
+                    else File.Move(temporary, path);
+                    return;
+                }
+                catch (IOException error)
+                {
+                    last = error;
+                    if (attempt < 7) Thread.Sleep(25);
+                }
+            }
+            throw last ?? new IOException("atomic launch replacement failed");
         }
 
         private void AcquireLock()

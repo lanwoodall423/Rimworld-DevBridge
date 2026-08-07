@@ -9,13 +9,22 @@ namespace RimWorldDevBridge
     {
         private readonly object gate = new object();
         private readonly Queue<WorkItem> queue = new Queue<WorkItem>();
-        private readonly Queue<WorkItem> lifecycleQueue = new Queue<WorkItem>();
+        private WorkItem lifecycleWork;
+        private long lifecycleSequenceHighWatermark = long.MinValue;
+        private long lifecycleCoalesced;
+        private long lifecycleDroppedStale;
         private readonly Queue<WorkItem> nextFrameQueue = new Queue<WorkItem>();
         private int ownerThreadId = Thread.CurrentThread.ManagedThreadId;
         private int ownerLocked;
 
         internal bool IsOwnerThread => Thread.CurrentThread.ManagedThreadId == Volatile.Read(ref ownerThreadId);
         internal bool IsOwnerEstablished => Volatile.Read(ref ownerLocked) != 0;
+        internal int LifecyclePendingCount
+        {
+            get { lock (gate) return lifecycleWork == null ? 0 : 1; }
+        }
+        internal long LifecycleCoalescedCount => Interlocked.Read(ref lifecycleCoalesced);
+        internal long LifecycleDroppedStaleCount => Interlocked.Read(ref lifecycleDroppedStale);
 
         // Mod construction can occur on a loader thread. The first authoritative Verse callback
         // establishes the actual game thread; ownership is immutable after that point.
@@ -44,11 +53,29 @@ namespace RimWorldDevBridge
         }
 
         // Lifecycle callbacks are kept separate so a worker-side engine callback can wait for
-        // owner adoption without competing with ordinary transport work.
+        // owner adoption without competing with ordinary transport work. FinalizeInit carries
+        // a monotonically increasing lifecycle sequence, so retain only its newest callback.
         internal void PostLifecycle(SendOrPostCallback callback, object state)
         {
             if (callback == null) throw new ArgumentNullException(nameof(callback));
-            lock (gate) lifecycleQueue.Enqueue(new WorkItem(callback, state));
+            lock (gate)
+            {
+                long sequence;
+                bool sequenced = TryGetLifecycleSequence(state, out sequence);
+                if (sequenced && sequence <= lifecycleSequenceHighWatermark)
+                {
+                    Interlocked.Increment(ref lifecycleDroppedStale);
+                    return;
+                }
+                if (lifecycleWork != null) Interlocked.Increment(ref lifecycleCoalesced);
+                lifecycleWork = new WorkItem(callback, state);
+                if (sequenced) lifecycleSequenceHighWatermark = sequence;
+            }
+        }
+
+        internal void PostLifecycleLatest(SendOrPostCallback callback, long sequence)
+        {
+            PostLifecycle(callback, sequence);
         }
 
         internal void PostNextFrame(SendOrPostCallback callback, object state)
@@ -102,9 +129,10 @@ namespace RimWorldDevBridge
         {
             lock (gate)
             {
-                if (lifecycleOnly && lifecycleQueue.Count > 0)
+                if (lifecycleOnly && lifecycleWork != null)
                 {
-                    item = lifecycleQueue.Dequeue();
+                    item = lifecycleWork;
+                    lifecycleWork = null;
                     return true;
                 }
                 if (!lifecycleOnly && queue.Count > 0)
@@ -114,6 +142,17 @@ namespace RimWorldDevBridge
                 }
             }
             item = null;
+            return false;
+        }
+
+        private static bool TryGetLifecycleSequence(object state, out long sequence)
+        {
+            if (state is long)
+            {
+                sequence = (long)state;
+                return true;
+            }
+            sequence = 0;
             return false;
         }
 

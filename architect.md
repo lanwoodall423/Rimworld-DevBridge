@@ -117,6 +117,26 @@ processes or gameplay mutation.
       explicitly opt into the versioned contract; legacy synchronous code is
       measured, reported as non-cooperative, and cannot be safely preempted.
 
+    - Lifecycle callbacks use a bounded newest-sequence slot rather than an
+      unbounded queue. `lifecyclePending`, `lifecycleCoalesced`, and
+      `lifecycleDroppedStale` make lifecycle pressure observable; sequence and
+      owner-adoption validation remain authoritative.
+    - Compatible pure reads may run concurrently. Restart, save/load, adapter
+      reload, stateful setup, mutation, and lease writes acquire the fair
+      serialized runtime lane. Requests waiting for optional human feedback
+      never hold that lane.
+
+4. **Durable human work**
+   - `review request|list|get|resolve|cancel|wait|checkpoint|resume` stores
+     redacted, atomically persisted tickets under the existing user root.
+   - Tickets preserve the question, options, evidence, completed/remaining
+     work, independent work, branch state, expiration/deduplication keys, and
+     exact resume operation. After the 60-second response window, autonomous
+     work checkpoints as `READY_AWAITING_HUMAN`, releases resources, and can
+     resume later without repeating completed work.
+   - Review and safety approval are separate from mutation authority, attached
+     process control, and write leases.
+
 ## Runtime boundaries and threading
 
 - `BridgeRuntime` owns lifecycle, session and transport-generation invalidation,

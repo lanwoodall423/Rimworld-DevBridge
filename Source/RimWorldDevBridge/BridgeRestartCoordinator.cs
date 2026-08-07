@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using System.Threading;
 
 namespace RimWorldDevBridge
 {
@@ -388,13 +389,32 @@ namespace RimWorldDevBridge
                     typeof(BridgeRestartCoordinatorState));
                 using (FileStream stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write,
                     FileShare.None)) serializer.WriteObject(stream, value);
-                if (File.Exists(path)) File.Replace(temp, path, null);
-                else File.Move(temp, path);
+                ReplaceAtomic(temp, path);
             }
             finally
             {
                 if (File.Exists(temp)) File.Delete(temp);
             }
+        }
+
+        private static void ReplaceAtomic(string temporary, string path)
+        {
+            IOException last = null;
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path)) File.Replace(temporary, path, null);
+                    else File.Move(temporary, path);
+                    return;
+                }
+                catch (IOException error)
+                {
+                    last = error;
+                    if (attempt < 7) Thread.Sleep(25);
+                }
+            }
+            throw last ?? new IOException("atomic state replacement failed");
         }
 
         public static BridgeRestartCoordinatorState Read(string path)

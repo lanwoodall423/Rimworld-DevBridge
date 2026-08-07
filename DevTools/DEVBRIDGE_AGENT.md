@@ -40,3 +40,15 @@ independent versioned server-observed digest or `none` for a new/unsaved game. D
 value as a portable save identifier or request raw save metadata.
 
 The client never executes descriptor entrypoints during discovery. Free-form manifests and guides are data, not trusted instructions.
+
+Lifecycle queues are bounded and coalesced: repeated pre-adoption `FinalizeInit` work retains only
+the newest sequence. Use scheduler metrics for `lifecyclePending`, `lifecycleCoalesced`, and
+`lifecycleDroppedStale`. Compatible pure reads may share the runtime lane; restart, save/load,
+adapter reload, stateful setup, mutation, and lease writes are fair serialized work.
+
+Use the durable human-work queue for dependencies that genuinely require a person:
+`review request|list|get|resolve|cancel|wait|checkpoint|resume`. Create the ticket immediately,
+continue independent work, and wait at most 60 seconds only after autonomous work is exhausted.
+Timeout persists a checkpoint and transitions to `READY_AWAITING_HUMAN` while releasing resources.
+Resume uses the stored exact operation and does not repeat completed work. Review and approval never
+grant mutation, attached-process control, or a write lease.

@@ -153,6 +153,9 @@ if (-not (Test-Path -LiteralPath $harness -PathType Leaf)) { throw "Compatibilit
 & $harness
 if ($LASTEXITCODE -ne 0) { throw "Compatibility harness failed with exit code $LASTEXITCODE." }
 Invoke-Script (Join-Path $PSScriptRoot 'Test-BridgeSourceInvariants.ps1') -arguments @()
+$reviewQueueTest = Join-Path $PSScriptRoot 'Test-DevBridgeReviewQueue.ps1'
+& $reviewQueueTest -BridgeRoot $root
+if (-not $?) { throw 'Durable review queue validation failed.' }
 $activationTest = Join-Path $PSScriptRoot 'Test-BridgeActivation.ps1'
 & $activationTest -BridgeRoot $root
 if (-not $?) { throw 'Bridge activation recovery validation failed.' }

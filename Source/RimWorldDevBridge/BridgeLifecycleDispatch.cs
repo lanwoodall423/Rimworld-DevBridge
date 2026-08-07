@@ -24,6 +24,9 @@ namespace RimWorldDevBridge
         internal int FinalizeInitRequestThreadId => Volatile.Read(ref finalizeInitRequestThreadId);
         internal int FinalizeInitExecutionThreadId => Volatile.Read(ref finalizeInitExecutionThreadId);
         internal int FinalizeInitDeferredCount => Volatile.Read(ref finalizeInitDeferredCount);
+        internal int PendingCount => mainThread.LifecyclePendingCount;
+        internal long CoalescedCount => mainThread.LifecycleCoalescedCount;
+        internal long DroppedStaleCount => mainThread.LifecycleDroppedStaleCount;
 
         internal void OnFinalizeInit(long sequence)
         {
@@ -49,7 +52,7 @@ namespace RimWorldDevBridge
         }
 
         internal void PostFinalizeInit(long sequence) =>
-            mainThread.PostLifecycle(CompleteDeferredFinalizeInit, sequence);
+            mainThread.PostLifecycleLatest(CompleteDeferredFinalizeInit, sequence);
 
         private void CompleteDeferredFinalizeInit(object state)
         {
