@@ -403,7 +403,7 @@ The extracted adapter services cover source discovery, assembly verification,
 manifest validation, generation management, lazy loading, and execution health.
 The extracted diagnostics services cover command routing, cooperative snapshot
 projection, artifact serialization, and the bounded event journal. The current
-compatibility harness reports 69 cases, including the characterization tests
+compatibility harness reports 78 cases, including the characterization tests
 added before this pass for command registration, concurrent event access,
 audit redaction, and concurrent catalog readers.
 
@@ -414,3 +414,52 @@ concurrency evidence must therefore remain green before each logical commit;
 no adapter or runtime extraction is allowed to alter stable status/error codes,
 session rotation, lease invalidation, bounded queue behavior, or snapshot
 consistency.
+
+## Multi-agent coordination and runtime isolation
+
+The coordination foundation keeps five identities distinct:
+
+- `agentId` is the logical caller label.
+- `clientInstanceId` is a stable reconnect and quota subject, persisted outside the
+  RimWorld user root by the canonical client.
+- `connectionSessionId` identifies one transport connection epoch.
+- `correlationId` identifies one request attempt.
+- `participantId` identifies one caller's participation in a shared operation.
+
+Identity labels are sanitized for diagnostics and are never authorization, mutation,
+lease, or process-ownership credentials. Transport authentication, in-game
+confirmation, leases, coordinator ownership, and quotas remain authoritative.
+Scheduler fairness uses agent, client, and workspace keys. Shared-operation admission
+also applies per-agent and global active/queued limits.
+
+`BridgeOperationCompatibilityKey` is canonical and excludes correlation, goal, and
+participant IDs. It includes operation kind, desired postcondition, managed profile,
+RimWorld version, mod/load-order fingerprints, source/build identity, deployment
+slot, expected core/adapter fingerprints, configuration and user-root fingerprints,
+save/map targets, process-replacement requirement, lifecycle generation, and mutation
+scope. Compatible callers join one durable operation; incompatible requests receive a
+different operation and use a different runtime slot. Final detach behavior is
+operation-specific and deterministic: safe work completes, verification cancels, and
+restart/save/load/reload work leaves an explicitly coordinator-owned runtime running.
+Participants may join, observe, reconnect, detach, or cancel only their own
+participation. Persisted operation recovery validates process identity and never
+issues a second launch for an already recorded operation.
+
+Artifacts are content-derived from source revision/dirty state, build/framework,
+dependencies, mod/load order, output hashes, assembly version/MVID/hash, slot, and
+provenance. Deployment uses scoped durable locks, staged files, atomic publication,
+exact deployed hashes, and loaded-assembly fingerprint matching. Modified output,
+wrong-agent provenance, stale locks, and loaded mismatches are hard failures.
+
+`BridgeRuntimeSlotManager` models an owned profile, user/config/mod roots, deployment
+overlay, coordinator/process/IPC/save/log/evidence/resource roots, process identity,
+and lifecycle state. Compatible work shares a slot; incompatible work gets isolated
+paths. Attached/manual processes are never claimed. A global active-process cap uses
+structured, fair capacity queues and exposes `capacityState` and `nextAction`.
+
+Canonical results expose `agentId`, `clientInstanceId`, `participantId`, operation
+identity/state, compatibility, desired state, slot/deployment/artifact and loaded
+fingerprints, PID/process start identity, session, lifecycle/progress, terminal and
+recovery fields, capacity, and `keepRunning`. These fields are passed through the
+bridge protocol, canonical client, and MCP response schema without changing protocol
+10 or schema `v10.1-typed-core`.

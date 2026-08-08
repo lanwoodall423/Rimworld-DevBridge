@@ -103,8 +103,33 @@ namespace RimWorldDevBridge
         private const int MaximumLines = 1024;
         private const int MaximumWarnings = 64;
         public string RequestId { get; set; }
+        public string CorrelationId { get; set; }
+        public string AgentId { get; set; }
+        public string ClientInstanceId { get; set; }
+        public string ParticipantId { get; set; }
         public string SessionId { get; set; }
+        public string ConnectionSessionId { get; set; }
         public string Command { get; set; }
+        public string OperationId { get; set; }
+        public string OperationKind { get; set; }
+        public string OperationState { get; set; }
+        public string CompatibilityKey { get; set; }
+        public string DesiredState { get; set; }
+        public string RuntimeSlotId { get; set; }
+        public string DeploymentId { get; set; }
+        public string ArtifactFingerprint { get; set; }
+        public string LoadedAssemblyFingerprint { get; set; }
+        public int ProcessId { get; set; }
+        public string ProcessStartIdentity { get; set; }
+        public long LifecycleGeneration { get; set; }
+        public long ProgressSequence { get; set; }
+        public DateTime? LastProgressAtUtc { get; set; }
+        public bool Terminal { get; set; }
+        public bool Recoverable { get; set; }
+        public bool RetrySafe { get; set; }
+        public string NextAction { get; set; }
+        public string CapacityState { get; set; }
+        public bool KeepRunning { get; set; }
         public string Provider { get; set; } = "core";
         public string ProviderVersion { get; set; } = BridgeProtocol.BridgeVersion;
         public BridgeCommandMode Mode { get; set; } = BridgeCommandMode.PureRead;
@@ -205,8 +230,25 @@ namespace RimWorldDevBridge
                 if (bounded != Warnings[i]) { Warnings[i] = bounded; changed = true; }
             }
             changed |= BoundProperty(RequestId, 256, out string requestId); RequestId = requestId;
+            changed |= BoundProperty(CorrelationId, 256, out string correlationId); CorrelationId = correlationId;
+            changed |= BoundProperty(AgentId, 128, out string agentId); AgentId = agentId;
+            changed |= BoundProperty(ClientInstanceId, 128, out string clientInstanceId); ClientInstanceId = clientInstanceId;
+            changed |= BoundProperty(ParticipantId, 128, out string participantId); ParticipantId = participantId;
             changed |= BoundProperty(SessionId, 256, out string sessionId); SessionId = sessionId;
+            changed |= BoundProperty(ConnectionSessionId, 256, out string connectionSessionId); ConnectionSessionId = connectionSessionId;
             changed |= BoundProperty(Command, 128, out string command); Command = command;
+            changed |= BoundProperty(OperationId, 256, out string operationId); OperationId = operationId;
+            changed |= BoundProperty(OperationKind, 64, out string operationKind); OperationKind = operationKind;
+            changed |= BoundProperty(OperationState, 64, out string operationState); OperationState = operationState;
+            changed |= BoundProperty(CompatibilityKey, 256, out string compatibilityKey); CompatibilityKey = compatibilityKey;
+            changed |= BoundProperty(DesiredState, 64, out string desiredState); DesiredState = desiredState;
+            changed |= BoundProperty(RuntimeSlotId, 128, out string runtimeSlotId); RuntimeSlotId = runtimeSlotId;
+            changed |= BoundProperty(DeploymentId, 256, out string deploymentId); DeploymentId = deploymentId;
+            changed |= BoundProperty(ArtifactFingerprint, 256, out string artifactFingerprint); ArtifactFingerprint = artifactFingerprint;
+            changed |= BoundProperty(LoadedAssemblyFingerprint, 256, out string loadedAssemblyFingerprint); LoadedAssemblyFingerprint = loadedAssemblyFingerprint;
+            changed |= BoundProperty(ProcessStartIdentity, 256, out string processStartIdentity); ProcessStartIdentity = processStartIdentity;
+            changed |= BoundProperty(NextAction, 512, out string nextAction); NextAction = nextAction;
+            changed |= BoundProperty(CapacityState, 128, out string capacityState); CapacityState = capacityState;
             changed |= BoundProperty(Provider, 256, out string provider); Provider = provider;
             changed |= BoundProperty(ProviderVersion, 128, out string providerVersion); ProviderVersion = providerVersion;
             changed |= BoundProperty(Schema, 256, out string schema); Schema = schema;
@@ -281,9 +323,41 @@ namespace RimWorldDevBridge
     {
         public string RequestId { get; set; }
         public string AgentId { get; set; }
+        public string ClientInstanceId { get; set; }
+        public string ClientCredential { get; set; }
+        public string ParticipantId { get; set; }
+        public string ConnectionSessionId { get; set; }
+        public string CorrelationId { get; set; }
         public string WorkspaceId { get; set; }
         public string SessionId { get; set; }
         public string Command { get; set; }
+        public string OperationId { get; set; }
+        public string OperationKind { get; set; }
+        public string DesiredState { get; set; }
+        public string CompatibilityKey { get; set; }
+        public string ManagedProfile { get; set; }
+        public string RimWorldVersion { get; set; }
+        public string ModSetFingerprint { get; set; }
+        public string ModLoadOrderFingerprint { get; set; }
+        public string SourceBuildIdentity { get; set; }
+        public string ExpectedCoreFingerprint { get; set; }
+        public string ExpectedAdapterFingerprint { get; set; }
+        public string ExpectedLoadedAssemblyFingerprint { get; set; }
+        public string ConfigurationFingerprint { get; set; }
+        public string UserRootFingerprint { get; set; }
+        public string SaveTarget { get; set; }
+        public string MapTarget { get; set; }
+        public bool RequiresProcessReplacement { get; set; }
+        public bool KeepRunning { get; set; }
+        public long LifecycleGeneration { get; set; }
+        public string MutationScope { get; set; }
+        public string RuntimeSlotId { get; set; }
+        public string DeploymentId { get; set; }
+        public string ArtifactFingerprint { get; set; }
+        public int ExpectedProcessId { get; set; }
+        public string ExpectedProcessStartIdentity { get; set; }
+        public string ExpectedProcessSessionId { get; set; }
+        public long ExpectedProcessLifecycleGeneration { get; set; }
         public string Argument { get; set; }
         public DateTime EnqueuedUtc { get; set; }
         public DateTime ReceivedUtc { get; set; }
@@ -322,6 +396,8 @@ namespace RimWorldDevBridge
         internal int CooperativeSteps;
         internal double CooperativeMaxStepMs;
         internal bool CooperativeMainThreadOverrun;
+        internal bool SharedOperationRegistered;
+        internal int SharedOperationCompletionClaimed;
         internal readonly ManualResetEventSlim Done = new ManualResetEventSlim(false);
         internal BridgeResult Result;
 

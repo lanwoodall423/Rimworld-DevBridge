@@ -26,6 +26,12 @@ internal static class Program
         Run("legacy request", LegacyRequest);
         Run("structured request", StructuredRequest);
         Run("agent identity isolation", AgentIdentityIsolation);
+        Run("multi-agent identity reconnect and spoofing", MultiAgentIdentityReconnectAndSpoofing);
+        Run("shared operation coalescing and abandonment", SharedOperationCoalescingAndAbandonment);
+        Run("artifact deployment fingerprint and lock isolation", ArtifactDeploymentFingerprintAndLockIsolation);
+        Run("runtime slot compatibility and fair capacity", RuntimeSlotCompatibilityAndFairCapacity);
+        Run("coordination wire contract and slot boundary", CoordinationWireContractAndSlotBoundary);
+        Run("coordinate request requires launch provenance", CoordinateRequestRequiresLaunchProvenance);
         Run("runtime boundary characterization", RuntimeBoundaryCharacterization);
         Run("finalize init defers before owner adoption", FinalizeInitDefersBeforeOwnerAdoption);
         Run("diagnostic command registration characterization", DiagnosticCommandRegistrationCharacterization);
@@ -165,6 +171,498 @@ internal static class Program
         Check(scheduler.Enqueue(queued) == null, "agent request was not queued");
         Check(!scheduler.Cancel(queued.RequestId, "agent-b"), "another agent cancelled a request");
         Check(scheduler.Cancel(queued.RequestId, "agent-a"), "owner agent could not cancel its request");
+    }
+
+    private static void MultiAgentIdentityReconnectAndSpoofing()
+    {
+        BridgeClientIdentity identity = BridgeClientIdentity.Create("agent/a", "client-one", "connection-one",
+            "request-one", "participant-one");
+        Equal("agent-a", identity.AgentId, "identity normalization");
+        Check(identity.SanitizedAgentId != identity.AgentId && !identity.SanitizedAgentId.Contains("agent-a"),
+            "diagnostic identity was not sanitized");
+
+        BridgeIdentityAuthority authority = new BridgeIdentityAuthority();
+        authority.Load(Path.Combine(HarnessUserRoot, "identity-authority.json"));
+        BridgeClientRegistration registration = authority.Register(identity.AgentId, identity.ClientInstanceId);
+        Check(authority.Authenticate(identity, registration.Credential, out _), "registered identity did not authenticate");
+        BridgeIdentityAuthority recoveredAuthority = new BridgeIdentityAuthority();
+        recoveredAuthority.Load(Path.Combine(HarnessUserRoot, "identity-authority.json"));
+        Check(recoveredAuthority.Authenticate(identity, registration.Credential, out _),
+            "persisted identity did not authenticate after recovery");
+        Check(!authority.Authenticate(BridgeClientIdentity.Create("other-agent", identity.ClientInstanceId),
+            registration.Credential, out _), "spoofed agent authenticated");
+
+        BridgeClientIdentity reconnect = identity.ForRequest("request-two", "participant-two");
+        Equal(identity.ClientInstanceId, reconnect.ClientInstanceId, "reconnect changed client identity");
+        Equal(identity.ConnectionSessionId, reconnect.ConnectionSessionId, "request changed connection identity");
+        Check(!string.Equals(identity.RequestCorrelationId, reconnect.RequestCorrelationId,
+            StringComparison.Ordinal), "request correlation was not independent");
+        Check(!BridgeIdentityRules.IsValid("agent/unsafe"), "unsafe identity accepted");
+    }
+
+    private static void SharedOperationCoalescingAndAbandonment()
+    {
+        BridgeManualClock clock = new BridgeManualClock(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        string statePath = Path.Combine(HarnessUserRoot, "shared-operations.json");
+        BridgeOperationLimits limits = new BridgeOperationLimits
+        {
+            MaximumActiveOperations = 1,
+            MaximumQueuedOperations = 8,
+            MaximumActivePerAgent = 1,
+            MaximumQueuedPerAgent = 8
+        };
+        BridgeOperationCompatibilityKey compatible = TestCompatibility("build-a", 4, false);
+        BridgeSharedOperationCoordinator coordinator = new BridgeSharedOperationCoordinator(clock, statePath, limits);
+        BridgeClientIdentity first = BridgeClientIdentity.Create("agent-a", "client-a", "connection-a",
+            "correlation-a", "participant-a");
+        BridgeOperationJoinResult created = coordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = first,
+            OperationKind = BridgeOperationKind.Restart,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = compatible,
+            GoalId = "goal-a",
+            KeepRunning = true
+        });
+        Check(created.Created && created.Joined, "shared operation was not created");
+        BridgeClientIdentity second = BridgeClientIdentity.Create("agent-b", "client-b", "connection-b",
+            "correlation-b", "participant-b");
+        BridgeOperationJoinResult joined = coordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = second,
+            OperationKind = BridgeOperationKind.Restart,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = compatible,
+            GoalId = "goal-b",
+            KeepRunning = true
+        });
+        Equal(created.OperationId, joined.OperationId, "compatible callers did not coalesce");
+        Check(joined.Operation.Participants.Count == 2, "participant was not attached");
+
+        BridgeOperationCompatibilityKey incompatible = TestCompatibility("build-b", 4, false);
+        BridgeOperationJoinResult separate = coordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = BridgeClientIdentity.Create("agent-c", "client-c", "connection-c", "correlation-c", "participant-c"),
+            OperationKind = BridgeOperationKind.Restart,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = incompatible,
+            GoalId = "goal-c",
+            KeepRunning = true
+        });
+        Check(separate.OperationId != created.OperationId && separate.CapacityState != "agent_queue_limit",
+            "incompatible operation coalesced or was rejected unexpectedly");
+        Check(separate.Operation.OperationState == BridgeOperationState.Queued,
+            "capacity queue did not preserve incompatible work");
+
+        ExpectInvalidOperation(() => coordinator.Detach(created.OperationId,
+            BridgeClientIdentity.Create("spoof", "client-a", "connection-x", "correlation-x", "participant-a")),
+            "participant identity spoof bypassed detach");
+        BridgeOperationRecord afterDetach = coordinator.Detach(created.OperationId, first);
+        Check(!afterDetach.Terminal && afterDetach.ActiveParticipantCount == 1,
+            "detaching one participant abandoned shared work");
+        BridgeOperationRecord abandoned = coordinator.Detach(created.OperationId, second);
+        Check(abandoned.Terminal && abandoned.OperationState == BridgeOperationState.Abandoned &&
+            abandoned.KeepRunning, "final detach policy was not deterministic");
+
+        BridgeSharedOperationCoordinator recovered = new BridgeSharedOperationCoordinator(clock, statePath, limits);
+        BridgeOperationRecord recoveredRecord = recovered.RecoverAfterCoordinatorRestart(_ => true);
+        Check(recoveredRecord != null, "durable shared operation was not recovered");
+        Check(recovered.Snapshot().Count == coordinator.Snapshot().Count,
+            "recovery duplicated shared operations");
+        BridgeOperationJoinResult crossProcessJoin = recovered.Join(new BridgeOperationJoinRequest
+        {
+            Identity = BridgeClientIdentity.Create("agent-d", "client-d", "connection-d",
+                "correlation-d", "participant-d"),
+            OperationKind = BridgeOperationKind.Restart,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = incompatible,
+            KeepRunning = true
+        });
+        Equal(separate.OperationId, crossProcessJoin.OperationId,
+            "durable state lock did not preserve cross-instance coalescing");
+
+        BridgeOperationLimits clientLimits = new BridgeOperationLimits
+        {
+            MaximumActiveOperations = 4,
+            MaximumActivePerAgent = 4,
+            MaximumActivePerClient = 1,
+            MaximumQueuedOperations = 8,
+            MaximumQueuedPerAgent = 8,
+            MaximumQueuedPerClient = 8
+        };
+        BridgeSharedOperationCoordinator quotaCoordinator = new BridgeSharedOperationCoordinator(clock,
+            Path.Combine(HarnessUserRoot, "client-quota.json"), clientLimits);
+        BridgeOperationJoinResult quotaFirst = quotaCoordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = BridgeClientIdentity.Create("quota-agent", "quota-client", "quota-connection",
+                "quota-correlation", "quota-participant"),
+            OperationKind = BridgeOperationKind.Deployment,
+             DesiredState = BridgeDesiredState.Bridge,
+             Compatibility = TestCompatibility("quota-a", 1, false)
+         });
+        BridgeOperationJoinResult quotaShared = quotaCoordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = BridgeClientIdentity.Create("quota-agent", "quota-client-b", "quota-connection-b",
+                "quota-correlation-b", "quota-participant-b"),
+            OperationKind = BridgeOperationKind.Deployment,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = TestCompatibility("quota-a", 1, false)
+        });
+        BridgeOperationJoinResult quotaBlocked = quotaCoordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = BridgeClientIdentity.Create("quota-agent", "quota-client-b", "quota-connection-2",
+                "quota-correlation-2", "quota-participant-2"),
+            OperationKind = BridgeOperationKind.Deployment,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = TestCompatibility("quota-b", 1, false)
+        });
+        BridgeOperationJoinResult quotaNext = quotaCoordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = BridgeClientIdentity.Create("quota-agent", "quota-client-c", "quota-connection-c",
+                "quota-correlation-c", "quota-participant-c"),
+            OperationKind = BridgeOperationKind.Deployment,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = TestCompatibility("quota-c", 1, false)
+        });
+        Check(quotaFirst.Created && quotaShared.OperationId == quotaFirst.OperationId &&
+            quotaBlocked.Operation != null && quotaBlocked.Operation.OperationState == BridgeOperationState.Queued &&
+            quotaBlocked.CapacityState == "client_capacity" && quotaNext.Operation != null &&
+            quotaNext.Operation.OperationState == BridgeOperationState.Running,
+            "per-client active quota was bypassed during promotion or blocked the fair queue");
+    }
+
+    private static void ArtifactDeploymentFingerprintAndLockIsolation()
+    {
+        string root = Path.Combine(HarnessUserRoot, "deployments");
+        string source = Path.Combine(HarnessUserRoot, "artifact.txt");
+        File.WriteAllText(source, "artifact-v1");
+        BridgeArtifactIdentity artifact = BridgeArtifactIdentity.FromFiles(new[] { source }, "rev-a", "clean",
+            "Release", "net472", "deps-a", "mods-a", "order-a", "slot-a", "operation-a", "agent-a", "harness");
+        BridgeManualClock clock = new BridgeManualClock(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        BridgeDeploymentManager manager = new BridgeDeploymentManager(root, clock);
+        BridgeDeploymentLockResult held = manager.TryAcquireLock("slot-a", "deployment-held", "operation-held",
+            "agent-a", "client-a", TimeSpan.FromMinutes(1));
+        Check(held.Acquired, "deployment lock was not acquired");
+        BridgeDeploymentLockResult blocked = manager.TryAcquireLock("slot-a", "deployment-other", "operation-other",
+            "agent-b", "client-b", TimeSpan.FromMinutes(1));
+        Check(!blocked.Acquired && blocked.CapacityState == "deployment_locked", "scoped lock did not isolate writers");
+        manager.ReleaseLock(held.Lock.LockId, "operation-held", "agent-a", "client-a");
+
+        ExpectInvalidOperation(() => manager.Deploy(artifact,
+            new Dictionary<string, string> { { "artifact.txt", source } }, "deployment-wrong-agent",
+            "operation-wrong", "agent-b", "client-b", TimeSpan.FromMinutes(1)), "wrong agent deployed artifact");
+        BridgeDeploymentManifest manifest = manager.Deploy(artifact,
+            new Dictionary<string, string> { { "artifact.txt", source } }, "deployment-a", "operation-a",
+            "agent-a", "client-a", TimeSpan.FromMinutes(1));
+        Check(File.Exists(Path.Combine(root, "slot-a", "deployments", "deployment-a", "artifact.txt")),
+            "deployed output missing");
+        Check(manifest.OutputArtifactHashes.ContainsKey("artifact.txt"), "manifest output missing");
+        Check(string.Equals(manifest.OutputArtifactHashes["artifact.txt"],
+            BridgeHashing.FileSha256(Path.Combine(root, "slot-a", "deployments", "deployment-a", "artifact.txt")),
+            StringComparison.OrdinalIgnoreCase), "deployed output hash mismatch");
+        string expectedManifestFingerprint = BridgeHashing.Sha256(string.Join("\n", new[]
+        {
+            manifest.DeploymentId, manifest.ArtifactFingerprint, manifest.DeploymentSlot, manifest.SourceRevision,
+            manifest.ProducingOperationId, manifest.ProducingAgentId, manifest.Provenance,
+            manifest.LoadedAssemblyFingerprint,
+            string.Join(";", manifest.OutputArtifactHashes.OrderBy(item => item.Key,
+                StringComparer.OrdinalIgnoreCase).Select(item => item.Key + "=" + item.Value)),
+            string.Join(";", manifest.Assemblies.OrderBy(item => item.RelativePath,
+                StringComparer.OrdinalIgnoreCase).Select(item => string.Join("|", item.AssemblyName,
+                item.AssemblyVersion, item.ModuleVersionId, item.Sha256, item.RelativePath)))
+        }));
+        Check(string.Equals(manifest.ManifestFingerprint, expectedManifestFingerprint,
+            StringComparison.OrdinalIgnoreCase), "manifest fingerprint mismatch");
+        Check(manager.VerifyDeployment(manifest), "atomic deployment did not verify");
+        Check(manager.VerifyLoaded(manifest, manifest.LoadedAssemblyFingerprint), "loaded fingerprint did not bind exactly");
+        Check(!manager.VerifyLoaded(manifest, "wrong-loaded-fingerprint"), "wrong loaded fingerprint accepted");
+        string deployed = Path.Combine(root, "slot-a", "deployments", "deployment-a", "artifact.txt");
+        string extra = Path.Combine(root, "slot-a", "deployments", "deployment-a", "unexpected.txt");
+        File.WriteAllText(extra, "unlisted");
+        Check(!manager.VerifyDeployment(manifest), "unlisted deployment output was accepted");
+        File.Delete(extra);
+        File.WriteAllText(deployed, "modified-after-deploy");
+        Check(!manager.VerifyDeployment(manifest), "modified deployment was not detected");
+    }
+
+    private static void RuntimeSlotCompatibilityAndFairCapacity()
+    {
+        BridgeOperationCompatibilityKey firstKey = TestCompatibility("build-a", 1, false);
+        BridgeOperationCompatibilityKey secondKey = TestCompatibility("build-b", 1, false);
+        BridgeRuntimeSlotManager shared = new BridgeRuntimeSlotManager(2);
+        BridgeRuntimeSlotAllocation first = shared.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = firstKey, AgentId = "agent-a", ClientInstanceId = "client-a", OperationId = "operation-a"
+        });
+        BridgeRuntimeSlotAllocation same = shared.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = firstKey, AgentId = "agent-b", ClientInstanceId = "client-b", OperationId = "operation-b"
+        });
+        BridgeRuntimeSlotAllocation isolated = shared.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = secondKey, AgentId = "agent-c", ClientInstanceId = "client-c", OperationId = "operation-c"
+        });
+        Check(first.Allocated && same.Allocated && isolated.Allocated, "compatible or isolated slot was not allocated");
+        Equal(first.Slot.RuntimeSlotId, same.Slot.RuntimeSlotId, "compatible work did not share a slot");
+        Check(first.Slot.RuntimeSlotId != isolated.Slot.RuntimeSlotId && shared.ValidateIsolation(first.Slot, isolated.Slot),
+            "incompatible slot paths were not isolated");
+
+        BridgeRuntimeSlotManager capacity = new BridgeRuntimeSlotManager(1);
+        BridgeRuntimeSlotAllocation active = capacity.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = firstKey, AgentId = "agent-a", ClientInstanceId = "client-a", OperationId = "active"
+        });
+        BridgeRuntimeSlotAllocation queuedA = capacity.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = secondKey, AgentId = "agent-a", ClientInstanceId = "client-a", OperationId = "queued-a"
+        });
+        BridgeRuntimeSlotAllocation queuedB = capacity.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = secondKey, AgentId = "agent-b", ClientInstanceId = "client-b", OperationId = "queued-b"
+        });
+        Check(!queuedA.Allocated && !queuedB.Allocated && capacity.QueuedRequestCount == 2,
+            "capacity queue did not retain structured requests");
+        Check(!capacity.RecordCoordinatorLaunch(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = secondKey, RequestedRuntimeSlotId = "coordinator-slot",
+            AgentId = "coordinator-agent", ClientInstanceId = "coordinator-client",
+            OperationId = "coordinator-operation"
+        }, new BridgeProcessIdentity { Pid = 10, ProcessStartIdentity = "start-coordinator",
+            RuntimeSlotId = "coordinator-slot" }) && capacity.QueuedRequestCount == 2,
+            "unavailable coordinator launch left an orphaned slot queue entry");
+        Check(capacity.RefuseAttachedProcess(active.Slot.RuntimeSlotId, new BridgeProcessIdentity { Pid = 10 }) ==
+            "attached_live_process_requires_operator", "attached process was claimable");
+        Check(!capacity.ClaimManagedProcess(active.Slot.RuntimeSlotId, new BridgeProcessIdentity
+        {
+            Pid = 10, ProcessStartIdentity = "start-a", RuntimeSlotId = active.Slot.RuntimeSlotId
+        }, "slot-op", "slot-agent", "slot-client"),
+            "attached process was claimable without coordinator provenance");
+        System.Diagnostics.Process managedProcess = System.Diagnostics.Process.GetCurrentProcess();
+        BridgeProcessIdentity expected = new BridgeProcessIdentity
+        {
+            Pid = managedProcess.Id,
+            ProcessStartIdentity = managedProcess.StartTime.ToUniversalTime().Ticks.ToString(
+                CultureInfo.InvariantCulture),
+            SessionId = "session-a", LifecycleGeneration = 1, RuntimeSlotId = active.Slot.RuntimeSlotId,
+            LoadedAssemblyFingerprint = "loaded", ExecutablePath = managedProcess.MainModule.FileName,
+            ProfileFingerprint = BridgeHashing.Sha256("managed-test")
+        };
+        Check(capacity.RecordManagedLaunch(active.Slot.RuntimeSlotId, expected, "active", "agent-a", "client-a"),
+            "managed launch expectation was not recorded");
+        Check(capacity.ClaimManagedProcess(active.Slot.RuntimeSlotId, expected, "active", "agent-a", "client-a"),
+            "managed process was not claimed");
+        Check(!capacity.ClaimManagedProcess(active.Slot.RuntimeSlotId, new BridgeProcessIdentity
+        {
+            Pid = managedProcess.Id, ProcessStartIdentity = "start-reused", SessionId = "session-a",
+            LifecycleGeneration = 1, RuntimeSlotId = active.Slot.RuntimeSlotId,
+            LoadedAssemblyFingerprint = "loaded", ExecutablePath = managedProcess.MainModule.FileName,
+            ProfileFingerprint = BridgeHashing.Sha256("managed-test")
+        }), "PID reuse bypassed process identity");
+        managedProcess.Dispose();
+        Check(capacity.Release(active.Slot.RuntimeSlotId, "active", "agent-a", "client-a", false),
+            "slot lease was not released");
+        BridgeRuntimeSlotAllocation next = capacity.TryAllocateNext();
+        Check(next.Allocated && next.QueueSequence > queuedA.QueueSequence,
+            "fair capacity queue did not admit work after release");
+
+        string durableRoot = Path.Combine(HarnessUserRoot, "durable-slots");
+        BridgeRuntimeSlotManager owner = new BridgeRuntimeSlotManager(1,
+            new BridgeManualClock(DateTime.UtcNow), durableRoot);
+        BridgeRuntimeSlotAllocation owned = owner.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = firstKey, AgentId = "owner-agent", ClientInstanceId = "owner-client",
+            OperationId = "owner-operation"
+        });
+        BridgeRuntimeSlotManager otherInstance = new BridgeRuntimeSlotManager(1,
+            new BridgeManualClock(DateTime.UtcNow), durableRoot);
+        BridgeRuntimeSlotAllocation crossInstanceQueued = otherInstance.Allocate(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = secondKey, AgentId = "other-agent", ClientInstanceId = "other-client",
+            OperationId = "other-operation"
+        });
+        Check(!crossInstanceQueued.Allocated && crossInstanceQueued.CapacityState == "global_process_capacity",
+            "cross-instance slot state was not reloaded or capacity was bypassed");
+        Check(owner.Release(owned.Slot.RuntimeSlotId, "owner-operation", "owner-agent", "owner-client", false),
+            "durable slot owner could not release its lease");
+        BridgeRuntimeSlotAllocation crossInstanceNext = otherInstance.TryAllocateNext();
+        Check(crossInstanceNext.Allocated, "cross-instance slot queue was not promoted after release");
+    }
+
+    private static void CoordinationWireContractAndSlotBoundary()
+    {
+        string raw = "wire|STATUS||agentId=agent-a&clientInstanceId=client-a&connectionSessionId=conn-a" +
+            "&participantId=participant-a&correlationId=corr-a&operationId=operation-a" +
+            "&operationKind=Restart&desiredState=Bridge&keepRunning=true" +
+            "&loadedAssemblyFingerprint=loaded-a&deploymentId=deployment-a&artifactFingerprint=artifact-a" +
+            "&expectedProcessId=42&expectedProcessStartIdentity=start-a&expectedProcessSessionId=session-a" +
+            "&expectedProcessLifecycleGeneration=7";
+        Check(BridgeProtocol.TryParse(raw, "session-a", out BridgeRequest request, out _),
+            "coordination request did not parse");
+        Check(request.KeepRunning && request.ExpectedLoadedAssemblyFingerprint == "loaded-a",
+            "coordination request fields were not parsed");
+        Check(request.ExpectedProcessId == 42 && request.ExpectedProcessStartIdentity == "start-a" &&
+            request.ExpectedProcessSessionId == "session-a" && request.ExpectedProcessLifecycleGeneration == 7,
+            "expected process identity fields were not parsed");
+        Check(!BridgeProtocol.TryParse(raw + "&expectedProcessLifecycleGeneration=8", "session-a",
+            out _, out _), "duplicate expected process lifecycle option was accepted");
+        Equal("operation-a", request.OperationId, "operation id round trip");
+        BridgeResult result = BridgeResult.Ok("coordination.contract");
+        result.CorrelationId = request.CorrelationId;
+        result.AgentId = request.AgentId;
+        result.ClientInstanceId = request.ClientInstanceId;
+        result.ParticipantId = request.ParticipantId;
+        result.OperationId = request.OperationId;
+        result.RuntimeSlotId = "slot-a";
+        result.DeploymentId = request.DeploymentId;
+        result.ArtifactFingerprint = request.ArtifactFingerprint;
+        result.LoadedAssemblyFingerprint = request.ExpectedLoadedAssemblyFingerprint;
+        result.KeepRunning = request.KeepRunning;
+        string json = BridgeProtocol.Serialize(result, "json");
+        Check(json.Contains("loadedAssemblyFingerprint") && json.Contains("keepRunning"),
+            "coordination response fields were not serialized");
+
+        BridgeOperationCompatibilityKey artifactA = BridgeOperationCompatibilityKey.Create(
+            BridgeOperationKind.Deployment, BridgeDesiredState.Bridge, "managed-test", "1.6", "mods",
+            "load-order", "source", "slot", "core", "adapter", "config", "user", "save", "map",
+            false, 1, "deployment", "deployment-a", "artifact-a", "loaded-a");
+        BridgeOperationCompatibilityKey artifactB = BridgeOperationCompatibilityKey.Create(
+            BridgeOperationKind.Deployment, BridgeDesiredState.Bridge, "managed-test", "1.6", "mods",
+            "load-order", "source", "slot", "core", "adapter", "config", "user", "save", "map",
+            false, 1, "deployment", "deployment-b", "artifact-a", "loaded-a");
+        Check(!artifactA.Equals(artifactB), "deployment identity was omitted from compatibility");
+
+        string root = Path.Combine(HarnessUserRoot, "unsafe-slot-boundary");
+        BridgeRuntimeSlotManager manager = new BridgeRuntimeSlotManager(1,
+            new BridgeManualClock(DateTime.UtcNow), root);
+        try
+        {
+            manager.Allocate(new BridgeRuntimeSlotRequest
+            {
+                Compatibility = artifactA,
+                RequestedRuntimeSlotId = "..",
+                AgentId = "agent-a",
+                ClientInstanceId = "client-a",
+                OperationId = "operation-a"
+            });
+            throw new InvalidOperationException("runtime slot path escaped");
+        }
+        catch (ArgumentException exception)
+        {
+            Equal("runtime_slot_id_invalid", exception.Message, "unsafe slot rejection");
+        }
+    }
+
+    private static void CoordinateRequestRequiresLaunchProvenance()
+    {
+        string root = Path.Combine(HarnessUserRoot, "coordinate-provenance");
+        BridgeSharedOperationCoordinator operations = new BridgeSharedOperationCoordinator(
+            new BridgeManualClock(DateTime.UtcNow), Path.Combine(root, "operations.json"));
+        BridgeRuntimeSlotManager slots = new BridgeRuntimeSlotManager(1,
+            new BridgeManualClock(DateTime.UtcNow), Path.Combine(root, "slots"));
+        BridgeRequest request = new BridgeRequest
+        {
+            RequestId = "coordinate-request",
+            AgentId = "coordinate-agent",
+            ClientInstanceId = "coordinate-client",
+            ConnectionSessionId = "coordinate-connection",
+            CorrelationId = "coordinate-correlation",
+            ParticipantId = "coordinate-participant",
+            OperationId = "coordinate-operation",
+            OperationKind = "Restart",
+            DesiredState = "Bridge",
+            RuntimeSlotId = "coordinate-slot",
+            ManagedProfile = "managed-test",
+            RequiresProcessReplacement = true
+        };
+        BridgeResult result = BridgeRuntime.CoordinateRequestForTests(request, operations, slots);
+        Check(result != null && result.Status == BridgeStatus.FORBIDDEN &&
+            string.Equals(FieldValue(result, "error"), "managed_process_identity_required",
+                StringComparison.Ordinal), "coordinate request claimed an unproven process");
+        Check(slots.Snapshot().All(item => !item.ActiveProcess || item.Process != null),
+            "failed coordinate request retained an unproven active slot");
+
+        string successRoot = Path.Combine(HarnessUserRoot, "coordinate-provenance-success");
+        BridgeSharedOperationCoordinator successOperations = new BridgeSharedOperationCoordinator(
+            new BridgeManualClock(DateTime.UtcNow), Path.Combine(successRoot, "operations.json"));
+        BridgeRuntimeSlotManager successSlots = new BridgeRuntimeSlotManager(1,
+            new BridgeManualClock(DateTime.UtcNow), Path.Combine(successRoot, "slots"));
+        BridgeOperationCompatibilityKey successCompatibility = BridgeOperationCompatibilityKey.Create(
+            BridgeOperationKind.Restart, BridgeDesiredState.Bridge, "managed-test", "test-version", "test-mods",
+            "test-order", "test-build", "coordinate-success-slot", "test-core", "test-adapter",
+            "test-config", "test-user", null, null, false, 0, "none");
+        BridgeRequest successRequest = new BridgeRequest
+        {
+            RequestId = "coordinate-success-request",
+            AgentId = "coordinate-success-agent",
+            ClientInstanceId = "coordinate-success-client",
+            ConnectionSessionId = "coordinate-success-connection",
+            CorrelationId = "coordinate-success-correlation",
+            ParticipantId = "coordinate-success-participant",
+            OperationId = "coordinate-success-operation",
+            OperationKind = "Restart",
+            DesiredState = "Bridge",
+            RuntimeSlotId = "coordinate-success-slot",
+            ManagedProfile = "managed-test",
+            RimWorldVersion = "test-version",
+            ModSetFingerprint = "test-mods",
+            ModLoadOrderFingerprint = "test-order",
+            SourceBuildIdentity = "test-build",
+            ExpectedCoreFingerprint = "test-core",
+            ExpectedAdapterFingerprint = "test-adapter",
+            ConfigurationFingerprint = "test-config",
+            UserRootFingerprint = "test-user",
+            MutationScope = "none"
+        };
+        System.Diagnostics.Process current = System.Diagnostics.Process.GetCurrentProcess();
+        string currentStart = current.StartTime.ToUniversalTime().Ticks.ToString(CultureInfo.InvariantCulture);
+        bool recorded = successSlots.RecordCoordinatorLaunch(new BridgeRuntimeSlotRequest
+        {
+            Compatibility = successCompatibility, RequestedRuntimeSlotId = successRequest.RuntimeSlotId,
+            AgentId = successRequest.AgentId, ClientInstanceId = successRequest.ClientInstanceId,
+            OperationId = successRequest.OperationId
+        }, new BridgeProcessIdentity
+        {
+            Pid = current.Id, ProcessStartIdentity = currentStart,
+            ExecutablePath = current.MainModule.FileName, RuntimeSlotId = successRequest.RuntimeSlotId,
+            ProfileFingerprint = BridgeHashing.Sha256(successRequest.ManagedProfile)
+        });
+        current.Dispose();
+        Check(recorded, "coordinator launch provenance could not be recorded for the managed process");
+        BridgeResult successResult = BridgeRuntime.CoordinateRequestForTests(successRequest,
+            successOperations, successSlots);
+        Check(successResult == null && successSlots.Snapshot().Single().Process != null,
+            "coordinator launch provenance did not authorize the matching process");
+        BridgeClientIdentity successIdentity = BridgeClientIdentity.Create(successRequest.AgentId,
+            successRequest.ClientInstanceId, successRequest.ConnectionSessionId, successRequest.CorrelationId,
+            successRequest.ParticipantId);
+        successOperations.Complete(successRequest.OperationId, successIdentity, null, "ok");
+        successSlots.Release(successRequest.RuntimeSlotId, successRequest.OperationId, successRequest.AgentId,
+            successRequest.ClientInstanceId, false);
+    }
+
+    private static BridgeOperationCompatibilityKey TestCompatibility(string sourceBuild, long lifecycle,
+        bool requiresReplacement)
+    {
+        return BridgeOperationCompatibilityKey.Create(BridgeOperationKind.Restart, BridgeDesiredState.Bridge,
+            "managed-test", "1.6", "mods", "load-order", sourceBuild, "slot", "core", "adapter", "config",
+            "user-root", "save", "map", requiresReplacement, lifecycle, "none");
+    }
+
+    private static void ExpectInvalidOperation(Action action, string message)
+    {
+        try
+        {
+            action();
+            throw new InvalidOperationException(message);
+        }
+        catch (InvalidOperationException exception) when (exception.Message == message)
+        {
+            throw;
+        }
+        catch (InvalidOperationException)
+        {
+            // Expected authorization or ownership rejection.
+        }
     }
 
     private static void RuntimeBoundaryCharacterization()

@@ -9,13 +9,19 @@ namespace RimWorldDevBridge
         private readonly BridgeMainThreadContext mainThread;
         private readonly Func<string> sessionId;
         private readonly Func<BridgeRequest, bool> isCurrentTransport;
+        private readonly Func<BridgeRequest, BridgeResult> coordinateRequest;
+        private readonly Action<BridgeRequest, BridgeResult> coordinatedCompletion;
 
         internal BridgeRequestPreparation(BridgeMainThreadContext mainThread, Func<string> sessionId,
-            Func<BridgeRequest, bool> isCurrentTransport)
+            Func<BridgeRequest, bool> isCurrentTransport,
+            Func<BridgeRequest, BridgeResult> coordinateRequest = null,
+            Action<BridgeRequest, BridgeResult> coordinatedCompletion = null)
         {
             this.mainThread = mainThread;
             this.sessionId = sessionId;
             this.isCurrentTransport = isCurrentTransport;
+            this.coordinateRequest = coordinateRequest;
+            this.coordinatedCompletion = coordinatedCompletion;
         }
 
         internal BridgePreparationResult Prepare(BridgeRequest request)
@@ -75,7 +81,7 @@ namespace RimWorldDevBridge
             return result.Failure;
         }
 
-        private static BridgeResult PrepareRequest(BridgeRequest request,
+        private BridgeResult PrepareRequest(BridgeRequest request,
             out BridgeCommandDescriptor descriptor)
         {
             if (request.Expired)
@@ -88,7 +94,16 @@ namespace RimWorldDevBridge
             request.Mode = descriptor.Mode;
             request.Cost = descriptor.Cost;
             request.PreparedDescriptor = descriptor.Clone();
-            return BridgeDispatch.Prepare(request);
+            BridgeResult coordinationFailure = coordinateRequest?.Invoke(request);
+            if (coordinationFailure != null)
+            {
+                if (request.SharedOperationRegistered) coordinatedCompletion?.Invoke(request, coordinationFailure);
+                return coordinationFailure;
+            }
+            BridgeResult result = BridgeDispatch.Prepare(request);
+            if (result != null && request.SharedOperationRegistered)
+                coordinatedCompletion?.Invoke(request, result);
+            return result;
         }
     }
 }

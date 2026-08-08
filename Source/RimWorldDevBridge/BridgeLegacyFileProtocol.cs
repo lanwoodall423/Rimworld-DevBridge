@@ -13,16 +13,19 @@ namespace RimWorldDevBridge
         private readonly BridgeRequestPreparation preparation;
         private readonly BridgeScheduler scheduler;
         private readonly Func<BridgeResult, BridgeRequest, string, string, BridgeResult> decorate;
+        private readonly Action<BridgeRequest, BridgeResult> coordinatedCompletion;
 
         internal BridgeLegacyFileProtocol(Action assertMainThread, Func<string> sessionId,
             BridgeRequestPreparation preparation, BridgeScheduler scheduler,
-            Func<BridgeResult, BridgeRequest, string, string, BridgeResult> decorate)
+            Func<BridgeResult, BridgeRequest, string, string, BridgeResult> decorate,
+            Action<BridgeRequest, BridgeResult> coordinatedCompletion = null)
         {
             this.assertMainThread = assertMainThread;
             this.sessionId = sessionId;
             this.preparation = preparation;
             this.scheduler = scheduler;
             this.decorate = decorate;
+            this.coordinatedCompletion = coordinatedCompletion;
         }
 
         internal void Process()
@@ -64,6 +67,7 @@ namespace RimWorldDevBridge
                 BridgeResult enqueue = scheduler.Enqueue(request);
                 if (enqueue != null)
                 {
+                    if (request.SharedOperationRegistered) coordinatedCompletion?.Invoke(request, enqueue);
                     decorate(enqueue, request, descriptor.Provider, descriptor.ProviderVersion);
                     BridgeFileOperations.AtomicWrite(outputPath, BridgeProtocol.Serialize(enqueue, "line"));
                     return;

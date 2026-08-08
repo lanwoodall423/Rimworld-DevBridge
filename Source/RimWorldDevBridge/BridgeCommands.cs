@@ -101,11 +101,11 @@ namespace RimWorldDevBridge
                 case "HELP": return Help(context.Request.Argument);
                 case "DESCRIBE": return DescribeResult(context.Request.Argument);
                 case "WRITE_LEASE": return BridgeRuntime.AcquireWriteLease(context.Request.Argument,
-                    context.Request.AgentId);
+                    context.Request.AgentId, context.Request.ClientInstanceId, context.Request.ClientCredential);
                 case "RENEW_WRITE_LEASE": return BridgeRuntime.RenewWriteLease(LeaseToken(context.Request),
-                    context.Request.AgentId);
+                    context.Request.AgentId, context.Request.ClientInstanceId, context.Request.ClientCredential);
                 case "REVOKE_WRITE_LEASE": return BridgeRuntime.RevokeWriteLease(LeaseToken(context.Request),
-                    context.Request.AgentId);
+                    context.Request.AgentId, context.Request.ClientInstanceId, context.Request.ClientCredential);
                 case "SET_SPEED": return SetSpeed(context.Request.Argument);
                 case "SCHEDULER_METRICS": return BridgeRuntime.SchedulerMetrics();
                 case "COMMAND_METRICS": return BridgeMetrics.Report();

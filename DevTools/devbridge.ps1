@@ -241,7 +241,12 @@ function Get-AgentId([string] $userRoot, [string] $override) {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         }
-        else { Move-Item -LiteralPath $temporary -Destination $path -Force }
+        else {
+            try { Move-Item -LiteralPath $temporary -Destination $path -Force -ErrorAction Stop }
+            catch {
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw }
+            }
+        }
     }
     finally {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) {
@@ -252,6 +257,87 @@ function Get-AgentId([string] $userRoot, [string] $override) {
         $value = ([IO.File]::ReadAllText($path)).Trim()
     }
     return [ordered]@{ value = $value; persisted = $true }
+}
+
+function Get-ClientInstanceId([string] $override, $config) {
+    $candidate = $override
+    if ([string]::IsNullOrWhiteSpace($candidate) -and $config) { $candidate = [string]$config.clientInstanceId }
+    if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = $env:RIMWORLD_DEVBRIDGE_CLIENT_INSTANCE_ID }
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        if ($candidate -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$') { throw "client_instance_id_invalid" }
+        return [ordered]@{ value = $candidate; persisted = $false }
+    }
+    $directory = if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        Join-Path $env:APPDATA "RimWorldDevBridge"
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+        Join-Path $env:XDG_CONFIG_HOME "RimWorldDevBridge"
+    } else { $null }
+    if ($null -eq $directory) { return [ordered]@{ value = "client-" + [Guid]::NewGuid().ToString("N"); persisted = $false } }
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+    $path = Join-Path $directory "ClientInstanceId.txt"
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $existing = ([IO.File]::ReadAllText($path)).Trim()
+        if ($existing -match '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$') {
+            return [ordered]@{ value = $existing; persisted = $true }
+        }
+    }
+    $value = "client-" + [Guid]::NewGuid().ToString("N")
+    $temporary = $path + ".tmp." + [Guid]::NewGuid().ToString("N")
+    try {
+        [IO.File]::WriteAllText($temporary, $value + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            try { Move-Item -LiteralPath $temporary -Destination $path -Force -ErrorAction Stop }
+            catch {
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw }
+            }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+    if (Test-Path -LiteralPath $path -PathType Leaf) { $value = ([IO.File]::ReadAllText($path)).Trim() }
+    return [ordered]@{ value = $value; persisted = $true }
+}
+
+function Get-ConnectionSessionId([string] $override) {
+    if (-not [string]::IsNullOrWhiteSpace($override)) {
+        if ($override -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$') { throw "connection_session_id_invalid" }
+        return $override
+    }
+    return "connection-" + [Guid]::NewGuid().ToString("N")
+}
+
+function Get-ClientCredential([string] $override, $config) {
+    $candidate = $override
+    if ([string]::IsNullOrWhiteSpace($candidate) -and $config) { $candidate = [string]$config.clientCredential }
+    if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = $env:RIMWORLD_DEVBRIDGE_CLIENT_CREDENTIAL }
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        if ($candidate -notmatch '^[A-Za-z0-9+/=_:-]{16,256}$') { throw "client_credential_invalid" }
+        return $candidate
+    }
+    $directory = if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        Join-Path $env:APPDATA "RimWorldDevBridge"
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:XDG_CONFIG_HOME)) {
+        Join-Path $env:XDG_CONFIG_HOME "RimWorldDevBridge"
+    } else { $null }
+    if ($null -eq $directory) { return $null }
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+    $path = Join-Path $directory "ClientCredential.txt"
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        $existing = ([IO.File]::ReadAllText($path)).Trim()
+        if ($existing -match '^[A-Za-z0-9+/=_:-]{16,256}$') { return $existing }
+    }
+    $value = ([Guid]::NewGuid().ToString("N") + [Guid]::NewGuid().ToString("N"))
+    $temporary = $path + ".tmp." + [Guid]::NewGuid().ToString("N")
+    try {
+        [IO.File]::WriteAllText($temporary, $value + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+        try { Move-Item -LiteralPath $temporary -Destination $path -Force -ErrorAction Stop }
+        catch { if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw } }
+    }
+    finally { if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue } }
+    return ([IO.File]::ReadAllText($path)).Trim()
 }
 
 function Get-ClientStatePath([string] $userRoot) {
@@ -280,16 +366,19 @@ function Save-ClientState([string] $userRoot, $state) {
     }
 }
 
-function Get-LeaseToken([string] $userRoot, [string] $explicit, [string] $session, [string] $agentId) {
+function Get-LeaseToken([string] $userRoot, [string] $explicit, [string] $session, [string] $agentId,
+    [string] $clientInstanceId = $null) {
     if (-not [string]::IsNullOrWhiteSpace($explicit)) { return $explicit }
     $state = Read-ClientState $userRoot
-    if ($state -and $state.agentId -eq $agentId -and $state.session -eq $session) {
+    if ($state -and $state.agentId -eq $agentId -and $state.session -eq $session -and
+        ([string]::IsNullOrWhiteSpace($clientInstanceId) -or $state.clientInstanceId -eq $clientInstanceId)) {
         return [string]$state.leaseToken
     }
     return $null
 }
 
-function Save-LeaseFromResponse([string] $userRoot, $response, [string] $session, [string] $agentId) {
+function Save-LeaseFromResponse([string] $userRoot, $response, [string] $session, [string] $agentId,
+    [string] $clientInstanceId = $null) {
     if ($null -eq $response) { return }
     $token = $null
     foreach ($name in @("lease", "leaseToken")) {
@@ -302,17 +391,20 @@ function Save-LeaseFromResponse([string] $userRoot, $response, [string] $session
     if ([string]::IsNullOrWhiteSpace($token)) { return }
     Save-ClientState $userRoot ([ordered]@{
         agentId = $agentId
+        clientInstanceId = $clientInstanceId
         session = $session
         leaseToken = $token
         savedUtc = [DateTime]::UtcNow.ToString("o")
     })
 }
 
-function Clear-LeaseState([string] $userRoot) {
+function Clear-LeaseState([string] $userRoot, [string] $agentId = $null, [string] $clientInstanceId = $null) {
     $path = Get-ClientStatePath $userRoot
-    if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) {
-        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-    }
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
+    $state = Read-ClientState $userRoot
+    if ([string]::IsNullOrWhiteSpace($agentId) -or [string]::IsNullOrWhiteSpace($clientInstanceId) -or
+        $state.agentId -ne $agentId -or $state.clientInstanceId -ne $clientInstanceId) { return }
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
 }
 
 function Get-BridgeStatus([string] $bridgeRoot, [string] $userRoot, [string] $agentId, $config) {
@@ -436,7 +528,20 @@ function Convert-BridgeResponse([string] $raw, [string] $agentId, [string] $idem
 
 function Test-ResponseOk($response) {
     return $null -ne $response -and $response.PSObject.Properties["status"] -and
-        ([string]$response.status).ToUpperInvariant() -eq "OK"
+        ([string]$response.status).ToUpperInvariant() -in @("OK", "PARTIAL")
+}
+
+function ConvertTo-BridgeWireValue([string] $value) {
+    return [Uri]::EscapeDataString([string]$value)
+}
+
+function Get-BridgeTextSha256([string] $value) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($algorithm.ComputeHash(
+            [Text.Encoding]::UTF8.GetBytes([string]$value))) -replace "-", "").ToUpperInvariant()
+    }
+    finally { $algorithm.Dispose() }
 }
 
 function Test-ActivationEligibleReason([string] $reason) {
@@ -451,6 +556,9 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
     $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
     $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
     $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
+    $clientInstance = Get-ClientInstanceId (Get-Value $values "--client-instance-id") $config
+    $clientCredential = Get-ClientCredential (Get-Value $values "--client-credential") $config
+    $connectionSessionId = Get-ConnectionSessionId (Get-Value $values "--connection-session-id")
     if ($null -eq $bridgeRoot -or $null -eq $userRoot) {
         $script:ExitCode = 3
         return New-ErrorResult "path_unavailable" "Supply --bridge-root/--user-root or RIMWORLD_DEVBRIDGE_BRIDGE_ROOT/RIMWORLD_DEVBRIDGE_USER_ROOT."
@@ -507,17 +615,58 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
     }
     $effectiveLease = $leaseToken
     if ([string]::IsNullOrWhiteSpace($effectiveLease)) {
-        $effectiveLease = Get-LeaseToken $userRoot $null $status.session $agent.value
+        $effectiveLease = Get-LeaseToken $userRoot $null $status.session $agent.value $clientInstance.value
     }
-    $options = @("format=json", "agentId=$($agent.value)", "workspaceId=$workspaceId", "timeoutMs=$timeout")
-    if (-not [string]::IsNullOrWhiteSpace($effectiveLease)) { $options += "lease=$effectiveLease" }
-    if (-not [string]::IsNullOrWhiteSpace($idempotencyKey)) { $options += "idempotency=$idempotencyKey" }
+    $requestId = [Guid]::NewGuid().ToString("N")
+    $correlationId = Get-Value $values "--correlation-id" $requestId
+    if ([string]::IsNullOrWhiteSpace($correlationId) -or $correlationId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') {
+        throw "correlation_id_invalid"
+    }
+    $options = @("format=json", "agentId=$(ConvertTo-BridgeWireValue $agent.value)",
+        "clientInstanceId=$(ConvertTo-BridgeWireValue $clientInstance.value)",
+        "clientCredential=$(ConvertTo-BridgeWireValue $clientCredential)",
+        "connectionSessionId=$(ConvertTo-BridgeWireValue $connectionSessionId)",
+        "correlationId=$(ConvertTo-BridgeWireValue $correlationId)",
+        "workspaceId=$(ConvertTo-BridgeWireValue $workspaceId)", "timeoutMs=$timeout")
+    $participantId = Get-Value $values "--participant-id"
+    if (-not [string]::IsNullOrWhiteSpace($participantId)) {
+        $options += "participantId=$(ConvertTo-BridgeWireValue $participantId)"
+    }
+    $operationId = Get-Value $values "--operation-id"
+    if (-not [string]::IsNullOrWhiteSpace($operationId)) {
+        $options += "operationId=$(ConvertTo-BridgeWireValue $operationId)"
+    }
+    foreach ($identityOption in @(
+            "operation-kind", "desired-state", "compatibility-key", "runtime-slot-id", "deployment-id",
+            "artifact-fingerprint", "loaded-assembly-fingerprint", "managed-profile", "rimworld-version",
+            "mod-set-fingerprint", "mod-load-order-fingerprint", "source-build-identity",
+             "expected-core-fingerprint", "expected-adapter-fingerprint", "configuration-fingerprint",
+             "user-root-fingerprint", "save-target", "map-target", "requires-process-replacement",
+             "lifecycle-generation", "mutation-scope", "expected-process-id",
+             "expected-process-start-identity", "expected-process-session-id",
+             "expected-process-lifecycle-generation")) {
+        $identityValue = Get-Value $values "--$identityOption"
+        if (-not [string]::IsNullOrWhiteSpace($identityValue)) {
+            $parts = @($identityOption -split "-")
+            $wireName = $parts[0]
+            for ($partIndex = 1; $partIndex -lt $parts.Count; $partIndex++) {
+                $wireName += $parts[$partIndex].Substring(0, 1).ToUpperInvariant() + $parts[$partIndex].Substring(1)
+            }
+            $options += "$wireName=$(ConvertTo-BridgeWireValue $identityValue)"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($effectiveLease)) {
+        $options += "lease=$(ConvertTo-BridgeWireValue $effectiveLease)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($idempotencyKey)) {
+        $options += "idempotency=$(ConvertTo-BridgeWireValue $idempotencyKey)"
+    }
     if (Has-Flag $values "--allow-expensive") { $options += "allowExpensive=true" }
     foreach ($option in $values) {
         if ($option -like "--option=*") { $options += $option.Substring(9) }
     }
     if ($null -eq $argument) { $argument = "" }
-    $requestId = [Guid]::NewGuid().ToString("N")
+    if ($argument -match '[|\r\n]') { throw "bridge_argument_invalid: pipe and newline characters are not supported" }
     $line = $rawStatus["token"] + "|" + $requestId + "|" + $command.ToUpperInvariant() + "|" +
         $argument + "|" + ($options -join "&")
     $client = [Net.Sockets.TcpClient]::new()
@@ -544,12 +693,20 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
         $parsed = $null
         try { $parsed = $rawResponse.Trim() | ConvertFrom-Json } catch { }
         if ($command -eq "WRITE_LEASE" -and $parsed -and (Test-ResponseOk $parsed)) {
-            Save-LeaseFromResponse $userRoot $parsed $status.session $agent.value
+            Save-LeaseFromResponse $userRoot $parsed $status.session $agent.value $clientInstance.value
         }
         if ($command -eq "REVOKE_WRITE_LEASE" -and $parsed -and (Test-ResponseOk $parsed)) {
-            Clear-LeaseState $userRoot
+            Clear-LeaseState $userRoot $agent.value $clientInstance.value
         }
         $response = Convert-BridgeResponse $rawResponse $agent.value $idempotencyKey
+        if ($response -is [System.Management.Automation.PSCustomObject]) {
+            Add-Member -InputObject $response -NotePropertyName clientInstanceId -NotePropertyValue $clientInstance.value -Force
+            Add-Member -InputObject $response -NotePropertyName connectionSessionId -NotePropertyValue $connectionSessionId -Force
+            Add-Member -InputObject $response -NotePropertyName correlationId -NotePropertyValue $correlationId -Force
+            if (-not [string]::IsNullOrWhiteSpace($participantId)) {
+                Add-Member -InputObject $response -NotePropertyName participantId -NotePropertyValue $participantId -Force
+            }
+        }
         if (-not (Test-ResponseOk $response) -and $response.PSObject.Properties["status"]) {
             $script:ExitCode = 6
         }
@@ -1206,8 +1363,15 @@ function Write-ActivationProgress([string] $state, [string] $phase, [int64] $ela
 function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [string] $userRoot,
     [int] $timeoutMs) {
     $result = @("--bridge-root", $bridgeRoot, "--user-root", $userRoot)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $allowed = @(
-        "--agent-id", "--package-id", "--layout", "--coordinator-path", "--launch-profile-path",
+        "--agent-id", "--client-instance-id", "--connection-session-id", "--participant-id", "--correlation-id",
+         "--operation-id", "--operation-kind", "--desired-state", "--compatibility-key", "--runtime-slot-id", "--deployment-id",
+         "--artifact-fingerprint", "--loaded-assembly-fingerprint", "--required-adapter-fingerprint",
+         "--expected-process-id", "--expected-process-start-identity", "--expected-process-session-id",
+         "--expected-process-lifecycle-generation",
+         "--mod-set-fingerprint", "--mod-load-order-fingerprint", "--source-build-identity", "--rimworld-version",
+         "--save-target", "--map-target", "--package-id", "--layout", "--coordinator-path", "--launch-profile-path",
         "--profile-user-root", "--game-path", "--working-directory", "--arguments", "--game-arguments",
         "--mod-configuration", "--sandbox-authorization-path", "--reason",
         "--max-launch-attempts", "--launch-backoff-ms", "--required-core-fingerprint",
@@ -1218,6 +1382,11 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
         $value = [string]$values[$index]
         $name = if ($value.Contains("=")) { $value.Substring(0, $value.IndexOf("=")) } else { $value }
         if ($allowed -notcontains $name) { continue }
+        if (-not $seen.Add($name)) {
+            if (-not $value.Contains("=") -and $index + 1 -lt $values.Count -and
+                -not ([string]$values[$index + 1]).StartsWith("--")) { $index++ }
+            continue
+        }
         $result += $value
         $nextValue = if ($index + 1 -lt $values.Count) { [string]$values[$index + 1] } else { "" }
         if (-not $value.Contains("=") -and $index + 1 -lt $values.Count -and
@@ -1228,7 +1397,10 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
     }
     $requestedReadiness = Get-Value $values "--readiness" "bridge"
     if ($requestedReadiness -notin @("bridge", "game", "map")) { $requestedReadiness = "bridge" }
-    $result += @("--readiness", $requestedReadiness, "--save-policy", "none", "--keep-running", "--timeout-ms", [string]$timeoutMs)
+    if (-not ($result | Where-Object { $_ -eq "--readiness" -or $_ -like "--readiness=*" })) {
+        $result += @("--readiness", $requestedReadiness)
+    }
+    $result += @("--save-policy", "none", "--keep-running", "--timeout-ms", [string]$timeoutMs)
     $targetPostcondition = Get-Value $values "--target-postcondition" $requestedReadiness
     if (-not ($result -contains "--target-postcondition") -and
         -not ($result | Where-Object { [string]$_ -like "--target-postcondition=*" })) {
@@ -1451,6 +1623,7 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     $savePolicy = Get-Value $values "--save-policy" "none"
     if ($savePolicy -notin @("none", "development-copy")) { throw "save_policy_invalid: use none or development-copy" }
     $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
+    $clientInstance = Get-ClientInstanceId (Get-Value $values "--client-instance-id") $config
     try {
         $profile = Get-ManagedLaunchProfile $values $config $userRoot
         $authorization = Get-SandboxAuthorization $values $config $userRoot $profile
@@ -1472,7 +1645,15 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         $script:ExitCode = 3
         return New-ErrorResult ("coordinator_" + $coordinator.status) "A validated coordinator executable is required; use --ensure-runtime-tools or configure --coordinator-path."
     }
-    $heartbeat = Invoke-Coordinator "heartbeat" $values
+    $userRootFingerprint = Get-BridgeTextSha256 ([IO.Path]::GetFullPath($userRoot))
+    $runtimeSlotId = Get-Value $values "--runtime-slot-id"
+    if ([string]::IsNullOrWhiteSpace($runtimeSlotId)) { $runtimeSlotId = "slot-" + $userRootFingerprint.Substring(0, 16) }
+    $heartbeatValues = @($values)
+    if (-not ($values -contains "--runtime-slot-id") -and
+        -not (@($values | Where-Object { ([string]$_).StartsWith("--runtime-slot-id=", [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)) {
+        $heartbeatValues += @("--runtime-slot-id", $runtimeSlotId)
+    }
+    $heartbeat = Invoke-Coordinator "heartbeat" $heartbeatValues
     $ownership = $heartbeat.ownership
     $ownedProcessId = 0
     if ($ownership -and $ownership.running -and $ownership.owned) {
@@ -1491,7 +1672,7 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         "--user-data-root", $profile.userDataRoot, "--mod-configuration", $profile.modConfiguration,
         "--launch-profile", "managed-test", "--owned"
     )
-    Clear-LeaseState $userRoot
+    Clear-LeaseState $userRoot $agent.value $clientInstance.value
     $preStatus = Get-BridgeStatus $bridgeRoot $userRoot $agent.value $config
     $requiresNewProcess = (Has-Flag $values "--requires-new-process") -or
         [bool]($ownership -and $ownership.running -and $ownership.owned)
@@ -1517,9 +1698,44 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     } elseif ($preStatus -and -not [string]::IsNullOrWhiteSpace([string]$preStatus.coreFingerprint)) {
         [string]$preStatus.coreFingerprint
     } else { "" }
+    $connectionSessionId = Get-ConnectionSessionId (Get-Value $values "--connection-session-id")
+    $correlationId = Get-Value $values "--correlation-id" ("correlation-" + [Guid]::NewGuid().ToString("N"))
+    $participantId = Get-Value $values "--participant-id" ("participant-" + [Guid]::NewGuid().ToString("N"))
+    $operationId = Get-Value $values "--operation-id" ("operation-" + [Guid]::NewGuid().ToString("N"))
+    $requiredAdapterFingerprint = Get-Value $values "--required-adapter-fingerprint" (Get-Value $values "--adapter-fingerprint")
+    $artifactFingerprint = Get-Value $values "--artifact-fingerprint"
+    $loadedAssemblyFingerprint = Get-Value $values "--loaded-assembly-fingerprint"
+    $compatibilityKey = Get-Value $values "--compatibility-key"
+    if ([string]::IsNullOrWhiteSpace($compatibilityKey)) {
+        $modSetFingerprint = Get-Value $values "--mod-set-fingerprint" "unknown-mod-set"
+        $modLoadOrderFingerprint = Get-Value $values "--mod-load-order-fingerprint" $profile.modConfiguration
+        $configurationFingerprint = Get-BridgeTextSha256 (($profile.modConfiguration, $profile.arguments) -join "|")
+        $sourceBuildIdentity = Get-Value $values "--source-build-identity" $requiredCoreFingerprint
+        $rimWorldVersion = Get-Value $values "--rimworld-version" "unknown-rimworld-version"
+        $saveTarget = Get-Value $values "--save-target" $savePolicy
+        $mapTarget = Get-Value $values "--map-target" "unknown-map"
+        $canonical = @(
+            "operationKind=Restart", "desiredState=$targetPostcondition",
+            "managedProfile=managed-test", "rimWorldVersion=$rimWorldVersion",
+            "modSetFingerprint=$modSetFingerprint", "modLoadOrderFingerprint=$modLoadOrderFingerprint",
+            "sourceBuildIdentity=$sourceBuildIdentity", "deploymentSlot=$runtimeSlotId",
+            "expectedCoreFingerprint=$requiredCoreFingerprint", "expectedAdapterFingerprint=$requiredAdapterFingerprint",
+            "configurationFingerprint=$configurationFingerprint", "userRootFingerprint=$userRootFingerprint",
+            "saveTarget=$saveTarget", "mapTarget=$mapTarget",
+            "requiresProcessReplacement=$requiresNewProcess",
+            "lifecycleGeneration=$([string](Get-Value $values "--requested-lifecycle-generation" "0"))",
+            "mutationScope=restart") -join "|"
+        $compatibilityKey = Get-BridgeTextSha256 $canonical
+    }
     $requestValues = @(
         "--bridge-root", $bridgeRoot, "--user-root", $userRoot,
         "--agent-id", $agent.value, "--package-id", (Get-Value $values "--package-id" "Lan.RimWorldDevBridge"),
+        "--client-instance-id", $clientInstance.value, "--connection-session-id", $connectionSessionId,
+        "--correlation-id", $correlationId, "--participant-id", $participantId,
+        "--client-credential", $clientCredential,
+        "--operation-id", $operationId, "--operation-kind", "Restart",
+        "--desired-state", $targetPostcondition, "--compatibility-key", $compatibilityKey,
+        "--runtime-slot-id", $runtimeSlotId,
         "--readiness", $readiness, "--save-policy", $savePolicy,
         "--reason", (Get-Value $values "--reason" "runtime-verification"),
         "--timeout-ms", (Get-Value $values "--timeout-ms" "120000"),
@@ -1528,6 +1744,19 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     )
     if (-not [string]::IsNullOrWhiteSpace($requiredCoreFingerprint)) {
         $requestValues += @("--required-core-fingerprint", $requiredCoreFingerprint)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($requiredAdapterFingerprint)) {
+        $requestValues += @("--required-adapter-fingerprint", $requiredAdapterFingerprint)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($artifactFingerprint)) {
+        $requestValues += @("--artifact-fingerprint", $artifactFingerprint)
+    }
+    $deploymentId = Get-Value $values "--deployment-id"
+    if (-not [string]::IsNullOrWhiteSpace($deploymentId)) {
+        $requestValues += @("--deployment-id", $deploymentId)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($loadedAssemblyFingerprint)) {
+        $requestValues += @("--loaded-assembly-fingerprint", $loadedAssemblyFingerprint)
     }
     $requestValues += @("--target-postcondition", $targetPostcondition, "--allow-supersede")
     if ($requiresNewProcess) { $requestValues += "--requires-new-process" }
@@ -1541,10 +1770,23 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
         }
     }
     if (Has-Flag $values "--keep-running") { $requestValues += "--keep-running" }
-    $ensureValues = @($launchValues + $requestValues)
+    $ensureValues = @($launchValues)
+    for ($requestIndex = 0; $requestIndex -lt $requestValues.Count; $requestIndex++) {
+        $requestValue = $requestValues[$requestIndex]
+        if ($requestValue -in @("--bridge-root", "--user-root", "--agent-id")) {
+            $requestIndex++
+            continue
+        }
+        $ensureValues += $requestValue
+        if ($requestValue -like "--*" -and $requestIndex + 1 -lt $requestValues.Count -and
+            -not $requestValues[$requestIndex + 1].StartsWith("--")) {
+            $requestIndex++
+            $ensureValues += $requestValues[$requestIndex]
+        }
+    }
     $ensure = Invoke-Coordinator "ensure" $ensureValues
     if (-not $ensure.ok) {
-        Clear-LeaseState $userRoot
+        Clear-LeaseState $userRoot $agent.value $clientInstance.value
         $script:ExitCode = 4
         return New-RestartEnsureResult "FAILED" $false $false "none" $ensure.phase $null "retry restart ensure within the bounded managed-launch policy" $ensure ([string]$ensure.error)
     }
@@ -1571,7 +1813,7 @@ function Invoke-RestartEnsure([string[]] $values, [scriptblock] $ProgressCallbac
     $result.readiness = $readiness
     $result.contextHandshake = if ($wait.contextHandshake) { $wait.contextHandshake } else { $null }
     if ($wait.phase -ne "READY") {
-        Clear-LeaseState $userRoot
+        Clear-LeaseState $userRoot $agent.value $clientInstance.value
         $script:ExitCode = 4
     }
     return $result
@@ -1647,9 +1889,11 @@ function Invoke-ActivationRecovery([string[]] $values, [string] $initialReason) 
     $started = [DateTime]::UtcNow
     $deadline = $started.AddMilliseconds($timeoutMs)
     $operationId = "activation-" + [Guid]::NewGuid().ToString("N")
+    $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
+    $clientInstance = Get-ClientInstanceId (Get-Value $values "--client-instance-id") $config
     $lock = $null
-    # Activation invalidates the prior session for every caller, including coalesced waiters.
-    Clear-LeaseState $userRoot
+    # Activation invalidates only this client instance's prior lease.
+    Clear-LeaseState $userRoot $agent.value $clientInstance.value
     while ([DateTime]::UtcNow -lt $deadline) {
         $lock = Try-OpenActivationLock $userRoot
         if ($lock) { break }
@@ -1783,13 +2027,17 @@ function Write-GoalOperation([string] $userRoot, $state) {
 }
 
 function New-GoalOperation([string] $goalId, [string] $desiredState, [string] $packageId,
-    [int] $timeoutMs, [int] $noProgressTimeoutMs, [bool] $keepRunning) {
+    [int] $timeoutMs, [int] $noProgressTimeoutMs, [bool] $keepRunning,
+    [string] $agentId, [string] $clientInstanceId, [string] $participantId) {
     $now = [DateTime]::UtcNow
     return [ordered]@{
         schema = 1
         operationKind = "runtime_goal"
         goalId = $goalId
         operationId = "goal-" + [Guid]::NewGuid().ToString("N")
+        agentId = $agentId
+        clientInstanceId = $clientInstanceId
+        participantId = $participantId
         packageId = $packageId
         desiredState = $desiredState
         operationState = "queued"
@@ -1816,10 +2064,16 @@ function New-GoalOperation([string] $goalId, [string] $desiredState, [string] $p
     }
 }
 
+function Test-GoalOwner($state, [string] $agentId, [string] $clientInstanceId, [string] $participantId) {
+    return $null -ne $state -and [string]$state.agentId -eq $agentId -and
+        [string]$state.clientInstanceId -eq $clientInstanceId -and
+        [string]$state.participantId -eq $participantId
+}
+
 function Get-GoalResponse($state, [string] $correlationId = $null) {
     if ($null -eq $state) { return New-ErrorResult "goal_not_found" "The durable goal operation was not found." }
     $result = [ordered]@{}
-    foreach ($property in @("ok", "code", "message", "correlationId", "goalId", "operationId", "operationState", "phase", "desiredState", "packageId", "startedUtc", "updatedUtc", "progressSequence", "pid", "sessionId", "lifecycleGeneration", "coreFingerprint", "cycleId", "ticket", "contextFresh", "recoverable", "requiredAction", "waitFor", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction", "resourcesReleased", "evidence", "details")) {
+    foreach ($property in @("ok", "code", "message", "correlationId", "goalId", "operationId", "agentId", "clientInstanceId", "participantId", "operationState", "phase", "desiredState", "packageId", "startedUtc", "updatedUtc", "progressSequence", "pid", "sessionId", "lifecycleGeneration", "coreFingerprint", "cycleId", "ticket", "contextFresh", "recoverable", "requiredAction", "waitFor", "keepRunning", "retrySafe", "operatorActionRequired", "nextAction", "resourcesReleased", "evidence", "details")) {
         if ($state -is [System.Collections.IDictionary] -and $state.Contains($property)) { $result[$property] = $state[$property] }
         elseif ($state.PSObject.Properties[$property]) { $result[$property] = $state.$property }
     }
@@ -1872,16 +2126,27 @@ function Get-GoalDeadline([string] $value, [int] $fallbackMs) {
     catch { return [DateTime]::UtcNow.AddMilliseconds($fallbackMs) }
 }
 
-function Wait-GoalOperation([string] $userRoot, [string] $goalId, [int] $timeoutMs, [string] $correlationId) {
+function Wait-GoalOperation([string] $userRoot, [string] $goalId, [int] $timeoutMs, [string] $correlationId,
+    [string] $agentId, [string] $clientInstanceId, [string] $participantId) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
     while ([DateTime]::UtcNow -lt $deadline) {
         $state = Read-GoalOperation $userRoot $goalId
+        if ($state -and -not (Test-GoalOwner $state $agentId $clientInstanceId $participantId)) {
+            $ownerError = New-ErrorResult "goal_owner_mismatch" "The goal belongs to a different client participant."
+            $ownerError.correlationId = $correlationId
+            return $ownerError
+        }
         if ($state -and [string]$state.operationState -in @("succeeded", "failed", "cancelled", "checkpointed")) {
             return Get-GoalResponse $state $correlationId
         }
         Start-Sleep -Milliseconds 100
     }
     $state = Read-GoalOperation $userRoot $goalId
+    if ($state -and -not (Test-GoalOwner $state $agentId $clientInstanceId $participantId)) {
+        $ownerError = New-ErrorResult "goal_owner_mismatch" "The goal belongs to a different client participant."
+        $ownerError.correlationId = $correlationId
+        return $ownerError
+    }
     $result = Get-GoalResponse $state $correlationId
     $result.ok = $false
     $result.code = "goal_wait_timeout"
@@ -2020,14 +2285,22 @@ function Invoke-Goal([string[]] $values) {
     $config = Get-ClientConfig
     $userRoot = Resolve-UserRoot (Get-Value $values "--user-root") $config
     $bridgeRoot = Resolve-BridgeRoot (Get-Value $values "--bridge-root") $config
+    $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
+    $clientInstance = Get-ClientInstanceId (Get-Value $values "--client-instance-id") $config
     if ($null -eq $userRoot -or $null -eq $bridgeRoot) { $script:ExitCode = 3; return New-ErrorResult "configuration_error" "bridge and user roots are required" }
     if ($values.Count -lt 1) { throw "goal_operation_required: use ensure, status, wait, cancel, checkpoint, or resume" }
     $operation = $values[0].ToLowerInvariant()
     $goalId = Get-Value $values "--goal-id"
+    $participantId = Get-Value $values "--participant-id" ("participant-goal-" +
+        (Get-BridgeTextSha256 $goalId).Substring(0, 16).ToLowerInvariant())
     if ([string]::IsNullOrWhiteSpace($goalId) -and $operation -ne "list") { throw "goal_id_required: use --goal-id" }
     if (-not [string]::IsNullOrWhiteSpace($goalId) -and -not (Test-GoalId $goalId)) { throw "goal_id_invalid" }
     if ($operation -eq "status" -or $operation -eq "get") {
         $statusState = Read-GoalOperation $userRoot $goalId
+        if ($statusState -and -not (Test-GoalOwner $statusState $agent.value $clientInstance.value $participantId)) {
+            $script:ExitCode = 4
+            return New-ErrorResult "goal_owner_mismatch" "The goal belongs to a different client participant."
+        }
         if ($statusState -and [string]$statusState.operationState -eq "failed") { $script:ExitCode = 3 }
         return Get-GoalResponse $statusState (Get-Value $values "--correlation-id")
     }
@@ -2037,7 +2310,11 @@ function Invoke-Goal([string[]] $values) {
         try {
             $state = Read-GoalOperation $userRoot $goalId
             if ($null -eq $state) { $script:ExitCode = 3; return New-ErrorResult "goal_not_found" "The goal operation was not found." }
-            Clear-LeaseState $userRoot
+            if (-not (Test-GoalOwner $state $agent.value $clientInstance.value $participantId)) {
+                $script:ExitCode = 4
+                return New-ErrorResult "goal_owner_mismatch" "The goal belongs to a different client participant."
+            }
+            Clear-LeaseState $userRoot $agent.value $clientInstance.value
             Set-GoalProperty $state "resourcesReleased" $true
             Set-GoalProperty $state "cancellationRequested" ($operation -eq "cancel")
             Set-GoalProperty $state "operationState" $(if ($operation -eq "cancel") { "cancelled" } else { "checkpointed" })
@@ -2049,7 +2326,7 @@ function Invoke-Goal([string[]] $values) {
         }
         finally { $lock.Dispose() }
     }
-    if ($operation -eq "wait") { return Wait-GoalOperation $userRoot $goalId ([int](Get-Value $values "--timeout-ms" "120000")) (Get-Value $values "--correlation-id") }
+    if ($operation -eq "wait") { return Wait-GoalOperation $userRoot $goalId ([int](Get-Value $values "--timeout-ms" "120000")) (Get-Value $values "--correlation-id") $agent.value $clientInstance.value $participantId }
     if ($operation -notin @("ensure", "resume")) { throw "goal_operation_invalid: use ensure, status, wait, cancel, checkpoint, or resume" }
     $desiredOption = Get-Value $values "--desired-state"
     $desired = if ([string]::IsNullOrWhiteSpace([string]$desiredOption)) { "test_ready" } else { [string]$desiredOption }
@@ -2062,20 +2339,34 @@ function Invoke-Goal([string[]] $values) {
     if ($goalNoProgressMs -lt 1000 -or $goalNoProgressMs -gt 600000) { throw "goal_no_progress_timeout_invalid: use 1000..600000 ms" }
     $packageOption = Get-Value $values "--package-id"
     $packageId = if ([string]::IsNullOrWhiteSpace([string]$packageOption)) { "Lan.RimWorldDevBridge" } else { [string]$packageOption }
-    $agent = Get-AgentId $userRoot (Get-Value $values "--agent-id")
     $lock = Try-OpenGoalLock (Get-GoalLockPath $userRoot $goalId)
-    if (-not $lock) { return Wait-GoalOperation $userRoot $goalId $goalTimeoutMs (Get-Value $values "--correlation-id") }
+    if (-not $lock) { return Wait-GoalOperation $userRoot $goalId $goalTimeoutMs (Get-Value $values "--correlation-id") $agent.value $clientInstance.value $participantId }
     try {
         $state = Read-GoalOperation $userRoot $goalId
+        $legacyUnownedResume = $state -and $operation -eq "resume" -and
+            [string]::IsNullOrWhiteSpace([string]$state.agentId) -and
+            [string]::IsNullOrWhiteSpace([string]$state.clientInstanceId) -and
+            [string]::IsNullOrWhiteSpace([string]$state.participantId)
+        if ($state -and -not $legacyUnownedResume -and
+            -not (Test-GoalOwner $state $agent.value $clientInstance.value $participantId)) {
+            return New-ErrorResult "goal_owner_mismatch" "The goal belongs to a different client participant."
+        }
         if ($operation -eq "resume" -and $state -and [string]$state.operationState -eq "succeeded") {
             return Get-GoalResponse $state (Get-Value $values "--correlation-id")
         }
         if ($operation -eq "resume" -and $state) {
+            if ($legacyUnownedResume) {
+                Set-GoalProperty $state "agentId" $agent.value
+                Set-GoalProperty $state "clientInstanceId" $clientInstance.value
+                Set-GoalProperty $state "participantId" $participantId
+            }
             if ([string]::IsNullOrWhiteSpace([string]$desiredOption)) { $desired = [string]$state.desiredState }
             if ([string]::IsNullOrWhiteSpace([string]$packageOption)) { $packageId = [string]$state.packageId }
         }
         if ($null -eq $state -or $operation -eq "resume") {
-            if ($null -eq $state) { $state = New-GoalOperation $goalId $desired $packageId $goalTimeoutMs $goalNoProgressMs $true }
+            if ($null -eq $state) {
+                $state = New-GoalOperation $goalId $desired $packageId $goalTimeoutMs $goalNoProgressMs $true $agent.value $clientInstance.value $participantId
+            }
             else {
                 Set-GoalProperty $state "operationState" "queued"
                 Set-GoalProperty $state "phase" "QUEUED"
@@ -2100,7 +2391,7 @@ function Invoke-Goal([string[]] $values) {
         try { return Invoke-GoalDriver $values $bridgeRoot $userRoot $state $agent $config }
         finally { $driverLock.Dispose() }
     }
-    return Wait-GoalOperation $userRoot $goalId $goalTimeoutMs (Get-Value $values "--correlation-id")
+    return Wait-GoalOperation $userRoot $goalId $goalTimeoutMs (Get-Value $values "--correlation-id") $agent.value $clientInstance.value $participantId
 }
 
 function Invoke-Wake([string[]] $values) {
@@ -2221,7 +2512,10 @@ function Invoke-Coordinator([string] $operation, [string[]] $values, [bool] $Ens
         $reason = if ($coordinator.status -eq "missing_build_tooling") { "restart_coordinator_missing_build_tooling" } else { "restart_coordinator_unavailable" }
         return New-ErrorResult $reason "coordinatorStatus=$($coordinator.status); use --ensure-runtime-tools or configure --coordinator-path"
     }
-    $coordinatorRoot = Join-Path $userRoot "RimWorld-DevBridge-Coordinator"
+    $scope = Get-Value $values "--runtime-slot-id"
+    if ([string]::IsNullOrWhiteSpace([string]$scope)) { $scope = Get-Value $values "--managed-profile" "default" }
+    $scopeHash = Get-BridgeTextSha256 ([string]$scope).ToLowerInvariant()
+    $coordinatorRoot = Join-Path $userRoot ("RimWorld-DevBridge-Coordinator-" + $scopeHash.Substring(0, 24))
     [IO.Directory]::CreateDirectory($coordinatorRoot) | Out-Null
     $exe = $coordinator.path
     $commonArguments = @('--root', $coordinatorRoot, '--user-root', $userRoot, '--bridge-root', $bridgeRoot)

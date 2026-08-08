@@ -62,9 +62,9 @@ public sealed class CanonicalClient
             process.StartInfo.ArgumentList.Insert(4, _options.ClientPath);
         }
 
-        if (includeClientRoots)
-        {
-            AddClientRoots(process.StartInfo);
+            if (includeClientRoots)
+            {
+                AddClientRoots(process.StartInfo, correlationId);
         }
         try
         {
@@ -117,7 +117,12 @@ public sealed class CanonicalClient
                 return McpToolResponse.Error("mcp_protocol_error", detail, correlationId);
             }
 
-            return McpToolResponse.FromJson(json.Value, correlationId);
+            var response = McpToolResponse.FromJson(json.Value, correlationId);
+            return response with
+            {
+                AgentId = string.IsNullOrWhiteSpace(response.AgentId) ? _options.AgentId : response.AgentId,
+                ClientInstanceId = string.IsNullOrWhiteSpace(response.ClientInstanceId) ? _options.ClientInstanceId : response.ClientInstanceId
+            };
         }
         catch (OperationCanceledException)
         {
@@ -132,7 +137,7 @@ public sealed class CanonicalClient
         }
     }
 
-    private void AddClientRoots(ProcessStartInfo startInfo)
+    private void AddClientRoots(ProcessStartInfo startInfo, string correlationId)
     {
         if (!string.IsNullOrWhiteSpace(_options.BridgeRoot))
         {
@@ -145,6 +150,16 @@ public sealed class CanonicalClient
             startInfo.ArgumentList.Add("--user-root");
             startInfo.ArgumentList.Add(_options.UserRoot);
         }
+
+        startInfo.ArgumentList.Add("--agent-id");
+        startInfo.ArgumentList.Add(_options.AgentId);
+        startInfo.ArgumentList.Add("--client-instance-id");
+        startInfo.ArgumentList.Add(_options.ClientInstanceId);
+        startInfo.ArgumentList.Add("--connection-session-id");
+        startInfo.ArgumentList.Add(string.IsNullOrWhiteSpace(_options.ConnectionSessionId)
+            ? "connection-" + Guid.NewGuid().ToString("N") : _options.ConnectionSessionId);
+        startInfo.ArgumentList.Add("--correlation-id");
+        startInfo.ArgumentList.Add(correlationId);
 
         startInfo.ArgumentList.Add("--json");
     }
