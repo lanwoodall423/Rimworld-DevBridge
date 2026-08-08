@@ -52,6 +52,28 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 29)] public string RequestedPid;
         [DataMember(Order = 30)] public string RequestedSessionId;
         [DataMember(Order = 31)] public bool AllowSupersede;
+        [DataMember(Order = 32)] public string ClientInstanceId;
+        [DataMember(Order = 33)] public string ConnectionSessionId;
+        [DataMember(Order = 34)] public string CorrelationId;
+        [DataMember(Order = 35)] public string ParticipantId;
+        [DataMember(Order = 36)] public string CompatibilityKey;
+        [DataMember(Order = 37)] public string OperationId;
+        [DataMember(Order = 38)] public string RuntimeSlotId;
+        [DataMember(Order = 39)] public string DeploymentId;
+        [DataMember(Order = 40)] public string ArtifactFingerprint;
+        [DataMember(Order = 41)] public string LoadedAssemblyFingerprint;
+        [DataMember(Order = 42)] public string ManagedProfile;
+        [DataMember(Order = 43)] public string RimWorldVersion;
+        [DataMember(Order = 44)] public string ModSetFingerprint;
+        [DataMember(Order = 45)] public string ModLoadOrderFingerprint;
+        [DataMember(Order = 46)] public string SourceBuildIdentity;
+        [DataMember(Order = 47)] public string ConfigurationFingerprint;
+        [DataMember(Order = 48)] public string UserRootFingerprint;
+        [DataMember(Order = 49)] public string SaveTarget;
+        [DataMember(Order = 50)] public string MapTarget;
+        [DataMember(Order = 51)] public string MutationScope;
+        [DataMember(Order = 52)] public string ClientCredential;
+        [DataMember(Order = 53)] public string SandboxAuthorizationPath;
     }
 
     [DataContract]
@@ -87,6 +109,23 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 14)] public int LastExitCode;
         [DataMember(Order = 15)] public bool LastExitCodeKnown;
         [DataMember(Order = 16)] public DateTime LastExitUtc;
+        [DataMember(Order = 17)] public string SandboxAuthorizationPath;
+    }
+
+    [DataContract]
+    internal sealed class SandboxAuthorizationRecord
+    {
+        [DataMember] public int schema { get; set; }
+        [DataMember] public string policy { get; set; }
+        [DataMember] public string scope { get; set; }
+        [DataMember] public bool operatorConfirmed { get; set; }
+        [DataMember] public string profile { get; set; }
+        [DataMember] public string executable { get; set; }
+        [DataMember] public string executableSha256 { get; set; }
+        [DataMember] public string workingDirectory { get; set; }
+        [DataMember] public string arguments { get; set; }
+        [DataMember] public string userDataRoot { get; set; }
+        [DataMember] public string modConfiguration { get; set; }
     }
 
     [DataContract]
@@ -167,8 +206,30 @@ namespace RimWorldDevBridge.RestartCoordinator
                 RequestedLifecycleGeneration = ParseLong(Get(options, "requested-lifecycle-generation", "0"), 0),
                 RequestedPid = Get(options, "requested-pid"),
                 RequestedSessionId = Get(options, "requested-session-id"),
-                AllowSupersede = options.ContainsKey("allow-supersede")
-            };
+                AllowSupersede = options.ContainsKey("allow-supersede"),
+                ClientInstanceId = Get(options, "client-instance-id"),
+                ConnectionSessionId = Get(options, "connection-session-id"),
+                CorrelationId = Get(options, "correlation-id"),
+                ParticipantId = Get(options, "participant-id"),
+                CompatibilityKey = Get(options, "compatibility-key"),
+                OperationId = Get(options, "operation-id"),
+                RuntimeSlotId = Get(options, "runtime-slot-id"),
+                 DeploymentId = Get(options, "deployment-id"),
+                 ArtifactFingerprint = Get(options, "artifact-fingerprint"),
+                 LoadedAssemblyFingerprint = Get(options, "loaded-assembly-fingerprint"),
+                 ManagedProfile = Get(options, "managed-profile", Get(options, "launch-profile")),
+                 RimWorldVersion = Get(options, "rimworld-version"),
+                 ModSetFingerprint = Get(options, "mod-set-fingerprint"),
+                 ModLoadOrderFingerprint = Get(options, "mod-load-order-fingerprint"),
+                 SourceBuildIdentity = Get(options, "source-build-identity"),
+                 ConfigurationFingerprint = Get(options, "configuration-fingerprint"),
+                 UserRootFingerprint = Get(options, "user-root-fingerprint"),
+                 SaveTarget = Get(options, "save-target"),
+                 MapTarget = Get(options, "map-target"),
+                  MutationScope = Get(options, "mutation-scope"),
+                  ClientCredential = Get(options, "client-credential"),
+                  SandboxAuthorizationPath = Get(options, "sandbox-authorization-path")
+             };
         }
 
         private static Dictionary<string, string> Parse(string[] args)
@@ -248,15 +309,19 @@ namespace RimWorldDevBridge.RestartCoordinator
         private readonly string statePath;
         private readonly string secretPath;
         private readonly string journalPath;
+        private readonly string credentialRoot;
         private readonly string pipeName;
         private readonly bool forceKillTestOnly;
         private readonly bool acquireWriterLock;
         private readonly object gate = new object();
+        private readonly BridgeRuntimeSlotManager runtimeSlots;
         private BridgeRestartCoordinatorStateMachine machine;
         private FileStream lockStream;
         private string secret;
         private LaunchRecord launchRecord;
         private Process monitoredProcess;
+        private readonly Dictionary<string, string> cycleCredentials =
+            new Dictionary<string, string>(StringComparer.Ordinal);
 
         internal CoordinatorHost(string root, string userRoot, string bridgeRoot, bool forceKillTestOnly,
             bool acquireWriterLock)
@@ -270,7 +335,10 @@ namespace RimWorldDevBridge.RestartCoordinator
             statePath = Path.Combine(this.root, "state.json");
             secretPath = Path.Combine(this.root, "secret.txt");
             journalPath = Path.Combine(this.root, "journal.log");
+            credentialRoot = Path.Combine(this.root, "credentials");
             pipeName = PipeName(this.root);
+            runtimeSlots = new BridgeRuntimeSlotManager(2,
+                root: Path.Combine(this.userRoot, "Coordination", "slots"));
         }
 
         internal int Serve()
@@ -323,6 +391,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 return new CoordinatorResponse { Ok = false, Error = "coordinator_authentication_failed", ExitCode = 3 };
             lock (gate)
             {
+                RememberCredential(message, message.Ticket);
                 RecoverStaleOwnedProcess();
                 switch ((message.Operation ?? string.Empty).ToLowerInvariant())
                 {
@@ -332,7 +401,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     case "register": return Register(message);
                     case "launch": return Launch(message);
                     case "ensure": return Ensure(message);
-                    case "heartbeat": return Heartbeat();
+                    case "heartbeat": return Heartbeat(message);
                     default: return new CoordinatorResponse { Ok = false, Error = "unknown_coordinator_operation", ExitCode = 2 };
                 }
             }
@@ -351,14 +420,30 @@ namespace RimWorldDevBridge.RestartCoordinator
         private CoordinatorResponse Request(CoordinatorMessage message, bool processAlreadyStarted,
             bool requiresNewProcess)
         {
+            if (string.IsNullOrWhiteSpace(message.RuntimeSlotId))
+            {
+                string rootValue = root;
+                message.RuntimeSlotId = "slot-" + BridgeHashing.Sha256(rootValue).Substring(0, 16);
+            }
             bool owned = launchRecord != null && launchRecord.Owned;
-            BridgeRestartTicketRecord ticket = machine.Request(message.AgentId, message.PackageId,
+            BridgeClientIdentity identity = IdentityFor(message);
+            string agentId = identity.AgentId;
+            BridgeOperationCompatibilityKey compatibility = LegacyCompatibility(message, requiresNewProcess);
+            if (!string.IsNullOrWhiteSpace(message.CompatibilityKey) &&
+                !string.Equals(compatibility.ToString(),
+                    BridgeOperationCompatibilityKey.FromDigest(message.CompatibilityKey).ToString(),
+                    StringComparison.Ordinal))
+                return new CoordinatorResponse { Ok = false, Error = "compatibility_key_mismatch", ExitCode = 2 };
+            BridgeRestartTicketRecord ticket = machine.Request(agentId, message.PackageId,
                 message.Reason, message.Readiness, message.SavePolicy, message.RequiredCoreFingerprint,
                 message.RequiredAdapterFingerprint, owned, message.LiveConfirmedAuthorized,
                 message.LiveConfirmed, processAlreadyStarted, message.MaxLaunchAttempts,
                 message.LaunchBackoffMs, message.TargetPostcondition, requiresNewProcess,
                 message.RequestedLifecycleGeneration, message.RequestedPid, message.RequestedSessionId,
-                message.AllowSupersede, message.TimeoutMs);
+                message.AllowSupersede, message.TimeoutMs, identity, compatibility, message.OperationId,
+                message.RuntimeSlotId, message.DeploymentId, message.ArtifactFingerprint,
+                 message.LoadedAssemblyFingerprint);
+             RememberCredential(message, ticket.Ticket);
             Persist("request " + ticket.Ticket);
             return TicketResponse(ticket);
         }
@@ -366,7 +451,8 @@ namespace RimWorldDevBridge.RestartCoordinator
         private CoordinatorResponse Status(CoordinatorMessage message)
         {
             Pump();
-            BridgeRestartTicketRecord ticket = string.IsNullOrEmpty(message.Ticket) ? null : machine.Ticket(message.Ticket);
+            BridgeClientIdentity identity = IdentityFor(message);
+            BridgeRestartTicketRecord ticket = string.IsNullOrEmpty(message.Ticket) ? null : machine.Ticket(message.Ticket, identity);
             string terminalError = TerminalError(ticket);
             return new CoordinatorResponse
             {
@@ -375,20 +461,21 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Ticket = ticket?.Ticket,
                 CycleId = ticket?.CycleId,
                 Phase = ticket?.Phase,
-                Json = Program.Json(machine.Snapshot),
+                Json = Program.Json(SnapshotFor(identity)),
                 OwnershipJson = Program.Json(GetOwnership()),
                 ExitCode = ticket == null ? 2 : 0
             };
         }
 
-        private CoordinatorResponse Heartbeat()
+        private CoordinatorResponse Heartbeat(CoordinatorMessage message)
         {
             Pump();
+            BridgeClientIdentity identity = IdentityFor(message);
             return new CoordinatorResponse
             {
                 Ok = true,
                 Phase = machine.Snapshot.Phase.ToString(),
-                Json = Program.Json(machine.Snapshot),
+                Json = Program.Json(SnapshotFor(identity)),
                 OwnershipJson = Program.Json(GetOwnership()),
                 ExitCode = 0
             };
@@ -396,11 +483,12 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse Wait(CoordinatorMessage message)
         {
+            BridgeClientIdentity identity = IdentityFor(message);
             DateTime deadline = DateTime.UtcNow.AddMilliseconds(Math.Max(100, message.TimeoutMs));
             while (DateTime.UtcNow < deadline)
             {
                 Pump();
-                BridgeRestartTicketRecord ticket = machine.Ticket(message.Ticket);
+                BridgeRestartTicketRecord ticket = machine.Ticket(message.Ticket, identity);
                 if (ticket == null) return new CoordinatorResponse { Ok = false, Error = "unknown_restart_ticket", ExitCode = 2 };
                 BridgeRestartPhase phase = (BridgeRestartPhase)Enum.Parse(typeof(BridgeRestartPhase), ticket.Phase);
                 if (phase == BridgeRestartPhase.READY || phase == BridgeRestartPhase.FAILED ||
@@ -408,7 +496,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                     return TicketResponse(ticket);
                 Thread.Sleep(250);
             }
-            BridgeRestartTicketRecord timeout = machine.Ticket(message.Ticket);
+            BridgeRestartTicketRecord timeout = machine.Ticket(message.Ticket, identity);
             string timeoutError = timeout != null &&
                 (timeout.Phase == BridgeRestartPhase.STARTING.ToString() ||
                  timeout.Phase == BridgeRestartPhase.WAITING_FOR_BRIDGE.ToString()) ?
@@ -418,6 +506,11 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private CoordinatorResponse Ensure(CoordinatorMessage message)
         {
+            if (launchRecord != null && launchRecord.Owned && !LaunchRecordAuthorized())
+            {
+                launchRecord.Owned = false;
+                Persist("managed launch authorization no longer valid");
+            }
             if (launchRecord != null && !launchRecord.Owned)
             {
                 return new CoordinatorResponse
@@ -472,12 +565,20 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             if (string.IsNullOrWhiteSpace(message.GamePath) || !File.Exists(message.GamePath))
                 return new CoordinatorResponse { Ok = false, Error = "validated_game_executable_required", ExitCode = 2 };
+            if (message.Owned && !string.Equals(message.LaunchProfile, "managed-test",
+                    StringComparison.OrdinalIgnoreCase))
+                return new CoordinatorResponse { Ok = false, Error = "validated_launch_profile_required", ExitCode = 2 };
             string working = string.IsNullOrWhiteSpace(message.WorkingDirectory) ?
                 Path.GetDirectoryName(Path.GetFullPath(message.GamePath)) : Path.GetFullPath(message.WorkingDirectory);
             if (!Directory.Exists(working)) return new CoordinatorResponse { Ok = false, Error = "working_directory_missing", ExitCode = 2 };
             string userDataRoot = string.IsNullOrWhiteSpace(message.UserDataRoot) ? userRoot :
                 Path.GetFullPath(message.UserDataRoot);
             if (!Directory.Exists(userDataRoot)) return new CoordinatorResponse { Ok = false, Error = "user_data_root_missing", ExitCode = 2 };
+            if (!StringComparer.OrdinalIgnoreCase.Equals(userDataRoot, userRoot))
+                return new CoordinatorResponse { Ok = false, Error = "managed_test_user_root_mismatch", ExitCode = 2 };
+            if (message.Owned && !SandboxAuthorized(message, message.GamePath, working, userDataRoot,
+                    message.Arguments ?? string.Empty, message.ModConfiguration ?? string.Empty))
+                return new CoordinatorResponse { Ok = false, Error = "sandbox_authorization_required", ExitCode = 3 };
             launchRecord = new LaunchRecord
             {
                 GamePath = Path.GetFullPath(message.GamePath),
@@ -489,6 +590,7 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Environment = Limit(message.Environment, 8192),
                 LaunchProfile = Limit(message.LaunchProfile, 256),
                 UserDataRoot = userDataRoot,
+                SandboxAuthorizationPath = message.SandboxAuthorizationPath,
                 ProfileValidatedUtc = DateTime.UtcNow
             };
             launchRecord.ProfileFingerprint = ProfileFingerprint(launchRecord);
@@ -500,6 +602,41 @@ namespace RimWorldDevBridge.RestartCoordinator
                 Json = Program.Json(launchRecord),
                 OwnershipJson = Program.Json(GetOwnership())
             };
+        }
+
+        private bool SandboxAuthorized(CoordinatorMessage message, string gamePath, string workingDirectory,
+            string userDataRoot, string arguments, string modConfiguration)
+        {
+            string path = string.IsNullOrWhiteSpace(message.SandboxAuthorizationPath) ?
+                Path.Combine(userRoot, "RimWorld-DevBridge-SandboxAuthorization.json") :
+                Path.GetFullPath(message.SandboxAuthorizationPath);
+            string rootPrefix = userRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
+                Path.DirectorySeparatorChar;
+            if (!path.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(path)) return false;
+            try
+            {
+                SandboxAuthorizationRecord authorization;
+                byte[] authorizationBytes = File.ReadAllBytes(path);
+                int authorizationOffset = authorizationBytes.Length >= 3 && authorizationBytes[0] == 0xEF &&
+                    authorizationBytes[1] == 0xBB && authorizationBytes[2] == 0xBF ? 3 : 0;
+                using (MemoryStream stream = new MemoryStream(authorizationBytes, authorizationOffset,
+                    authorizationBytes.Length - authorizationOffset, false))
+                    authorization = (SandboxAuthorizationRecord)new DataContractJsonSerializer(
+                        typeof(SandboxAuthorizationRecord)).ReadObject(stream);
+                string executable = Path.GetFullPath(gamePath);
+                string expectedHash = BridgeHashing.FileSha256(executable);
+                return authorization != null && authorization.schema == 1 &&
+                    authorization.policy == "explicit-operator-disposable-sandbox" &&
+                    authorization.scope == "coordinator-owned-managed-test" && authorization.operatorConfirmed &&
+                    authorization.profile == "managed-test" &&
+                    StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(authorization.userDataRoot), userRoot) &&
+                    StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(authorization.executable), executable) &&
+                    StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(authorization.workingDirectory),
+                        Path.GetFullPath(workingDirectory)) && authorization.arguments == arguments &&
+                    authorization.modConfiguration == modConfiguration &&
+                    StringComparer.OrdinalIgnoreCase.Equals(authorization.executableSha256, expectedHash);
+            }
+            catch { return false; }
         }
 
         private CoordinatorResponse Launch(CoordinatorMessage message)
@@ -616,7 +753,8 @@ namespace RimWorldDevBridge.RestartCoordinator
                             Get(bridgeStatus, "bootId"), Get(bridgeStatus, "session"),
                             Get(bridgeStatus, "transportGeneration"), Get(bridgeStatus, "coreFingerprint"),
                             cycle.RequiredAdapterFingerprint,
-                            ParseLong(Get(bridgeStatus, "lifecycleGeneration"), 0));
+                            ParseLong(Get(bridgeStatus, "lifecycleGeneration"), 0),
+                            Get(bridgeStatus, "loadedAssemblyFingerprint"));
                         if (string.Equals(cycle.Readiness, "bridge", StringComparison.OrdinalIgnoreCase))
                         {
                             machine.SetPhase(cycle.CycleId, BridgeRestartPhase.READY,
@@ -737,6 +875,8 @@ namespace RimWorldDevBridge.RestartCoordinator
                 launchRecord.LastExitCode = 0;
                 launchRecord.LastExitUtc = default(DateTime);
                 machine.SetStartedPid(cycle.CycleId, startedProcess.Id.ToString());
+                if (!RecordCoordinatorLaunch(cycle, startedProcess))
+                    throw new InvalidOperationException("managed_launch_provenance_required");
                 machine.SetPhase(cycle.CycleId, BridgeRestartPhase.WAITING_FOR_BRIDGE);
                 Persist("started pid=" + startedProcess.Id);
             }
@@ -745,6 +885,52 @@ namespace RimWorldDevBridge.RestartCoordinator
                 CloseStartedProcess(startedProcess);
                 HandleManagedLaunchFailure(cycle, "launch_profile_invalid:" + exception.GetType().Name);
             }
+        }
+
+        private bool RecordCoordinatorLaunch(BridgeRestartCycleRecord cycle, Process process)
+        {
+            if (cycle == null || process == null || string.IsNullOrWhiteSpace(cycle.RuntimeSlotId) ||
+                string.IsNullOrWhiteSpace(cycle.OperationId)) return false;
+            BridgeOperationCompatibilityKey compatibility = CycleCompatibility(cycle);
+            string start = process.StartTime.ToUniversalTime().Ticks.ToString(CultureInfo.InvariantCulture);
+            BridgeProcessIdentity expected = new BridgeProcessIdentity
+            {
+                Pid = process.Id,
+                ProcessStartIdentity = start,
+                ExecutablePath = launchRecord.GamePath,
+                ProfileFingerprint = BridgeHashing.Sha256(cycle.ManagedProfile ?? string.Empty),
+                RuntimeSlotId = cycle.RuntimeSlotId,
+                LifecycleGeneration = compatibility.LifecycleGeneration,
+                LoadedAssemblyFingerprint = cycle.LoadedAssemblyFingerprint ?? string.Empty
+            };
+            BridgeRuntimeSlotRequest slotRequest = new BridgeRuntimeSlotRequest
+            {
+                Compatibility = compatibility,
+                RequestedRuntimeSlotId = cycle.RuntimeSlotId,
+                AgentId = cycle.PrimaryAgentId,
+                ClientInstanceId = cycle.PrimaryClientInstanceId,
+                OperationId = cycle.OperationId,
+                RequiresNewProcess = cycle.RequiresNewProcess
+            };
+            bool recorded = runtimeSlots.RecordCoordinatorLaunch(slotRequest, expected);
+            return recorded;
+        }
+
+        private static BridgeOperationCompatibilityKey CycleCompatibility(BridgeRestartCycleRecord cycle)
+        {
+            BridgeDesiredState desired;
+            if (!TryParseDesiredState(cycle.TargetPostcondition ?? cycle.Readiness ?? "bridge", out desired))
+                desired = BridgeDesiredState.Bridge;
+            return BridgeOperationCompatibilityKey.Create(BridgeOperationKind.Restart, desired,
+                cycle.ManagedProfile ?? "managed-test", cycle.RimWorldVersion ?? "unknown-rimworld-version",
+                cycle.ModSetFingerprint ?? "unknown-mod-set", cycle.ModLoadOrderFingerprint ?? "unknown-load-order",
+                cycle.SourceBuildIdentity ?? cycle.RequiredCoreFingerprint ?? "unknown-build",
+                cycle.RuntimeSlotId ?? "default", cycle.RequiredCoreFingerprint ?? "unknown-core",
+                cycle.RequiredAdapterFingerprint ?? "unknown-adapter", cycle.ConfigurationFingerprint ?? "unknown-config",
+                cycle.UserRootFingerprint ?? "unknown-user-root", cycle.SaveTarget ?? cycle.SavePolicy ?? "none",
+                cycle.MapTarget ?? "unknown-map", cycle.RequiresNewProcess, cycle.RequestedLifecycleGeneration,
+                cycle.MutationScope ?? "restart", cycle.DeploymentId, cycle.ArtifactFingerprint,
+                cycle.LoadedAssemblyFingerprint);
         }
 
         private static void CloseStartedProcess(Process process)
@@ -804,6 +990,7 @@ namespace RimWorldDevBridge.RestartCoordinator
 
         private void ClearLaunchProcessIdentity()
         {
+            ClearCoordinatorProvenance();
             if (launchRecord != null)
             {
                 launchRecord.ProcessId = 0;
@@ -815,6 +1002,27 @@ namespace RimWorldDevBridge.RestartCoordinator
                 monitoredProcess = null;
             }
             machine.ClearOwnedProcess();
+        }
+
+        private void ClearCoordinatorProvenance()
+        {
+            if (launchRecord == null || launchRecord.ProcessId <= 0) return;
+            BridgeRestartCycleRecord cycle = machine.Snapshot.Cycles.FirstOrDefault(item =>
+                item.OperationId != null && item.RuntimeSlotId != null &&
+                string.Equals(item.NewPid, launchRecord.ProcessId.ToString(), StringComparison.Ordinal));
+            if (cycle == null) return;
+            BridgeProcessIdentity expected = new BridgeProcessIdentity
+            {
+                Pid = launchRecord.ProcessId,
+                ProcessStartIdentity = launchRecord.ProcessStartTimeUtcTicks.ToString(CultureInfo.InvariantCulture),
+                ExecutablePath = launchRecord.GamePath,
+                ProfileFingerprint = BridgeHashing.Sha256(cycle.ManagedProfile ?? string.Empty),
+                RuntimeSlotId = cycle.RuntimeSlotId,
+                LifecycleGeneration = cycle.RequestedLifecycleGeneration,
+                LoadedAssemblyFingerprint = cycle.LoadedAssemblyFingerprint ?? string.Empty
+            };
+            runtimeSlots.ClearCoordinatorLaunch(cycle.RuntimeSlotId, cycle.OperationId,
+                cycle.PrimaryAgentId, cycle.PrimaryClientInstanceId, expected);
         }
 
         private bool TryGetOwnedProcess(out Process process)
@@ -924,6 +1132,7 @@ namespace RimWorldDevBridge.RestartCoordinator
         private Process StartOwned()
         {
             if (launchRecord == null || !launchRecord.Owned) throw new InvalidOperationException("owned_launch_required");
+            if (!LaunchRecordAuthorized()) throw new InvalidOperationException("sandbox_authorization_required");
             ProcessStartInfo info = new ProcessStartInfo
             {
                 FileName = launchRecord.GamePath,
@@ -935,6 +1144,23 @@ namespace RimWorldDevBridge.RestartCoordinator
             Process process = Process.Start(info);
             if (process == null) throw new InvalidOperationException("process_start_failed");
             return process;
+        }
+
+        private bool LaunchRecordAuthorized()
+        {
+            if (launchRecord == null) return false;
+            return SandboxAuthorized(new CoordinatorMessage
+            {
+                GamePath = launchRecord.GamePath,
+                WorkingDirectory = launchRecord.WorkingDirectory,
+                Arguments = launchRecord.Arguments,
+                UserDataRoot = launchRecord.UserDataRoot,
+                ModConfiguration = launchRecord.ModConfiguration,
+                SandboxAuthorizationPath = launchRecord.SandboxAuthorizationPath,
+                LaunchProfile = launchRecord.LaunchProfile,
+                Owned = true
+            }, launchRecord.GamePath, launchRecord.WorkingDirectory, launchRecord.UserDataRoot,
+                launchRecord.Arguments ?? string.Empty, launchRecord.ModConfiguration ?? string.Empty);
         }
 
         private static void ApplyEnvironment(ProcessStartInfo info, string serialized)
@@ -1011,6 +1237,15 @@ namespace RimWorldDevBridge.RestartCoordinator
                 !string.Equals(Get(status, "processId"), cycle.NewPid, StringComparison.OrdinalIgnoreCase)) return false;
             if (!string.IsNullOrEmpty(cycle.RequiredCoreFingerprint) &&
                 !CoreFingerprintMatches(cycle.RequiredCoreFingerprint, Get(status, "coreFingerprint"))) return false;
+            if (!string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint) &&
+                !string.Equals(cycle.RequiredAdapterFingerprint, Get(status, "adapterFingerprint"),
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.IsNullOrEmpty(cycle.ArtifactFingerprint) &&
+                !string.Equals(cycle.ArtifactFingerprint, Get(status, "artifactFingerprint"),
+                    StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.IsNullOrEmpty(cycle.LoadedAssemblyFingerprint) &&
+                !string.Equals(cycle.LoadedAssemblyFingerprint, Get(status, "loadedAssemblyFingerprint"),
+                    StringComparison.OrdinalIgnoreCase)) return false;
             if (!ReplacementIdentitySatisfied(cycle, status)) return false;
             return true;
         }
@@ -1057,14 +1292,17 @@ namespace RimWorldDevBridge.RestartCoordinator
             string package = machine.Snapshot.Tickets.FirstOrDefault(item => item.CycleId == cycle.CycleId)?.PackageId;
             if (!TryBridge("AGENT_CONTEXT", cycle, out string response, "packageId=" + package)) return false;
             if (response.IndexOf("gameLoaded=true", StringComparison.OrdinalIgnoreCase) < 0) return false;
-            if (cycle.Readiness == "map" && response.IndexOf("mapReady=true", StringComparison.OrdinalIgnoreCase) < 0) return false;
+            if ((cycle.Readiness == "map" || cycle.TargetPostcondition == "map" ||
+                cycle.TargetPostcondition == "test_ready") &&
+                response.IndexOf("mapReady=true", StringComparison.OrdinalIgnoreCase) < 0) return false;
             if (!string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint) &&
                 response.IndexOf(cycle.RequiredAdapterFingerprint, StringComparison.OrdinalIgnoreCase) < 0) return false;
             Dictionary<string, string> status = ReadStatus();
             if (!ReplacementIdentitySatisfied(cycle, status)) return false;
             machine.SetReadyContext(cycle.CycleId, Get(status, "processId"), Get(status, "bootId"),
                 Get(status, "session"), Get(status, "transportGeneration"), Get(status, "coreFingerprint"),
-                cycle.RequiredAdapterFingerprint, ParseLong(Get(status, "lifecycleGeneration"), 0));
+                cycle.RequiredAdapterFingerprint, ParseLong(Get(status, "lifecycleGeneration"), 0),
+                Get(status, "loadedAssemblyFingerprint"), Get(status, "processStartIdentity"));
             return true;
         }
 
@@ -1080,7 +1318,61 @@ namespace RimWorldDevBridge.RestartCoordinator
                 if (string.IsNullOrEmpty(token) || !int.TryParse(Get(status, "port"), out port)) return false;
                 string id = "restart-" + Guid.NewGuid().ToString("N");
                 string session = Get(status, "session");
-                string options = "session=" + Uri.EscapeDataString(session) + "&format=line&deadlineMs=3000";
+                BridgeRestartTicketRecord ticket = machine.Snapshot.Tickets.FirstOrDefault(item =>
+                    string.Equals(item.CycleId, cycle.CycleId, StringComparison.Ordinal));
+                List<string> optionValues = new List<string>
+                {
+                    "session=" + Uri.EscapeDataString(session ?? string.Empty),
+                    "format=line",
+                    "deadlineMs=3000",
+                    "agentId=" + Uri.EscapeDataString(ticket?.AgentId ?? cycle.PrimaryAgentId ?? "restart-coordinator"),
+                    "clientInstanceId=" + Uri.EscapeDataString(ticket?.ClientInstanceId ?? cycle.PrimaryClientInstanceId ?? "restart-client"),
+                    "participantId=" + Uri.EscapeDataString(ticket?.ParticipantId ?? "restart-participant"),
+                    "correlationId=" + Uri.EscapeDataString(ticket?.CorrelationId ?? id),
+                    "operationKind=Restart",
+                    "desiredState=" + Uri.EscapeDataString(cycle.TargetPostcondition ?? "bridge")
+                };
+                string credential;
+                if (ticket != null && TryGetCredential(ticket.Ticket, out credential) &&
+                    !string.IsNullOrWhiteSpace(credential))
+                    optionValues.Add("clientCredential=" + Uri.EscapeDataString(credential));
+                if (!string.IsNullOrEmpty(cycle.OperationId))
+                    optionValues.Add("operationId=" + Uri.EscapeDataString(cycle.OperationId));
+                if (!string.IsNullOrEmpty(cycle.CompatibilityKey))
+                    optionValues.Add("compatibilityKey=" + Uri.EscapeDataString(cycle.CompatibilityKey));
+                if (!string.IsNullOrEmpty(cycle.RuntimeSlotId))
+                    optionValues.Add("runtimeSlotId=" + Uri.EscapeDataString(cycle.RuntimeSlotId));
+                if (!string.IsNullOrEmpty(cycle.DeploymentId))
+                    optionValues.Add("deploymentId=" + Uri.EscapeDataString(cycle.DeploymentId));
+                if (!string.IsNullOrEmpty(cycle.ArtifactFingerprint))
+                    optionValues.Add("artifactFingerprint=" + Uri.EscapeDataString(cycle.ArtifactFingerprint));
+                if (!string.IsNullOrEmpty(cycle.LoadedAssemblyFingerprint))
+                    optionValues.Add("loadedAssemblyFingerprint=" + Uri.EscapeDataString(cycle.LoadedAssemblyFingerprint));
+                AddBridgeOption(optionValues, "expectedProcessId", cycle.NewPid);
+                AddBridgeOption(optionValues, "expectedProcessStartIdentity", ticket?.ProcessStartIdentity ??
+                    cycle.ProcessStartIdentity);
+                AddBridgeOption(optionValues, "expectedProcessSessionId", cycle.NewSessionId);
+                if (cycle.NewLifecycleGeneration > 0)
+                    AddBridgeOption(optionValues, "expectedProcessLifecycleGeneration",
+                        cycle.NewLifecycleGeneration.ToString(CultureInfo.InvariantCulture));
+                AddBridgeOption(optionValues, "managedProfile", cycle.ManagedProfile);
+                AddBridgeOption(optionValues, "rimWorldVersion", cycle.RimWorldVersion);
+                AddBridgeOption(optionValues, "modSetFingerprint", cycle.ModSetFingerprint);
+                AddBridgeOption(optionValues, "modLoadOrderFingerprint", cycle.ModLoadOrderFingerprint);
+                AddBridgeOption(optionValues, "sourceBuildIdentity", cycle.SourceBuildIdentity);
+                AddBridgeOption(optionValues, "configurationFingerprint", cycle.ConfigurationFingerprint);
+                AddBridgeOption(optionValues, "userRootFingerprint", cycle.UserRootFingerprint);
+                AddBridgeOption(optionValues, "saveTarget", cycle.SaveTarget);
+                AddBridgeOption(optionValues, "mapTarget", cycle.MapTarget);
+                AddBridgeOption(optionValues, "mutationScope", cycle.MutationScope);
+                if (cycle.NewLifecycleGeneration > 0)
+                {
+                    AddBridgeOption(optionValues, "lifecycleGeneration",
+                        cycle.NewLifecycleGeneration.ToString(CultureInfo.InvariantCulture));
+                }
+                if (cycle.RequiresNewProcess)
+                    optionValues.Add("requiresProcessReplacement=true");
+                string options = string.Join("&", optionValues.ToArray());
                 string line = token + "|" + id + "|" + command + "|" + (argument ?? string.Empty) + "|" + options + "\n";
                 using (TcpClient client = new TcpClient("127.0.0.1", port))
                 using (NetworkStream stream = client.GetStream())
@@ -1198,6 +1490,125 @@ namespace RimWorldDevBridge.RestartCoordinator
                 OwnershipJson = Program.Json(GetOwnership()),
                 ExitCode = string.IsNullOrWhiteSpace(terminalError) ? 0 : 4
             };
+        }
+
+        private void RememberCredential(CoordinatorMessage message, string ticketId)
+        {
+            if (message == null || string.IsNullOrWhiteSpace(message.ClientCredential) ||
+                string.IsNullOrWhiteSpace(ticketId)) return;
+            cycleCredentials[ticketId] = message.ClientCredential;
+            try
+            {
+                Directory.CreateDirectory(credentialRoot);
+                byte[] protectedValue = ProtectedData.Protect(Encoding.UTF8.GetBytes(message.ClientCredential),
+                    null, DataProtectionScope.CurrentUser);
+                string path = Path.Combine(credentialRoot, BridgeHashing.Sha256(ticketId) + ".bin");
+                string temporary = path + ".tmp-" + Guid.NewGuid().ToString("N");
+                File.WriteAllBytes(temporary, protectedValue);
+                ReplaceAtomic(temporary, path);
+            }
+            catch { }
+        }
+
+        private bool TryGetCredential(string ticketId, out string credential)
+        {
+            credential = null;
+            if (string.IsNullOrWhiteSpace(ticketId)) return false;
+            if (cycleCredentials.TryGetValue(ticketId, out credential) &&
+                !string.IsNullOrWhiteSpace(credential)) return true;
+            try
+            {
+                string path = Path.Combine(credentialRoot, BridgeHashing.Sha256(ticketId) + ".bin");
+                if (!File.Exists(path)) return false;
+                credential = Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(path),
+                    null, DataProtectionScope.CurrentUser));
+                if (string.IsNullOrWhiteSpace(credential)) return false;
+                cycleCredentials[ticketId] = credential;
+                return true;
+            }
+            catch
+            {
+                credential = null;
+                return false;
+            }
+        }
+
+        private static void AddBridgeOption(List<string> options, string name, string value)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+                options.Add(name + "=" + Uri.EscapeDataString(value));
+        }
+
+        private static BridgeClientIdentity IdentityFor(CoordinatorMessage message)
+        {
+            string agent = string.IsNullOrWhiteSpace(message?.AgentId) ? "coordinator-client" : message.AgentId;
+            string client = string.IsNullOrWhiteSpace(message?.ClientInstanceId) ? "client-coordinator" :
+                message.ClientInstanceId;
+            string connection = string.IsNullOrWhiteSpace(message?.ConnectionSessionId) ?
+                "connection-coordinator" : message.ConnectionSessionId;
+            string correlation = string.IsNullOrWhiteSpace(message?.CorrelationId) ?
+                "correlation-coordinator" : message.CorrelationId;
+            string participant = string.IsNullOrWhiteSpace(message?.ParticipantId) ?
+                "participant-" + BridgeHashing.Sha256(agent).Substring(0, 16).ToLowerInvariant() :
+                message.ParticipantId;
+            return BridgeClientIdentity.Create(agent, client, connection, correlation, participant);
+        }
+
+        private static bool TryParseDesiredState(string value, out BridgeDesiredState desired)
+        {
+            string normalized = string.IsNullOrWhiteSpace(value) ? "bridge" : value.Trim();
+            normalized = normalized.Replace("_", string.Empty).Replace("-", string.Empty);
+            if (string.Equals(normalized, "testready", StringComparison.OrdinalIgnoreCase))
+            {
+                desired = BridgeDesiredState.TestReady;
+                return true;
+            }
+            return Enum.TryParse(normalized, true, out desired);
+        }
+
+        private static BridgeOperationCompatibilityKey LegacyCompatibility(CoordinatorMessage message,
+            bool? effectiveRequiresNewProcess = null)
+        {
+            BridgeDesiredState desired;
+            if (!TryParseDesiredState(message.TargetPostcondition ?? message.Readiness ?? "bridge", out desired))
+                desired = BridgeDesiredState.Bridge;
+            string userRoot = string.IsNullOrWhiteSpace(message.UserDataRoot) ? "unknown-user-root" :
+                BridgeHashing.Sha256(Path.GetFullPath(message.UserDataRoot));
+            return BridgeOperationCompatibilityKey.Create(BridgeOperationKind.Restart, desired,
+                message.ManagedProfile ?? message.LaunchProfile ?? "managed-test",
+                message.RimWorldVersion ?? "unknown-rimworld-version",
+                message.ModSetFingerprint ?? "unknown-mod-set",
+                message.ModLoadOrderFingerprint ?? message.ModConfiguration ?? "unknown-load-order",
+                message.SourceBuildIdentity ?? message.RequiredCoreFingerprint ?? "unknown-build",
+                message.RuntimeSlotId ?? "default", message.RequiredCoreFingerprint ?? "unknown-core",
+                message.RequiredAdapterFingerprint ?? "unknown-adapter",
+                message.ConfigurationFingerprint ?? BridgeHashing.Sha256(
+                    (message.ModConfiguration ?? "unknown-config") + "|" + (message.Arguments ?? string.Empty)),
+                message.UserRootFingerprint ?? userRoot,
+                message.SaveTarget ?? message.SavePath ?? message.SavePolicy ?? "none",
+                message.MapTarget ?? "unknown-map", effectiveRequiresNewProcess ?? message.RequiresNewProcess,
+                message.RequestedLifecycleGeneration, message.MutationScope ?? "restart",
+                message.DeploymentId, message.ArtifactFingerprint, message.LoadedAssemblyFingerprint);
+        }
+
+        private BridgeRestartCoordinatorState SnapshotFor(BridgeClientIdentity identity)
+        {
+            BridgeRestartCoordinatorState result = Program.FromJson<BridgeRestartCoordinatorState>(
+                Program.Json(machine.Snapshot));
+            result.Tickets = result.Tickets.Where(ticket => ticket.AgentId == identity.AgentId &&
+                ticket.ClientInstanceId == identity.ClientInstanceId &&
+                ticket.ParticipantId == identity.ParticipantId).ToList();
+            HashSet<string> cycles = new HashSet<string>(result.Tickets.Select(ticket => ticket.CycleId),
+                StringComparer.Ordinal);
+            result.Cycles = result.Cycles.Where(cycle => cycles.Contains(cycle.CycleId)).ToList();
+            foreach (BridgeRestartCycleRecord cycle in result.Cycles)
+            {
+                cycle.TicketIds = cycle.TicketIds.Where(ticketId => result.Tickets.Any(ticket =>
+                    ticket.Ticket == ticketId)).ToList();
+                cycle.ParticipantIds = cycle.ParticipantIds.Where(participant =>
+                    participant == identity.ParticipantId).ToList();
+            }
+            return result;
         }
 
         private static string TerminalError(BridgeRestartTicketRecord ticket)

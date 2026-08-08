@@ -225,3 +225,30 @@ be preempted and are measured and circuit-broken after serious overruns. A compo
 cannot survive process exit; restart coordination is external and cannot revive an ended Codex run.
 
 See `BRIDGE_HANDOFF.md`, `AGENTS.md`, and `DevTools/DEVBRIDGE_AGENT.md` for the operational workflow.
+
+## Multi-Agent Runtime Isolation
+
+The bridge distinguishes logical agents, stable client instances, connection sessions,
+request correlations, and shared-operation participants. Generated client-instance IDs
+are persisted outside the RimWorld user root for reconnect and quota accounting. These
+identities are sanitized metadata only and never bypass authentication, confirmation,
+leases, coordinator ownership, or quotas.
+
+Durable activation/restart/readiness/save-load/reload/deployment/verification operations
+coalesce compatible participants using a canonical compatibility key. Different goal or
+correlation IDs can join; different profiles, builds, mod/load orders, configuration,
+save/map targets, lifecycle or replacement requirements cannot. Results expose operation,
+slot, deployment, artifact, loaded assembly, process, lifecycle, progress, capacity, and
+keep-running fields. Detach and cancellation affect only the caller's participation.
+
+Managed slots isolate profile, user/config/mod, save, log, IPC, coordinator, evidence,
+resource, and deployment paths. Compatible work shares a slot and incompatible work is
+queued fairly or isolated under a global process cap. Attached/manual processes are
+never claimed. Deployments are atomic and fingerprint-bound; wrong-agent provenance,
+modified outputs, stale ownership, PID reuse, and loaded-assembly mismatches are rejected.
+
+For recovery, preserve `operationId`, `compatibilityKey`, `participantId`,
+`runtimeSlotId`, process start identity, session, lifecycle generation, and progress
+sequence. `capacityState`, `recoverable`, `retrySafe`, `nextAction`, and `keepRunning`
+are authoritative guidance. Do not relaunch on a stale observation or treat
+`attached_live_process_requires_operator` as an automatic-retry state.

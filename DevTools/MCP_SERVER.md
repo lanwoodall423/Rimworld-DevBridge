@@ -232,3 +232,31 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DevTools\Test-DevBridg
 MCP Inspector and a real local Codex registration are required for end-to-end release
 evidence when those tools are installed. An unavailable Inspector, Codex registration,
 or managed RimWorld instance must be reported as unrun, never as passed.
+
+## Coordination Contract
+
+Every result may include the canonical fields `agentId`, `clientInstanceId`,
+`participantId`, `operationId`, `operationKind`, `operationState`, `compatibilityKey`,
+`desiredState`, `runtimeSlotId`, `deploymentId`, `artifactFingerprint`,
+`loadedAssemblyFingerprint`, `pid`, `processStartIdentity`, `sessionId`,
+`lifecycleGeneration`, `progressSequence`, and `capacityState`, in addition to the
+existing recovery fields. These are observations and labels, not authorization.
+Transport authentication, in-game confirmation, write leases, coordinator ownership,
+and quotas remain separate trust boundaries.
+
+Activation, restart, readiness, save/load, adapter reload, deployment, and verification
+use durable participant-aware operations. Correlation IDs, goal IDs, and participant
+IDs do not affect compatibility. Callers with the same canonical key join; a changed
+profile, RimWorld/mod/load-order or source/build identity, deployment slot,
+configuration/user-root/save/map target, process-replacement requirement, lifecycle
+generation, or mutation scope is incompatible. Each participant can join, observe,
+wait, reconnect, detach, or cancel only its own participation. Final-detach behavior
+is persisted and deterministic; it never grants process control.
+
+Managed runtime slots isolate profile, user/config/mod roots, deployment overlay,
+coordinator, IPC, saves, logs, evidence, and resources. Compatible work shares a slot;
+incompatible work waits fairly or receives an isolated slot under the global process
+cap. Manual and attached processes are never claimed. Deployments use scoped locks,
+staged files, atomic publication, exact artifact manifests, and loaded-assembly
+fingerprint matching. Modified output, wrong-agent provenance, stale ownership, PID
+reuse, and loaded mismatch are rejection states, not reasons to relaunch.

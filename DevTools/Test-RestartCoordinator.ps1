@@ -28,10 +28,29 @@ function Invoke-Coordinator([string]$operation, [string[]]$arguments, [int]$expe
     try { return ($output.Trim() | ConvertFrom-Json) } catch { throw "coordinator operation $operation returned invalid JSON: $output" }
 }
 
+function Write-SandboxAuthorization([string]$gamePath, [string]$workingDirectory, [string]$arguments,
+    [string]$userDataRoot, [string]$modConfiguration) {
+    $path = Join-Path $userDataRoot 'RimWorld-DevBridge-SandboxAuthorization.json'
+    [ordered]@{
+        schema = 1
+        policy = 'explicit-operator-disposable-sandbox'
+        scope = 'coordinator-owned-managed-test'
+        operatorConfirmed = $true
+        profile = 'managed-test'
+        executable = [IO.Path]::GetFullPath($gamePath)
+        executableSha256 = (Get-FileHash -LiteralPath $gamePath -Algorithm SHA256).Hash
+        workingDirectory = [IO.Path]::GetFullPath($workingDirectory)
+        arguments = $arguments
+        userDataRoot = [IO.Path]::GetFullPath($userDataRoot)
+        modConfiguration = $modConfiguration
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $path -Encoding UTF8
+}
+
 try {
     $game = (Get-Process -Id $PID).Path
     $working = Split-Path -Parent $game
-    $arguments = '-NoProfile -Command "Start-Sleep -Seconds 30"'
+    $arguments = '-NoProfile -Command Start-Sleep -Seconds 30'
+    Write-SandboxAuthorization $game $working $arguments $userRoot 'managed-test'
     Start-CoordinatorServer $coordinatorRoot $CoordinatorPath
     $launch = Invoke-Coordinator 'launch' @(
         '--game-path', $game, '--working-directory', $working, '--arguments', $arguments,
@@ -43,14 +62,16 @@ try {
     if (-not $ownership.Owned -or -not $ownership.Running -or $ownership.LaunchProfile -ne 'managed-test') { throw 'launch ownership projection was invalid' }
     $processIds.Add([int]$ownership.ProcessId)
 
-    $requestArguments = @('--agent-id', 'coordinator-test-agent', '--package-id', 'Lan.RimWorldDevBridge',
+    $requestIdentity = @('--agent-id', 'coordinator-test-agent', '--client-instance-id', 'coordinator-test-client',
+        '--participant-id', 'coordinator-test-participant')
+    $requestArguments = $requestIdentity + @('--package-id', 'Lan.RimWorldDevBridge',
         '--readiness', 'bridge', '--save-policy', 'none', '--reason', 'coordinator-test', '--timeout-ms', '1000')
     $first = Invoke-Coordinator 'ensure' ($requestArguments + @('--owned'))
     $second = Invoke-Coordinator 'ensure' ($requestArguments + @('--owned'))
     if ([string]::IsNullOrWhiteSpace($first.Ticket) -or $first.CycleId -ne $second.CycleId) {
         throw ('ensure did not coalesce compatible requests first={0} second={1}' -f ($first | ConvertTo-Json -Compress), ($second | ConvertTo-Json -Compress))
     }
-    $status = Invoke-Coordinator 'status' @('--ticket', $first.Ticket)
+    $status = Invoke-Coordinator 'status' ($requestIdentity + @('--ticket', $first.Ticket))
     if (-not $status.OwnershipJson) { throw 'status did not preserve ownership projection' }
 
     $failedRoot = Join-Path $root 'failed-game'
@@ -58,12 +79,15 @@ try {
     Start-CoordinatorServer $failedRoot $CoordinatorPath
     $failedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('exit 7'))
     $failedArguments = "-NoProfile -EncodedCommand $failedCommand"
+    Write-SandboxAuthorization $game $working $failedArguments $userRoot 'managed-test'
     $failedLaunch = & $CoordinatorPath launch '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
         '--game-path' $game '--working-directory' $working '--arguments' $failedArguments '--user-data-root' $userRoot `
         '--mod-configuration' 'managed-test' '--launch-profile' 'managed-test' '--owned' 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "failed-game launch failed: $failedLaunch" }
+    $failedIdentity = @('--agent-id', 'failed-game-agent', '--client-instance-id', 'failed-game-client',
+        '--participant-id', 'failed-game-participant')
     $failedEnsure = & $CoordinatorPath ensure '--root' $failedRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
-        '--agent-id' 'failed-game-agent' '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
+        $failedIdentity '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
         '--timeout-ms' '3000' '--owned' 2>&1 | Out-String
     $failedEnsureJson = $failedEnsure.Trim() | ConvertFrom-Json
     if ([string]::IsNullOrWhiteSpace($failedEnsureJson.Ticket)) { throw "failed-game ensure returned no ticket: $failedEnsure" }
@@ -73,7 +97,7 @@ try {
     $waitTwoError = Join-Path $failedRoot 'wait-two.err'
     $waitArguments = @('wait', '--root', $failedRoot, '--user-root', $userRoot,
         '--bridge-root', (Split-Path -Parent $PSScriptRoot), '--ticket', $failedEnsureJson.Ticket,
-        '--timeout-ms', '10000')
+        '--timeout-ms', '10000') + $failedIdentity
     $waitOne = Start-Process -FilePath $CoordinatorPath -ArgumentList $waitArguments -RedirectStandardOutput $waitOnePath `
         -RedirectStandardError $waitOneError -WindowStyle Hidden -PassThru
     $waitTwo = Start-Process -FilePath $CoordinatorPath -ArgumentList $waitArguments -RedirectStandardOutput $waitTwoPath `
@@ -108,6 +132,7 @@ try {
     $retryScript = "`$marker = '$marker'; if (Test-Path -LiteralPath `$marker) { Start-Sleep -Seconds 30 } else { New-Item -ItemType File -Path `$marker | Out-Null; exit 7 }"
     $retryCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($retryScript))
     $retryArguments = "-NoProfile -EncodedCommand $retryCommand"
+    Write-SandboxAuthorization $game $working $retryArguments $userRoot 'managed-test'
     $retryLaunch = & $CoordinatorPath launch '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
         '--game-path' $game '--working-directory' $working '--arguments' $retryArguments '--user-data-root' $userRoot `
         '--mod-configuration' 'managed-test' '--launch-profile' 'managed-test' '--owned' 2>&1 | Out-String
@@ -115,12 +140,14 @@ try {
     $retryLaunchJson = $retryLaunch.Trim() | ConvertFrom-Json
     $firstRetryPid = [int]($retryLaunchJson.OwnershipJson | ConvertFrom-Json).ProcessId
     $processIds.Add($firstRetryPid)
+    $retryIdentity = @('--agent-id', 'retry-agent', '--client-instance-id', 'retry-client',
+        '--participant-id', 'retry-participant')
     $retryEnsure = & $CoordinatorPath ensure '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
-        '--agent-id' 'retry-agent' '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
+        $retryIdentity '--package-id' 'Lan.RimWorldDevBridge' '--readiness' 'bridge' '--save-policy' 'none' `
         '--timeout-ms' '5000' '--max-launch-attempts' '2' '--launch-backoff-ms' '100' '--owned' 2>&1 | Out-String
     $retryEnsureJson = $retryEnsure.Trim() | ConvertFrom-Json
     $retryWait = & $CoordinatorPath wait '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
-        '--ticket' $retryEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
+        '--ticket' $retryEnsureJson.Ticket '--timeout-ms' '5000' $retryIdentity 2>&1 | Out-String
     $retryWaitJson = $retryWait.Trim() | ConvertFrom-Json
     if ($retryWaitJson.Error -ne 'bridge_handshake_timeout') { throw "bounded retry did not reach handshake timeout: $retryWait" }
     $retryOwnership = $retryWaitJson.OwnershipJson | ConvertFrom-Json
@@ -135,7 +162,7 @@ try {
     Start-CoordinatorServer $retryRoot $CoordinatorPath
     Stop-Process -Id $replacementPid -Force -ErrorAction SilentlyContinue
     $restartedWait = & $CoordinatorPath wait '--root' $retryRoot '--user-root' $userRoot '--bridge-root' (Split-Path -Parent $PSScriptRoot) `
-        '--ticket' $retryEnsureJson.Ticket '--timeout-ms' '5000' 2>&1 | Out-String
+        '--ticket' $retryEnsureJson.Ticket '--timeout-ms' '5000' $retryIdentity 2>&1 | Out-String
     $restartedWaitJson = $restartedWait.Trim() | ConvertFrom-Json
     if ($restartedWaitJson.Error -ne 'bridge_handshake_timeout' -or
         [int]($restartedWaitJson.OwnershipJson | ConvertFrom-Json).ProcessId -eq $replacementPid) {

@@ -15,6 +15,7 @@ namespace RimWorldDevBridge
         private readonly Func<BridgeRequest, BridgePreparationResult> prepare;
         private readonly Func<BridgeRequest, BridgeResult> enqueue;
         private readonly Func<string, string, bool> cancel;
+        private readonly Func<string, string, string, string, bool> cancelWithIdentity;
         private readonly Func<int> clientLimit;
         private readonly Func<BridgeResult, BridgeRequest, string, string, BridgeResult> decorate;
         private readonly Func<string> currentSession;
@@ -22,6 +23,7 @@ namespace RimWorldDevBridge
         private readonly Action<BridgeTransportState> refreshIndicator;
         private readonly Action<BridgeTransportState> markClientStateDirty;
         private readonly Action onActivity;
+        private readonly Action<BridgeRequest, BridgeResult> coordinatedCompletion;
 
         internal BridgeTransportServer(BridgeTransportState state,
             Func<BridgeTransportState, bool> isCurrent,
@@ -48,6 +50,46 @@ namespace RimWorldDevBridge
             this.refreshIndicator = refreshIndicator;
             this.markClientStateDirty = markClientStateDirty;
             this.onActivity = onActivity;
+            this.coordinatedCompletion = null;
+        }
+
+        internal BridgeTransportServer(BridgeTransportState state,
+            Func<BridgeTransportState, bool> isCurrent,
+            Func<BridgeRequest, BridgePreparationResult> prepare,
+            Func<BridgeRequest, BridgeResult> enqueue,
+            Func<string, string, bool> cancel,
+            Func<int> clientLimit,
+            Func<BridgeResult, BridgeRequest, string, string, BridgeResult> decorate,
+            Func<string> currentSession,
+            Action<BridgeTransportState> onIdle,
+            Action<BridgeTransportState> refreshIndicator,
+            Action<BridgeTransportState> markClientStateDirty,
+            Action onActivity,
+            Func<string, string, string, string, bool> cancelWithIdentity)
+            : this(state, isCurrent, prepare, enqueue, cancel, clientLimit, decorate, currentSession,
+                onIdle, refreshIndicator, markClientStateDirty, onActivity)
+        {
+            this.cancelWithIdentity = cancelWithIdentity;
+        }
+
+        internal BridgeTransportServer(BridgeTransportState state,
+            Func<BridgeTransportState, bool> isCurrent,
+            Func<BridgeRequest, BridgePreparationResult> prepare,
+            Func<BridgeRequest, BridgeResult> enqueue,
+            Func<string, string, bool> cancel,
+            Func<int> clientLimit,
+            Func<BridgeResult, BridgeRequest, string, string, BridgeResult> decorate,
+            Func<string> currentSession,
+            Action<BridgeTransportState> onIdle,
+            Action<BridgeTransportState> refreshIndicator,
+            Action<BridgeTransportState> markClientStateDirty,
+            Action onActivity,
+            Func<string, string, string, string, bool> cancelWithIdentity,
+            Action<BridgeRequest, BridgeResult> coordinatedCompletion)
+            : this(state, isCurrent, prepare, enqueue, cancel, clientLimit, decorate, currentSession,
+                onIdle, refreshIndicator, markClientStateDirty, onActivity, cancelWithIdentity)
+        {
+            this.coordinatedCompletion = coordinatedCompletion;
         }
 
         internal void Start()
@@ -169,7 +211,7 @@ namespace RimWorldDevBridge
                     if (request.Command == "CANCEL")
                     {
                         BridgeResult cancelled = BridgeResult.Ok("core.cancel")
-                            .Add("cancelled", cancel(request.Argument, request.AgentId));
+                            .Add("cancelled", CancelRequest(request.Argument, request));
                         decorate(cancelled, request, "core", BridgeProtocol.BridgeVersion);
                         writer.Write(BridgeProtocol.Serialize(cancelled, request.OutputFormat));
                         return;
@@ -195,13 +237,16 @@ namespace RimWorldDevBridge
                     }
                     if (!isCurrent(clientState) || request.SessionId != currentSession())
                     {
-                        writer.Write("id=unknown\nstatus=FORBIDDEN\nerror=stale_transport");
+                        CompleteUnstarted(request, BridgeResult.Fail(BridgeStatus.FORBIDDEN, "stale_transport"));
+                        writer.Write(BridgeProtocol.Serialize(BridgeResult.Fail(BridgeStatus.FORBIDDEN,
+                            "stale_transport"), request.OutputFormat));
                         return;
                     }
                     request.EnqueuedUtc = DateTime.UtcNow;
                     BridgeResult enqueueFailure = enqueue(request);
                     if (enqueueFailure != null)
                     {
+                        CompleteUnstarted(request, enqueueFailure);
                         decorate(enqueueFailure, request, descriptor.Provider, descriptor.ProviderVersion);
                         writer.Write(BridgeProtocol.Serialize(enqueueFailure, request.OutputFormat));
                         return;
@@ -229,12 +274,35 @@ namespace RimWorldDevBridge
                     onActivity();
                 }
             }
-            catch { if (request != null && !request.Started) request.ClientDisconnected = true; }
+            catch
+            {
+                if (request != null && !request.Started)
+                {
+                    request.ClientDisconnected = true;
+                    CompleteUnstarted(request, BridgeResult.Fail(BridgeStatus.CANCELLED, "client_disconnected"));
+                }
+            }
             finally
             {
+                if (request != null && !request.Started && request.SharedOperationRegistered)
+                    CompleteUnstarted(request, BridgeResult.Fail(BridgeStatus.CANCELLED, "client_disconnected"));
                 RemoveClient(client);
                 refreshIndicator(clientState);
             }
+        }
+
+        private bool CancelRequest(string requestId, BridgeRequest identity)
+        {
+            return cancelWithIdentity == null ? cancel(requestId, identity?.AgentId) :
+                cancelWithIdentity(requestId, identity?.AgentId, identity?.ClientInstanceId,
+                    identity?.ParticipantId);
+        }
+
+        private void CompleteUnstarted(BridgeRequest request, BridgeResult result)
+        {
+            if (request == null || request.Started || !request.SharedOperationRegistered ||
+                coordinatedCompletion == null) return;
+            coordinatedCompletion(request, result);
         }
 
         private void RemoveClient(TcpClient client)

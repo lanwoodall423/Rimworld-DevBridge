@@ -1,5 +1,7 @@
 param(
     [string]$OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'Release'),
+    [string]$GameOutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) '1.6/Assemblies'),
+    [string]$CoordinatorOutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) '1.6/Assemblies/RestartCoordinator/net472'),
     [switch]$Build,
     [switch]$KeepStaging
 )
@@ -8,8 +10,10 @@ $ErrorActionPreference = 'Stop'
 $modRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $sourceProject = Join-Path $modRoot 'Source/RimWorldDevBridge/RimWorldDevBridge.csproj'
 $coordinatorProject = Join-Path $modRoot 'DevTools/RestartCoordinator/RimWorldDevBridge.RestartCoordinator.csproj'
-$coreSource = Join-Path $modRoot '1.6/Assemblies/RimWorldDevBridge.dll'
-$coordinatorSource = Join-Path $modRoot '1.6/Assemblies/RestartCoordinator/net472/RimWorldDevBridge.RestartCoordinator.exe'
+$gameOutputRoot = [IO.Path]::GetFullPath($GameOutputDirectory)
+$coordinatorOutputRoot = [IO.Path]::GetFullPath($CoordinatorOutputDirectory)
+$coreSource = Join-Path $gameOutputRoot 'RimWorldDevBridge.dll'
+$coordinatorSource = Join-Path $coordinatorOutputRoot 'RimWorldDevBridge.RestartCoordinator.exe'
 $licenseSource = Join-Path $modRoot 'LICENSE'
 $manifestPath = Join-Path $modRoot 'BRIDGE_MANIFEST.txt'
 $verifier = Join-Path $PSScriptRoot 'Test-RimWorldDevBridgePackage.ps1'
@@ -69,16 +73,22 @@ function Write-ZipEntry([IO.Compression.ZipArchive]$Archive, [hashtable]$Entry) 
 try {
     if (-not (Test-Path -LiteralPath $sourceProject)) { throw "Source project is missing: $sourceProject" }
     if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Bridge manifest is missing: $manifestPath" }
-    foreach ($entry in $packageEntries | Where-Object { $_.Source -ne $coordinatorSource }) {
+    foreach ($entry in $packageEntries | Where-Object {
+            $_.Source -ne $coordinatorSource -and (-not $Build -or $_.Source -ne $coreSource) }) {
         if (-not (Test-Path -LiteralPath $entry.Source -PathType Leaf)) {
             throw "Required package source is missing: $($entry.Source)"
         }
     }
     if ($Build) {
-        & dotnet build $sourceProject -c Release
+        & dotnet build $sourceProject -c Release "-p:DevBridgeGameOutputRoot=$gameOutputRoot"
         if (-not $?) { throw 'Source build failed.' }
-        & dotnet build $coordinatorProject -c Release
+        & dotnet build $coordinatorProject -c Release "-p:DevBridgeCoordinatorOutputRoot=$coordinatorOutputRoot"
         if (-not $?) { throw 'Restart coordinator build failed.' }
+    }
+    foreach ($entry in $packageEntries) {
+        if (-not (Test-Path -LiteralPath $entry.Source -PathType Leaf)) {
+            throw "Required package source is missing: $($entry.Source)"
+        }
     }
     if (-not (Test-Path -LiteralPath $coordinatorSource -PathType Leaf)) {
         throw "Required package source is missing: $coordinatorSource"

@@ -57,6 +57,30 @@ namespace RimWorldDevBridge
         [DataMember(Order = 25)] public string RequestedPid;
         [DataMember(Order = 26)] public string RequestedSessionId;
         [DataMember(Order = 27)] public string ReplacementCycleId;
+        [DataMember(Order = 28)] public string ClientInstanceId;
+        [DataMember(Order = 29)] public string ParticipantId;
+        [DataMember(Order = 30)] public string OperationId;
+        [DataMember(Order = 31)] public string CorrelationId;
+        [DataMember(Order = 32)] public string CompatibilityKey;
+        [DataMember(Order = 33)] public string RuntimeSlotId;
+        [DataMember(Order = 34)] public string DeploymentId;
+        [DataMember(Order = 35)] public string ArtifactFingerprint;
+        [DataMember(Order = 36)] public string LoadedAssemblyFingerprint;
+        [DataMember(Order = 37)] public string ProcessStartIdentity;
+        [DataMember(Order = 38)] public long ProgressSequence;
+        [DataMember(Order = 39)] public bool Terminal;
+        [DataMember(Order = 40)] public bool Recoverable;
+        [DataMember(Order = 41)] public bool RetrySafe;
+        [DataMember(Order = 42)] public string CapacityState;
+        [DataMember(Order = 43)] public bool KeepRunning;
+    }
+
+    [DataContract]
+    public sealed class BridgeRestartParticipantOwner
+    {
+        [DataMember(Order = 1)] public string AgentId;
+        [DataMember(Order = 2)] public string ClientInstanceId;
+        [DataMember(Order = 3)] public string ParticipantId;
     }
 
     [DataContract]
@@ -101,6 +125,28 @@ namespace RimWorldDevBridge
         [DataMember(Order = 37)] public string OldSessionId;
         [DataMember(Order = 38)] public long OldLifecycleGeneration;
         [DataMember(Order = 39)] public int ProgressTimeoutMs = 120000;
+        [DataMember(Order = 40)] public string CompatibilityKey;
+        [DataMember(Order = 41)] public string RuntimeSlotId;
+        [DataMember(Order = 42)] public string DeploymentId;
+        [DataMember(Order = 43)] public string ArtifactFingerprint;
+        [DataMember(Order = 44)] public string LoadedAssemblyFingerprint;
+        [DataMember(Order = 45)] public List<string> ParticipantIds = new List<string>();
+        [DataMember(Order = 46)] public string PrimaryAgentId;
+        [DataMember(Order = 47)] public string PrimaryClientInstanceId;
+        [DataMember(Order = 48)] public string OperationId;
+        [DataMember(Order = 49)] public List<BridgeRestartParticipantOwner> ParticipantOwners =
+            new List<BridgeRestartParticipantOwner>();
+        [DataMember(Order = 50)] public string ManagedProfile;
+        [DataMember(Order = 51)] public string RimWorldVersion;
+        [DataMember(Order = 52)] public string ModSetFingerprint;
+        [DataMember(Order = 53)] public string ModLoadOrderFingerprint;
+        [DataMember(Order = 54)] public string SourceBuildIdentity;
+        [DataMember(Order = 55)] public string ConfigurationFingerprint;
+        [DataMember(Order = 56)] public string UserRootFingerprint;
+        [DataMember(Order = 57)] public string SaveTarget;
+        [DataMember(Order = 58)] public string MapTarget;
+        [DataMember(Order = 59)] public string MutationScope;
+        [DataMember(Order = 60)] public string ProcessStartIdentity;
     }
 
     [DataContract]
@@ -157,13 +203,31 @@ namespace RimWorldDevBridge
             string targetPostcondition = null, bool requiresNewProcess = false,
             long requestedLifecycleGeneration = 0, string requestedPid = null,
             string requestedSessionId = null, bool allowSupersede = false,
-            int progressTimeoutMs = 120000)
+            int progressTimeoutMs = 120000, BridgeClientIdentity identity = null,
+            BridgeOperationCompatibilityKey compatibility = null, string operationId = null,
+            string runtimeSlotId = null, string deploymentId = null, string artifactFingerprint = null,
+            string loadedAssemblyFingerprint = null)
         {
             lock (gate)
             {
                 ValidateRequest(readiness, savePolicy);
+                if (identity != null)
+                {
+                    if (!string.Equals(identity.AgentId, agentId, StringComparison.Ordinal))
+                        throw new InvalidOperationException("restart_identity_agent_mismatch");
+                    if (!BridgeIdentityRules.IsValid(identity.AgentId) ||
+                        !BridgeIdentityRules.IsValid(identity.ClientInstanceId) ||
+                        !BridgeIdentityRules.IsValid(identity.ConnectionSessionId) ||
+                        !BridgeIdentityRules.IsValid(identity.RequestCorrelationId) ||
+                        !BridgeIdentityRules.IsValid(identity.ParticipantId))
+                        throw new ArgumentException("restart_identity_invalid");
+                    if (compatibility == null)
+                        throw new ArgumentException("restart_compatibility_required");
+                }
                 string target = ReadinessValue(targetPostcondition) ?? ReadinessValue(readiness);
                 string safeReason = SafeReason(reason);
+                string canonicalCompatibility = compatibility == null ? string.Empty : compatibility.ToString();
+                string sharedOperationId = Bound(operationId, 128);
                 int boundedProgressTimeout = ClampProgressTimeout(progressTimeoutMs);
                 if (liveConfirmed && !liveConfirmedAuthorized)
                 {
@@ -172,6 +236,8 @@ namespace RimWorldDevBridge
                         BridgeRestartPhase.FAILED, "live_confirmed_restart_authorization_required",
                         target, requiresNewProcess, requestedLifecycleGeneration, requestedPid,
                         requestedSessionId);
+                    PopulateTicket(unauthorized, identity, sharedOperationId, canonicalCompatibility,
+                        runtimeSlotId, deploymentId, artifactFingerprint, loadedAssemblyFingerprint);
                     state.Tickets.Add(unauthorized);
                     Touch();
                     return Clone(unauthorized);
@@ -181,7 +247,7 @@ namespace RimWorldDevBridge
                     IsOpenCompatible(item) && Compatible(item, target, savePolicy,
                         requiredCoreFingerprint, requiredAdapterFingerprint, safeReason,
                         requiresNewProcess, processAlreadyStarted, requestedPid,
-                        requestedSessionId, requestedLifecycleGeneration));
+                         requestedSessionId, requestedLifecycleGeneration, canonicalCompatibility));
                 if (cycle == null)
                 {
                     BridgeRestartCycleRecord active = state.Cycles.LastOrDefault(IsOpenCycle);
@@ -195,6 +261,8 @@ namespace RimWorldDevBridge
                                 "attached_live_process_requires_operator",
                             target, requiresNewProcess, requestedLifecycleGeneration, requestedPid,
                             requestedSessionId);
+                        PopulateTicket(staleBlocked, identity, sharedOperationId, canonicalCompatibility,
+                            runtimeSlotId, deploymentId, artifactFingerprint, loadedAssemblyFingerprint);
                         state.Tickets.Add(staleBlocked);
                         Touch();
                         return Clone(staleBlocked);
@@ -206,6 +274,8 @@ namespace RimWorldDevBridge
                             BridgeRestartPhase.FAILED, "restart_cycle_incompatible_in_progress",
                             target, requiresNewProcess, requestedLifecycleGeneration, requestedPid,
                             requestedSessionId);
+                        PopulateTicket(blocked, identity, sharedOperationId, canonicalCompatibility,
+                            runtimeSlotId, deploymentId, artifactFingerprint, loadedAssemblyFingerprint);
                         state.Tickets.Add(blocked);
                         Touch();
                         return Clone(blocked);
@@ -234,7 +304,27 @@ namespace RimWorldDevBridge
                         LastProgressUtc = DateTime.UtcNow,
                         LiveConfirmed = liveConfirmed,
                         CreatedUtc = DateTime.UtcNow,
-                        UpdatedUtc = DateTime.UtcNow
+                        UpdatedUtc = DateTime.UtcNow,
+                        CompatibilityKey = canonicalCompatibility,
+                        RuntimeSlotId = Bound(runtimeSlotId, 128),
+                        DeploymentId = Bound(deploymentId, 128),
+                        ArtifactFingerprint = Bound(artifactFingerprint, 256),
+                         LoadedAssemblyFingerprint = Bound(loadedAssemblyFingerprint, 256),
+                         ManagedProfile = Bound(compatibility == null ? string.Empty : compatibility.ManagedProfile, 256),
+                         RimWorldVersion = Bound(compatibility == null ? string.Empty : compatibility.RimWorldVersion, 128),
+                         ModSetFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ModSetFingerprint, 256),
+                         ModLoadOrderFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ModLoadOrderFingerprint, 256),
+                         SourceBuildIdentity = Bound(compatibility == null ? string.Empty : compatibility.SourceBuildIdentity, 256),
+                         ConfigurationFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ConfigurationFingerprint, 256),
+                         UserRootFingerprint = Bound(compatibility == null ? string.Empty : compatibility.UserRootFingerprint, 256),
+                         SaveTarget = Bound(compatibility == null ? string.Empty : compatibility.SaveTarget, 256),
+                         MapTarget = Bound(compatibility == null ? string.Empty : compatibility.MapTarget, 256),
+                         MutationScope = Bound(compatibility == null ? string.Empty : compatibility.MutationScope, 256),
+                        OperationId = string.IsNullOrEmpty(sharedOperationId) ?
+                            "operation-" + Guid.NewGuid().ToString("N") : sharedOperationId,
+                        PrimaryAgentId = Bound(agentId, 128),
+                        PrimaryClientInstanceId = identity == null ? string.Empty :
+                            Bound(identity.ClientInstanceId, 128)
                     };
                     state.Cycles.Add(cycle);
                     if (stale != null && allowSupersede && ownedSandbox)
@@ -248,13 +338,33 @@ namespace RimWorldDevBridge
                         cycle.RequiredCoreFingerprint = requiredCoreFingerprint ?? string.Empty;
                     if (string.IsNullOrEmpty(cycle.RequiredAdapterFingerprint))
                         cycle.RequiredAdapterFingerprint = requiredAdapterFingerprint ?? string.Empty;
+                    if (string.IsNullOrEmpty(cycle.RuntimeSlotId)) cycle.RuntimeSlotId = Bound(runtimeSlotId, 128);
+                    if (string.IsNullOrEmpty(cycle.DeploymentId)) cycle.DeploymentId = Bound(deploymentId, 128);
+                    if (string.IsNullOrEmpty(cycle.ArtifactFingerprint))
+                        cycle.ArtifactFingerprint = Bound(artifactFingerprint, 256);
+                    if (string.IsNullOrEmpty(cycle.LoadedAssemblyFingerprint))
+                        cycle.LoadedAssemblyFingerprint = Bound(loadedAssemblyFingerprint, 256);
+                    if (string.IsNullOrEmpty(cycle.ManagedProfile)) cycle.ManagedProfile = Bound(compatibility == null ? string.Empty : compatibility.ManagedProfile, 256);
+                    if (string.IsNullOrEmpty(cycle.RimWorldVersion)) cycle.RimWorldVersion = Bound(compatibility == null ? string.Empty : compatibility.RimWorldVersion, 128);
+                    if (string.IsNullOrEmpty(cycle.ModSetFingerprint)) cycle.ModSetFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ModSetFingerprint, 256);
+                    if (string.IsNullOrEmpty(cycle.ModLoadOrderFingerprint)) cycle.ModLoadOrderFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ModLoadOrderFingerprint, 256);
+                    if (string.IsNullOrEmpty(cycle.SourceBuildIdentity)) cycle.SourceBuildIdentity = Bound(compatibility == null ? string.Empty : compatibility.SourceBuildIdentity, 256);
+                    if (string.IsNullOrEmpty(cycle.ConfigurationFingerprint)) cycle.ConfigurationFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ConfigurationFingerprint, 256);
+                    if (string.IsNullOrEmpty(cycle.UserRootFingerprint)) cycle.UserRootFingerprint = Bound(compatibility == null ? string.Empty : compatibility.UserRootFingerprint, 256);
+                    if (string.IsNullOrEmpty(cycle.SaveTarget)) cycle.SaveTarget = Bound(compatibility == null ? string.Empty : compatibility.SaveTarget, 256);
+                    if (string.IsNullOrEmpty(cycle.MapTarget)) cycle.MapTarget = Bound(compatibility == null ? string.Empty : compatibility.MapTarget, 256);
+                    if (string.IsNullOrEmpty(cycle.MutationScope)) cycle.MutationScope = Bound(compatibility == null ? string.Empty : compatibility.MutationScope, 256);
                 }
                 BridgeRestartPhase ticketPhase = ParsePhase(cycle.Phase);
                 BridgeRestartTicketRecord ticket = NewTicket(cycle.CycleId, agentId, packageId, reason,
                     readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
                     ticketPhase, "restart_requested", target, cycle.RequiresNewProcess || requiresNewProcess,
                     requestedLifecycleGeneration, requestedPid, requestedSessionId);
+                PopulateTicket(ticket, identity, cycle.OperationId, cycle.CompatibilityKey,
+                    cycle.RuntimeSlotId, cycle.DeploymentId, cycle.ArtifactFingerprint,
+                    cycle.LoadedAssemblyFingerprint);
                 cycle.TicketIds.Add(ticket.Ticket);
+                AddParticipant(cycle, identity);
                 state.Tickets.Add(ticket);
                 cycle.UpdatedUtc = DateTime.UtcNow;
                 Touch();
@@ -263,12 +373,13 @@ namespace RimWorldDevBridge
         }
 
         public BridgeRestartCoordinatorState SetPhase(string cycleId, BridgeRestartPhase phase,
-            string diagnostics = null, long barrierId = 0)
+            string diagnostics = null, long barrierId = 0, BridgeClientIdentity identity = null)
         {
             lock (gate)
             {
                 BridgeRestartCycleRecord cycle = FindCycle(cycleId);
                 if (cycle == null) throw new InvalidOperationException("unknown_restart_cycle");
+                RequireParticipant(cycle, identity);
                 if (!IsValidTransition(ParsePhase(cycle.Phase), phase))
                     throw new InvalidOperationException("invalid_restart_transition");
                 cycle.Phase = phase.ToString();
@@ -290,6 +401,8 @@ namespace RimWorldDevBridge
                             "bridge_ready" : Bound(cycle.Diagnostics, 512);
                     else if (phase == BridgeRestartPhase.FAILED || phase == BridgeRestartPhase.USER_RESTART_REQUIRED)
                         ticket.Completion = cycle.Diagnostics;
+                    ticket.Terminal = phase == BridgeRestartPhase.READY || phase == BridgeRestartPhase.FAILED ||
+                        phase == BridgeRestartPhase.USER_RESTART_REQUIRED;
                 }
                 Touch();
                 return Clone(state);
@@ -320,21 +433,26 @@ namespace RimWorldDevBridge
             }
         }
 
-        public BridgeRestartTicketRecord Ticket(string ticketId)
+        public BridgeRestartTicketRecord Ticket(string ticketId, BridgeClientIdentity identity = null)
         {
             lock (gate)
             {
                 BridgeRestartTicketRecord ticket = state.Tickets.FirstOrDefault(item =>
                     string.Equals(item.Ticket, ticketId, StringComparison.Ordinal));
+                if (ticket != null && identity != null &&
+                    (!string.Equals(ticket.AgentId, identity.AgentId, StringComparison.Ordinal) ||
+                     !string.Equals(ticket.ClientInstanceId, identity.ClientInstanceId, StringComparison.Ordinal) ||
+                     !string.Equals(ticket.ParticipantId, identity.ParticipantId, StringComparison.Ordinal))) return null;
                 return ticket == null ? null : Clone(ticket);
             }
         }
 
-        public BridgeRestartCycleRecord Cycle(string cycleId)
+        public BridgeRestartCycleRecord Cycle(string cycleId, BridgeClientIdentity identity = null)
         {
             lock (gate)
             {
                 BridgeRestartCycleRecord cycle = FindCycle(cycleId);
+                RequireParticipant(cycle, identity);
                 return cycle == null ? null : Clone(cycle);
             }
         }
@@ -435,7 +553,8 @@ namespace RimWorldDevBridge
 
         public void SetReadyContext(string cycleId, string pid, string bootId, string session,
             string transportGeneration, string coreFingerprint, string adapterFingerprint,
-            long lifecycleGeneration = 0)
+            long lifecycleGeneration = 0, string loadedAssemblyFingerprint = null,
+            string processStartIdentity = null)
         {
             lock (gate)
             {
@@ -443,10 +562,13 @@ namespace RimWorldDevBridge
                 if (cycle == null) return;
                 cycle.NewPid = Bound(pid, 32);
                 cycle.NewBootId = Bound(bootId, 128);
+                cycle.ProcessStartIdentity = Bound(processStartIdentity, 256);
                 cycle.NewSessionId = Bound(session, 128);
                 cycle.NewTransportGeneration = Bound(transportGeneration, 32);
                 cycle.NewCoreFingerprint = Bound(coreFingerprint, 128);
                 cycle.NewAdapterFingerprint = Bound(adapterFingerprint, 128);
+                if (!string.IsNullOrEmpty(loadedAssemblyFingerprint))
+                    cycle.LoadedAssemblyFingerprint = Bound(loadedAssemblyFingerprint, 256);
                 cycle.NewLifecycleGeneration = lifecycleGeneration;
                 foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == cycleId))
                 {
@@ -456,6 +578,8 @@ namespace RimWorldDevBridge
                     ticket.NewTransportGeneration = cycle.NewTransportGeneration;
                     ticket.NewCoreFingerprint = cycle.NewCoreFingerprint;
                     ticket.NewAdapterFingerprint = cycle.NewAdapterFingerprint;
+                    ticket.LoadedAssemblyFingerprint = cycle.LoadedAssemblyFingerprint;
+                    ticket.ProcessStartIdentity = cycle.ProcessStartIdentity;
                     ticket.NewLifecycleGeneration = cycle.NewLifecycleGeneration;
                 }
                 Touch();
@@ -582,8 +706,10 @@ namespace RimWorldDevBridge
         private static bool Compatible(BridgeRestartCycleRecord cycle, string targetPostcondition,
             string savePolicy, string core, string adapter, string reason, bool requiresNewProcess,
             bool processAlreadyStarted, string requestedPid, string requestedSessionId,
-            long requestedLifecycleGeneration)
+            long requestedLifecycleGeneration, string compatibilityKey)
         {
+            if (!string.IsNullOrEmpty(compatibilityKey) && !string.Equals(cycle.CompatibilityKey,
+                compatibilityKey, StringComparison.Ordinal)) return false;
             if (!string.Equals(cycle.SavePolicy, savePolicy, StringComparison.OrdinalIgnoreCase)) return false;
             if (!string.IsNullOrEmpty(cycle.RequiredCoreFingerprint) && !string.IsNullOrEmpty(core) &&
                 !string.Equals(cycle.RequiredCoreFingerprint, core, StringComparison.OrdinalIgnoreCase)) return false;
@@ -637,6 +763,20 @@ namespace RimWorldDevBridge
             oldCycle.Phase = BridgeRestartPhase.FAILED.ToString();
             oldCycle.Diagnostics = Bound(diagnostics, 512);
             oldCycle.UpdatedUtc = DateTime.UtcNow;
+            foreach (string participantId in oldCycle.ParticipantIds ?? new List<string>())
+                if (!replacement.ParticipantIds.Contains(participantId)) replacement.ParticipantIds.Add(participantId);
+            foreach (BridgeRestartParticipantOwner owner in oldCycle.ParticipantOwners ??
+                new List<BridgeRestartParticipantOwner>())
+                if (!replacement.ParticipantOwners.Any(item =>
+                        string.Equals(item.AgentId, owner.AgentId, StringComparison.Ordinal) &&
+                        string.Equals(item.ClientInstanceId, owner.ClientInstanceId, StringComparison.Ordinal) &&
+                        string.Equals(item.ParticipantId, owner.ParticipantId, StringComparison.Ordinal)))
+                    replacement.ParticipantOwners.Add(new BridgeRestartParticipantOwner
+                    {
+                        AgentId = owner.AgentId,
+                        ClientInstanceId = owner.ClientInstanceId,
+                        ParticipantId = owner.ParticipantId
+                    });
             foreach (BridgeRestartTicketRecord ticket in state.Tickets.Where(item => item.CycleId == oldCycle.CycleId).ToList())
             {
                 oldCycle.TicketIds.Remove(ticket.Ticket);
@@ -677,6 +817,46 @@ namespace RimWorldDevBridge
                 StringComparison.Ordinal));
         }
 
+        private static void RequireParticipant(BridgeRestartCycleRecord cycle, BridgeClientIdentity identity)
+        {
+            if (identity == null || cycle == null) return;
+            if (!BridgeIdentityRules.IsValid(identity.AgentId) ||
+                !BridgeIdentityRules.IsValid(identity.ClientInstanceId) ||
+                !BridgeIdentityRules.IsValid(identity.ParticipantId) ||
+                !OwnsParticipant(cycle, identity))
+                throw new InvalidOperationException("restart_participant_not_owned");
+        }
+
+        private static void AddParticipant(BridgeRestartCycleRecord cycle, BridgeClientIdentity identity)
+        {
+            if (cycle == null || identity == null) return;
+            if (cycle.ParticipantIds == null) cycle.ParticipantIds = new List<string>();
+            if (!cycle.ParticipantIds.Contains(identity.ParticipantId)) cycle.ParticipantIds.Add(identity.ParticipantId);
+            if (cycle.ParticipantOwners == null) cycle.ParticipantOwners = new List<BridgeRestartParticipantOwner>();
+            if (!cycle.ParticipantOwners.Any(item =>
+                    string.Equals(item.AgentId, identity.AgentId, StringComparison.Ordinal) &&
+                    string.Equals(item.ClientInstanceId, identity.ClientInstanceId, StringComparison.Ordinal) &&
+                    string.Equals(item.ParticipantId, identity.ParticipantId, StringComparison.Ordinal)))
+                cycle.ParticipantOwners.Add(new BridgeRestartParticipantOwner
+                {
+                    AgentId = identity.AgentId,
+                    ClientInstanceId = identity.ClientInstanceId,
+                    ParticipantId = identity.ParticipantId
+                });
+        }
+
+        private static bool OwnsParticipant(BridgeRestartCycleRecord cycle, BridgeClientIdentity identity)
+        {
+            if (cycle.ParticipantOwners != null && cycle.ParticipantOwners.Count > 0)
+                return cycle.ParticipantOwners.Any(item =>
+                    string.Equals(item.AgentId, identity.AgentId, StringComparison.Ordinal) &&
+                    string.Equals(item.ClientInstanceId, identity.ClientInstanceId, StringComparison.Ordinal) &&
+                    string.Equals(item.ParticipantId, identity.ParticipantId, StringComparison.Ordinal));
+            return string.Equals(cycle.PrimaryAgentId, identity.AgentId, StringComparison.Ordinal) &&
+                string.Equals(cycle.PrimaryClientInstanceId, identity.ClientInstanceId, StringComparison.Ordinal) &&
+                (cycle.ParticipantIds ?? new List<string>()).Contains(identity.ParticipantId);
+        }
+
         private void Touch()
         {
             state.Sequence++;
@@ -708,8 +888,31 @@ namespace RimWorldDevBridge
                 Phase = phase.ToString(),
                 Completion = Bound(completion, 512),
                 CreatedUtc = DateTime.UtcNow,
-                UpdatedUtc = DateTime.UtcNow
+                UpdatedUtc = DateTime.UtcNow,
+                Recoverable = true,
+                RetrySafe = true,
+                CapacityState = "admitted",
+                KeepRunning = requiresNewProcess
             };
+        }
+
+        private static void PopulateTicket(BridgeRestartTicketRecord ticket, BridgeClientIdentity identity,
+            string operationId, string compatibilityKey, string runtimeSlotId, string deploymentId,
+            string artifactFingerprint, string loadedAssemblyFingerprint)
+        {
+            if (ticket == null) return;
+            ticket.ClientInstanceId = identity == null ? string.Empty : Bound(identity.ClientInstanceId, 128);
+            ticket.ParticipantId = identity == null ? string.Empty : Bound(identity.ParticipantId, 128);
+            ticket.CorrelationId = identity == null ? string.Empty : Bound(identity.RequestCorrelationId, 128);
+            ticket.OperationId = Bound(operationId, 128);
+            ticket.CompatibilityKey = Bound(compatibilityKey, 256);
+            ticket.RuntimeSlotId = Bound(runtimeSlotId, 128);
+            ticket.DeploymentId = Bound(deploymentId, 128);
+            ticket.ArtifactFingerprint = Bound(artifactFingerprint, 256);
+            ticket.LoadedAssemblyFingerprint = Bound(loadedAssemblyFingerprint, 256);
+            ticket.Terminal = ticket.Phase == BridgeRestartPhase.READY.ToString() ||
+                ticket.Phase == BridgeRestartPhase.FAILED.ToString() ||
+                ticket.Phase == BridgeRestartPhase.USER_RESTART_REQUIRED.ToString();
         }
 
         private static void ValidateRequest(string readiness, string savePolicy)

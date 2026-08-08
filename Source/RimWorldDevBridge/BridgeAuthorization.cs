@@ -61,6 +61,12 @@ namespace RimWorldDevBridge
 
         internal BridgeResult Acquire(string requestedContext, bool mutationEnabled, string agentId)
         {
+            return Acquire(requestedContext, mutationEnabled, agentId, null);
+        }
+
+        internal BridgeResult Acquire(string requestedContext, bool mutationEnabled, string agentId,
+            string clientInstanceId)
+        {
             if (!mutationEnabled)
                 return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
             string normalized = (requestedContext ?? string.Empty).Trim().ToLowerInvariant();
@@ -74,7 +80,8 @@ namespace RimWorldDevBridge
                 DateTime now = DateTime.UtcNow;
                 RemoveExpired(now);
                 WriteLease existing = leases.Values.FirstOrDefault(item => item.ExpiresUtc > now);
-                if (existing != null && !AgentMatches(existing.AgentId, agentId))
+                if (existing != null && !IdentityMatches(existing.AgentId, existing.ClientInstanceId, agentId,
+                    clientInstanceId))
                     return BridgeResult.Fail(BridgeStatus.BUSY, "write_lease_held");
                 if (existing != null) leases.Remove(existing.Token);
                 lease = new WriteLease
@@ -84,7 +91,8 @@ namespace RimWorldDevBridge
                     Context = normalized,
                     AgentId = agentId,
                     AcquiredUtc = now,
-                    ExpiresUtc = now.AddSeconds(LeaseSeconds)
+                    ExpiresUtc = now.AddSeconds(LeaseSeconds),
+                    ClientInstanceId = clientInstanceId
                 };
                 leases[lease.Token] = lease;
             }
@@ -99,6 +107,12 @@ namespace RimWorldDevBridge
             Renew(leaseToken, mutationEnabled, null);
 
         internal BridgeResult Renew(string leaseToken, bool mutationEnabled, string agentId)
+        {
+            return Renew(leaseToken, mutationEnabled, agentId, null);
+        }
+
+        internal BridgeResult Renew(string leaseToken, bool mutationEnabled, string agentId,
+            string clientInstanceId)
         {
             if (!mutationEnabled)
                 return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "remote_mutation_disabled");
@@ -117,7 +131,7 @@ namespace RimWorldDevBridge
                     RemoveExpired(now);
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_expired");
                 }
-                if (!AgentMatches(lease.AgentId, agentId))
+                if (!IdentityMatches(lease.AgentId, lease.ClientInstanceId, agentId, clientInstanceId))
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_agent_mismatch");
                 lease.ExpiresUtc = now.AddSeconds(LeaseSeconds);
                 return BridgeResult.Ok("core.writeLeaseRenewed")
@@ -130,6 +144,11 @@ namespace RimWorldDevBridge
 
         internal BridgeResult Revoke(string leaseToken, string agentId)
         {
+            return Revoke(leaseToken, agentId, null);
+        }
+
+        internal BridgeResult Revoke(string leaseToken, string agentId, string clientInstanceId)
+        {
             lock (gate)
             {
                 if (string.IsNullOrWhiteSpace(leaseToken))
@@ -141,7 +160,7 @@ namespace RimWorldDevBridge
                     leases.Remove(leaseToken);
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_expired");
                 }
-                if (!AgentMatches(lease.AgentId, agentId))
+                if (!IdentityMatches(lease.AgentId, lease.ClientInstanceId, agentId, clientInstanceId))
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_agent_mismatch");
                 leases.Remove(leaseToken);
                 return BridgeResult.Ok("core.writeLeaseRevoked").Add("lease", leaseToken);
@@ -170,7 +189,8 @@ namespace RimWorldDevBridge
                     RemoveExpired(now);
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_expired");
                 }
-                if (!AgentMatches(lease.AgentId, request.AgentId))
+                if (!IdentityMatches(lease.AgentId, lease.ClientInstanceId, request.AgentId,
+                    request.ClientInstanceId))
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "write_lease_agent_mismatch");
                 if (descriptor.Mode == BridgeCommandMode.PotentiallyDestructive && lease.Context != "sandbox")
                     return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "destructive_write_requires_sandbox");
@@ -184,7 +204,7 @@ namespace RimWorldDevBridge
         {
             result = null;
             if (string.IsNullOrEmpty(request.IdempotencyKey)) return false;
-            string key = request.SessionId + ":" + request.IdempotencyKey;
+            string key = IdempotencyKey(request);
             lock (gate)
             {
                 if (!completed.TryGetValue(key, out CachedWrite cached)) return false;
@@ -205,7 +225,7 @@ namespace RimWorldDevBridge
         {
             if (request.Mode == BridgeCommandMode.PureRead || string.IsNullOrEmpty(request.IdempotencyKey) ||
                 result == null) return;
-            string key = request.SessionId + ":" + request.IdempotencyKey;
+            string key = IdempotencyKey(request);
             lock (gate)
             {
                 if (request.SessionId != sessionId) return;
@@ -227,6 +247,9 @@ namespace RimWorldDevBridge
             string userRoot = BridgePaths.UserRoot;
             string auditPath = BridgePaths.AuditPath;
             string line = DateTime.UtcNow.ToString("o") + "|session=" + BridgeText.Clean(request.SessionId) +
+                "|agent=" + BridgeText.Clean(request.AgentId) + "|client=" +
+                BridgeText.Clean(request.ClientInstanceId) + "|participant=" +
+                BridgeText.Clean(request.ParticipantId) +
                 "|request=" + BridgeText.Clean(request.RequestId) + "|command=" +
                 BridgeText.Clean(request.Command) + "|mode=" + request.Mode + "|status=" +
                 (result?.Status.ToString() ?? "ERROR") + "|idempotency=" +
@@ -281,14 +304,24 @@ namespace RimWorldDevBridge
             internal string SessionId;
             internal string Context;
             internal string AgentId;
+            internal string ClientInstanceId;
             internal DateTime AcquiredUtc;
             internal DateTime ExpiresUtc;
         }
 
-        private static bool AgentMatches(string leaseAgentId, string requestAgentId)
+        private static bool IdentityMatches(string leaseAgentId, string leaseClientInstanceId,
+            string requestAgentId, string requestClientInstanceId)
         {
-            return (string.IsNullOrEmpty(leaseAgentId) && string.IsNullOrEmpty(requestAgentId)) ||
-                string.Equals(leaseAgentId, requestAgentId, StringComparison.Ordinal);
+            return ((string.IsNullOrEmpty(leaseAgentId) && string.IsNullOrEmpty(requestAgentId)) ||
+                string.Equals(leaseAgentId, requestAgentId, StringComparison.Ordinal)) &&
+                ((string.IsNullOrEmpty(leaseClientInstanceId) && string.IsNullOrEmpty(requestClientInstanceId)) ||
+                string.Equals(leaseClientInstanceId, requestClientInstanceId, StringComparison.Ordinal));
+        }
+
+        private static string IdempotencyKey(BridgeRequest request)
+        {
+            return request.SessionId + ":" + request.AgentId + ":" + request.ClientInstanceId + ":" +
+                request.IdempotencyKey;
         }
 
         private sealed class CachedWrite
@@ -329,8 +362,33 @@ namespace RimWorldDevBridge
             BridgeResult copy = new BridgeResult
             {
                 RequestId = requestId,
+                CorrelationId = source.CorrelationId,
+                AgentId = source.AgentId,
+                ClientInstanceId = source.ClientInstanceId,
+                ParticipantId = source.ParticipantId,
                 SessionId = source.SessionId,
+                ConnectionSessionId = source.ConnectionSessionId,
                 Command = source.Command,
+                OperationId = source.OperationId,
+                OperationKind = source.OperationKind,
+                OperationState = source.OperationState,
+                CompatibilityKey = source.CompatibilityKey,
+                DesiredState = source.DesiredState,
+                RuntimeSlotId = source.RuntimeSlotId,
+                DeploymentId = source.DeploymentId,
+                ArtifactFingerprint = source.ArtifactFingerprint,
+                LoadedAssemblyFingerprint = source.LoadedAssemblyFingerprint,
+                ProcessId = source.ProcessId,
+                ProcessStartIdentity = source.ProcessStartIdentity,
+                LifecycleGeneration = source.LifecycleGeneration,
+                ProgressSequence = source.ProgressSequence,
+                LastProgressAtUtc = source.LastProgressAtUtc,
+                Terminal = source.Terminal,
+                Recoverable = source.Recoverable,
+                RetrySafe = source.RetrySafe,
+                NextAction = source.NextAction,
+                CapacityState = source.CapacityState,
+                KeepRunning = source.KeepRunning,
                 Provider = source.Provider,
                 ProviderVersion = source.ProviderVersion,
                 Mode = source.Mode,

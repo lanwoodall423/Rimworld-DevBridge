@@ -10,6 +10,24 @@ public sealed record McpToolResponse
     public string Code { get; init; } = "mcp_error";
     public string Message { get; init; } = "";
     public string CorrelationId { get; init; } = "";
+    public string AgentId { get; init; } = "";
+    public string ClientInstanceId { get; init; } = "";
+    public string ParticipantId { get; init; } = "";
+    public string OperationId { get; init; } = "";
+    public string OperationKind { get; init; } = "";
+    public string OperationState { get; init; } = "";
+    public string CompatibilityKey { get; init; } = "";
+    public string DesiredState { get; init; } = "";
+    public string RuntimeSlotId { get; init; } = "";
+    public string DeploymentId { get; init; } = "";
+    public string ArtifactFingerprint { get; init; } = "";
+    public string LoadedAssemblyFingerprint { get; init; } = "";
+    public int Pid { get; init; }
+    public string ProcessStartIdentity { get; init; } = "";
+    public string SessionId { get; init; } = "";
+    public long LifecycleGeneration { get; init; }
+    public long ProgressSequence { get; init; }
+    public string CapacityState { get; init; } = "";
     public string ActivationState { get; init; } = "inactive";
     public string WaitFor { get; init; } = "none";
     public bool Recoverable { get; init; }
@@ -24,7 +42,8 @@ public sealed record McpToolResponse
     {
         var ok = ReadBool(root, "ok") || ReadBool(root, "available") ||
             string.Equals(ReadString(root, "status"), "available", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(ReadString(root, "status"), "OK", StringComparison.OrdinalIgnoreCase);
+            string.Equals(ReadString(root, "status"), "OK", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(ReadString(root, "status"), "PARTIAL", StringComparison.OrdinalIgnoreCase);
         var code = FirstNonEmpty(ReadString(root, "reason"), ReadString(root, "error"), ok ? "ok" : "bridge_unavailable");
         var activation = FirstNonEmpty(ReadString(root, "activationState"), ReadString(root, "state"), ok ? "ready" : "inactive");
         var waitFor = FirstNonEmpty(ReadString(root, "waitFor"), ok ? "none" : "bridge");
@@ -37,6 +56,24 @@ public sealed record McpToolResponse
             Code = code,
             Message = message,
             CorrelationId = correlationId,
+            AgentId = ReadString(root, "agentId") ?? "",
+            ClientInstanceId = ReadString(root, "clientInstanceId") ?? "",
+            ParticipantId = ReadString(root, "participantId") ?? "",
+            OperationId = ReadString(root, "operationId") ?? "",
+            OperationKind = ReadString(root, "operationKind") ?? "",
+            OperationState = ReadString(root, "operationState") ?? ReadString(root, "state") ?? "",
+            CompatibilityKey = ReadString(root, "compatibilityKey") ?? "",
+            DesiredState = ReadString(root, "desiredState") ?? "",
+            RuntimeSlotId = ReadString(root, "runtimeSlotId") ?? "",
+            DeploymentId = ReadString(root, "deploymentId") ?? "",
+            ArtifactFingerprint = ReadString(root, "artifactFingerprint") ?? "",
+            LoadedAssemblyFingerprint = ReadString(root, "loadedAssemblyFingerprint") ?? "",
+            Pid = ReadInt(root, "pid", ReadInt(root, "processId", 0)),
+            ProcessStartIdentity = ReadString(root, "processStartIdentity") ?? "",
+            SessionId = ReadString(root, "sessionId") ?? ReadString(root, "session") ?? "",
+            LifecycleGeneration = ReadLong(root, "lifecycleGeneration"),
+            ProgressSequence = ReadLong(root, "progressSequence"),
+            CapacityState = ReadString(root, "capacityState") ?? "",
             ActivationState = activation,
             WaitFor = waitFor,
             Recoverable = ReadBool(root, "recoverable", !ok && IsRecoverableCode(code)),
@@ -94,6 +131,18 @@ public sealed record McpToolResponse
         return root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) &&
             (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)
             ? value.GetBoolean() : fallback;
+    }
+
+    private static int ReadInt(JsonElement root, string name, int fallback)
+    {
+        return root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) &&
+            value.TryGetInt32(out var parsed) ? parsed : fallback;
+    }
+
+    private static long ReadLong(JsonElement root, string name)
+    {
+        return root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) &&
+            value.TryGetInt64(out var parsed) ? parsed : 0;
     }
 }
 

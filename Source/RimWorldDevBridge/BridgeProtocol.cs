@@ -84,7 +84,12 @@ namespace RimWorldDevBridge
             request = new BridgeRequest
             {
                 RequestId = id,
+                CorrelationId = Value(options, "correlationId") ?? id,
                 AgentId = Value(options, "agentId") ?? "anonymous",
+                ClientInstanceId = Value(options, "clientInstanceId") ?? "client-legacy",
+                ClientCredential = Value(options, "clientCredential"),
+                ConnectionSessionId = Value(options, "connectionSessionId") ?? currentSessionId,
+                ParticipantId = Value(options, "participantId") ?? "participant-" + id,
                 WorkspaceId = Value(options, "workspaceId") ?? "default",
                 SessionId = Value(options, "session") ?? currentSessionId,
                 Command = command,
@@ -96,11 +101,58 @@ namespace RimWorldDevBridge
                 OutputFormat = NormalizeFormat(Value(options, "format")),
                 DetailLevel = Value(options, "detail") ?? "compact",
                 AllowExpensive = ParseBool(Value(options, "allowExpensive")),
-                AuthToken = Value(options, "lease")
+                AuthToken = Value(options, "lease"),
+                OperationId = Value(options, "operationId"),
+                OperationKind = Value(options, "operationKind"),
+                DesiredState = Value(options, "desiredState"),
+                CompatibilityKey = Value(options, "compatibilityKey"),
+                ManagedProfile = Value(options, "managedProfile"),
+                RimWorldVersion = Value(options, "rimWorldVersion"),
+                ModSetFingerprint = Value(options, "modSetFingerprint"),
+                ModLoadOrderFingerprint = Value(options, "modLoadOrderFingerprint"),
+                 SourceBuildIdentity = Value(options, "sourceBuildIdentity"),
+                 ExpectedCoreFingerprint = Value(options, "expectedCoreFingerprint"),
+                 ExpectedAdapterFingerprint = Value(options, "expectedAdapterFingerprint"),
+                 ExpectedLoadedAssemblyFingerprint = Value(options, "loadedAssemblyFingerprint"),
+                ConfigurationFingerprint = Value(options, "configurationFingerprint"),
+                UserRootFingerprint = Value(options, "userRootFingerprint"),
+                SaveTarget = Value(options, "saveTarget"),
+                 MapTarget = Value(options, "mapTarget"),
+                 RequiresProcessReplacement = ParseBool(Value(options, "requiresProcessReplacement")),
+                 KeepRunning = ParseBool(Value(options, "keepRunning")),
+                 LifecycleGeneration = ParseLong(Value(options, "lifecycleGeneration")),
+                MutationScope = Value(options, "mutationScope"),
+                 RuntimeSlotId = Value(options, "runtimeSlotId"),
+                 DeploymentId = Value(options, "deploymentId"),
+                 ArtifactFingerprint = Value(options, "artifactFingerprint"),
+                 ExpectedProcessId = ParseBoundedInt(Value(options, "expectedProcessId"), 0, 0, 2147483647),
+                 ExpectedProcessStartIdentity = Value(options, "expectedProcessStartIdentity"),
+                 ExpectedProcessSessionId = Value(options, "expectedProcessSessionId"),
+                 ExpectedProcessLifecycleGeneration = ParseLong(Value(options, "expectedProcessLifecycleGeneration"))
             };
-            if (!ValidOptionValue(request.AgentId, 128) || !ValidOptionValue(request.WorkspaceId, 128) ||
+            if (!ValidOptionValue(request.AgentId, 128) || !ValidOptionValue(request.ClientInstanceId, 128) ||
+                !ValidOptionValue(request.ClientCredential, 256) ||
+                !ValidOptionValue(request.ConnectionSessionId, 128) || !ValidOptionValue(request.ParticipantId, 128) ||
+                !ValidOptionValue(request.CorrelationId, 128) || !ValidOptionValue(request.WorkspaceId, 128) ||
                 !ValidOptionValue(request.SessionId, 128) || !ValidOptionValue(request.IdempotencyKey, 128) ||
-                !ValidOptionValue(request.AuthToken, 128) || !ValidOptionValue(request.DetailLevel, 32))
+                !ValidOptionValue(request.AuthToken, 128) || !ValidOptionValue(request.DetailLevel, 32) ||
+                 !ValidOptionValue(request.OperationId, 256) || !ValidOptionValue(request.OperationKind, 64) ||
+                 !ValidOptionValue(request.DesiredState, 64) || !ValidOptionValue(request.CompatibilityKey, 256) ||
+                 !ValidOptionValue(request.RuntimeSlotId, 128) ||
+                 !ValidOptionValue(request.DeploymentId, 256) || !ValidOptionValue(request.ArtifactFingerprint, 256) ||
+                 !ValidOptionValue(request.ExpectedProcessStartIdentity, 256) ||
+                 !ValidOptionValue(request.ExpectedProcessSessionId, 256) ||
+                !ValidOptionValue(request.ManagedProfile, 128) || !ValidOptionValue(request.RimWorldVersion, 64) ||
+                !ValidOptionValue(request.ModSetFingerprint, 256) ||
+                !ValidOptionValue(request.ModLoadOrderFingerprint, 256) ||
+                !ValidOptionValue(request.SourceBuildIdentity, 256) ||
+                 !ValidOptionValue(request.ExpectedCoreFingerprint, 256) ||
+                 !ValidOptionValue(request.ExpectedAdapterFingerprint, 256) ||
+                 !ValidOptionValue(request.ExpectedLoadedAssemblyFingerprint, 256) ||
+                !ValidOptionValue(request.ConfigurationFingerprint, 256) ||
+                !ValidOptionValue(request.UserRootFingerprint, 256) ||
+                !ValidOptionValue(request.SaveTarget, 256) || !ValidOptionValue(request.MapTarget, 256) ||
+                !ValidOptionValue(request.MutationScope, 128))
             {
                 request = null;
                 failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_request_option_length");
@@ -230,6 +282,7 @@ namespace RimWorldDevBridge
                     throw new InvalidDataException("Option percent-encoding is malformed.");
                 string key = Uri.UnescapeDataString(rawKey);
                 string item = Uri.UnescapeDataString(rawItem);
+                if (result.ContainsKey(key)) throw new InvalidDataException("Duplicate bridge option.");
                 result[key] = item;
             }
             return result;
@@ -255,6 +308,11 @@ namespace RimWorldDevBridge
         internal static bool ParseBool(string value) =>
             string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) || value == "1";
 
+        internal static long ParseLong(string value)
+        {
+            return long.TryParse(value, out long parsed) ? parsed : 0L;
+        }
+
         internal static int ParseBoundedInt(string value, int fallback, int minimum, int maximum)
         {
             return int.TryParse(value, out int parsed) ? Math.Max(minimum, Math.Min(maximum, parsed)) : fallback;
@@ -264,37 +322,87 @@ namespace RimWorldDevBridge
             string.Equals(value, "json", StringComparison.OrdinalIgnoreCase) ? "json" : "line";
 
         private static bool ValidOptionValue(string value, int maximumLength) =>
-            value == null || value.Length <= maximumLength;
+            value == null || value.Length <= maximumLength && value.IndexOf('\0') < 0;
 
         [System.Runtime.Serialization.DataContract]
         private sealed class JsonResult
         {
             [System.Runtime.Serialization.DataMember(Order = 1)] public string requestId;
-            [System.Runtime.Serialization.DataMember(Order = 2)] public string sessionId;
-            [System.Runtime.Serialization.DataMember(Order = 3)] public string command;
-            [System.Runtime.Serialization.DataMember(Order = 4)] public string provider;
-            [System.Runtime.Serialization.DataMember(Order = 5)] public string providerVersion;
-            [System.Runtime.Serialization.DataMember(Order = 6)] public string mode;
-            [System.Runtime.Serialization.DataMember(Order = 7)] public string status;
-            [System.Runtime.Serialization.DataMember(Order = 8)] public string schema;
-            [System.Runtime.Serialization.DataMember(Order = 9)] public int schemaVersion;
-            [System.Runtime.Serialization.DataMember(Order = 10)] public double queueDelayMs;
-            [System.Runtime.Serialization.DataMember(Order = 11)] public double executionMs;
-            [System.Runtime.Serialization.DataMember(Order = 20)] public double preparationMs;
-            [System.Runtime.Serialization.DataMember(Order = 12)] public int tickBefore;
-            [System.Runtime.Serialization.DataMember(Order = 13)] public int tickAfter;
-            [System.Runtime.Serialization.DataMember(Order = 14)] public bool truncated;
-            [System.Runtime.Serialization.DataMember(Order = 15)] public string cursor;
-            [System.Runtime.Serialization.DataMember(Order = 16)] public string mutation;
-            [System.Runtime.Serialization.DataMember(Order = 17)] public List<BridgeField> data;
-            [System.Runtime.Serialization.DataMember(Order = 18)] public List<string> lines;
-            [System.Runtime.Serialization.DataMember(Order = 19)] public List<string> warnings;
+            [System.Runtime.Serialization.DataMember(Order = 2)] public string correlationId;
+            [System.Runtime.Serialization.DataMember(Order = 3)] public string agentId;
+            [System.Runtime.Serialization.DataMember(Order = 4)] public string clientInstanceId;
+            [System.Runtime.Serialization.DataMember(Order = 5)] public string participantId;
+            [System.Runtime.Serialization.DataMember(Order = 6)] public string sessionId;
+            [System.Runtime.Serialization.DataMember(Order = 7)] public string connectionSessionId;
+            [System.Runtime.Serialization.DataMember(Order = 8)] public string command;
+            [System.Runtime.Serialization.DataMember(Order = 9)] public string operationId;
+            [System.Runtime.Serialization.DataMember(Order = 10)] public string operationKind;
+            [System.Runtime.Serialization.DataMember(Order = 11)] public string operationState;
+            [System.Runtime.Serialization.DataMember(Order = 12)] public string compatibilityKey;
+            [System.Runtime.Serialization.DataMember(Order = 13)] public string desiredState;
+            [System.Runtime.Serialization.DataMember(Order = 14)] public string runtimeSlotId;
+            [System.Runtime.Serialization.DataMember(Order = 15)] public string deploymentId;
+            [System.Runtime.Serialization.DataMember(Order = 16)] public string artifactFingerprint;
+            [System.Runtime.Serialization.DataMember(Order = 17)] public string loadedAssemblyFingerprint;
+            [System.Runtime.Serialization.DataMember(Order = 18)] public int pid;
+            [System.Runtime.Serialization.DataMember(Order = 19)] public string processStartIdentity;
+            [System.Runtime.Serialization.DataMember(Order = 20)] public long lifecycleGeneration;
+            [System.Runtime.Serialization.DataMember(Order = 21)] public long progressSequence;
+            [System.Runtime.Serialization.DataMember(Order = 22)] public DateTime? lastProgressAtUtc;
+            [System.Runtime.Serialization.DataMember(Order = 23)] public bool terminal;
+            [System.Runtime.Serialization.DataMember(Order = 24)] public bool recoverable;
+            [System.Runtime.Serialization.DataMember(Order = 25)] public bool retrySafe;
+            [System.Runtime.Serialization.DataMember(Order = 26)] public string nextAction;
+            [System.Runtime.Serialization.DataMember(Order = 27)] public string capacityState;
+            [System.Runtime.Serialization.DataMember(Order = 28)] public bool keepRunning;
+            [System.Runtime.Serialization.DataMember(Order = 29)] public string provider;
+            [System.Runtime.Serialization.DataMember(Order = 30)] public string providerVersion;
+            [System.Runtime.Serialization.DataMember(Order = 31)] public string mode;
+            [System.Runtime.Serialization.DataMember(Order = 32)] public string status;
+            [System.Runtime.Serialization.DataMember(Order = 33)] public string schema;
+            [System.Runtime.Serialization.DataMember(Order = 34)] public int schemaVersion;
+            [System.Runtime.Serialization.DataMember(Order = 35)] public double queueDelayMs;
+            [System.Runtime.Serialization.DataMember(Order = 36)] public double executionMs;
+            [System.Runtime.Serialization.DataMember(Order = 37)] public double preparationMs;
+            [System.Runtime.Serialization.DataMember(Order = 38)] public int tickBefore;
+            [System.Runtime.Serialization.DataMember(Order = 39)] public int tickAfter;
+            [System.Runtime.Serialization.DataMember(Order = 40)] public bool truncated;
+            [System.Runtime.Serialization.DataMember(Order = 41)] public string cursor;
+            [System.Runtime.Serialization.DataMember(Order = 42)] public string mutation;
+            [System.Runtime.Serialization.DataMember(Order = 43)] public List<BridgeField> data;
+            [System.Runtime.Serialization.DataMember(Order = 44)] public List<string> lines;
+            [System.Runtime.Serialization.DataMember(Order = 45)] public List<string> warnings;
 
             internal static JsonResult From(BridgeResult result) => new JsonResult
             {
                 requestId = result?.RequestId,
+                correlationId = result?.CorrelationId,
+                agentId = result?.AgentId,
+                clientInstanceId = result?.ClientInstanceId,
+                participantId = result?.ParticipantId,
                 sessionId = result?.SessionId,
+                connectionSessionId = result?.ConnectionSessionId,
                 command = result?.Command,
+                operationId = result?.OperationId,
+                operationKind = result?.OperationKind,
+                operationState = result?.OperationState,
+                compatibilityKey = result?.CompatibilityKey,
+                desiredState = result?.DesiredState,
+                runtimeSlotId = result?.RuntimeSlotId,
+                deploymentId = result?.DeploymentId,
+                artifactFingerprint = result?.ArtifactFingerprint,
+                loadedAssemblyFingerprint = result?.LoadedAssemblyFingerprint,
+                pid = result?.ProcessId ?? 0,
+                processStartIdentity = result?.ProcessStartIdentity,
+                lifecycleGeneration = result?.LifecycleGeneration ?? 0,
+                progressSequence = result?.ProgressSequence ?? 0,
+                lastProgressAtUtc = result?.LastProgressAtUtc,
+                terminal = result?.Terminal ?? false,
+                recoverable = result?.Recoverable ?? false,
+                retrySafe = result?.RetrySafe ?? false,
+                nextAction = result?.NextAction,
+                capacityState = result?.CapacityState,
+                keepRunning = result?.KeepRunning ?? false,
                 provider = result?.Provider,
                 providerVersion = result?.ProviderVersion,
                 mode = result?.Mode.ToString(),

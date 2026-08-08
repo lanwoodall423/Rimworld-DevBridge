@@ -11,7 +11,12 @@
     <OutputPath>$(DevBridgeCoordinatorOutputRoot)</OutputPath>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="System.Security" />
     <Compile Include="..\..\Source\RimWorldDevBridge\BridgeRestartCoordinator.cs" Link="BridgeRestartCoordinator.cs" />
+    <Compile Include="..\..\Source\RimWorldDevBridge\BridgeMultiAgentContracts.cs" Link="BridgeMultiAgentContracts.cs" />
+    <Compile Include="..\..\Source\RimWorldDevBridge\BridgeSharedOperations.cs" Link="BridgeSharedOperations.cs" />
+    <Compile Include="..\..\Source\RimWorldDevBridge\BridgeArtifactDeployment.cs" Link="BridgeArtifactDeployment.cs" />
+    <Compile Include="..\..\Source\RimWorldDevBridge\BridgeRuntimeSlots.cs" Link="BridgeRuntimeSlots.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
 </Project>

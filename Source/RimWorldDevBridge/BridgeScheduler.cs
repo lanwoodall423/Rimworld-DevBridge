@@ -166,7 +166,7 @@ namespace RimWorldDevBridge
                     return BridgeResult.Fail(BridgeStatus.BUSY, "operation_queue_full")
                         .Add("queueDepth", queuedCount).Add("capacity", capacity);
                 }
-                string agentKey = AgentKey(request.AgentId);
+                string agentKey = FairnessKey(request);
                 if (!agentQueues.TryGetValue(agentKey, out Queue<BridgeRequest> agentQueue))
                 {
                     agentQueue = new Queue<BridgeRequest>();
@@ -193,6 +193,11 @@ namespace RimWorldDevBridge
 
         internal bool Cancel(string requestId, string agentId)
         {
+            return Cancel(requestId, agentId, null, null);
+        }
+
+        internal bool Cancel(string requestId, string agentId, string clientInstanceId, string participantId)
+        {
             lock (gate)
             {
                 BridgeRequest request = null;
@@ -206,7 +211,10 @@ namespace RimWorldDevBridge
                 }
                 if (request == null) running.TryGetValue(requestId ?? string.Empty, out request);
                 if (request == null || (agentId != null &&
-                    !string.Equals(request.AgentId, agentId, StringComparison.Ordinal))) return false;
+                    !string.Equals(request.AgentId, agentId, StringComparison.Ordinal)) ||
+                    (clientInstanceId != null && !string.Equals(request.ClientInstanceId, clientInstanceId,
+                        StringComparison.Ordinal)) || (participantId != null &&
+                    !string.Equals(request.ParticipantId, participantId, StringComparison.Ordinal))) return false;
                 request.Cancelled = true;
                 return true;
             }
@@ -520,7 +528,7 @@ namespace RimWorldDevBridge
                     slowestMs = executionMs;
                     slowestCommand = request.Command;
                 }
-                string agentKey = AgentKey(request.AgentId);
+                string agentKey = FairnessKey(request);
                 if (!agentMetrics.TryGetValue(agentKey, out AgentMetric metric))
                 {
                     metric = new AgentMetric();
@@ -539,6 +547,7 @@ namespace RimWorldDevBridge
         {
             lock (gate) running.Remove(request.RequestId);
             request.Result = BridgeResult.Fail(status, code);
+            try { completed?.Invoke(request, request.Result); } catch { }
             request.Done.Set();
         }
 
@@ -549,7 +558,7 @@ namespace RimWorldDevBridge
 
         private void AddQueuedLocked(BridgeRequest request)
         {
-            string agentKey = AgentKey(request.AgentId);
+            string agentKey = FairnessKey(request);
             if (!agentQueues.TryGetValue(agentKey, out Queue<BridgeRequest> pending))
             {
                 pending = new Queue<BridgeRequest>();
@@ -560,9 +569,12 @@ namespace RimWorldDevBridge
             queuedCount++;
         }
 
-        private static string AgentKey(string agentId)
+        private static string FairnessKey(BridgeRequest request)
         {
-            return string.IsNullOrWhiteSpace(agentId) ? string.Empty : agentId;
+            if (request == null) return string.Empty;
+            return (request.AgentId ?? string.Empty) + "\u001f" +
+                (request.ClientInstanceId ?? string.Empty) + "\u001f" +
+                (request.WorkspaceId ?? string.Empty);
         }
 
         private static string RedactAgent(string agentId)

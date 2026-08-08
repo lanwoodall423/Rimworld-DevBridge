@@ -17,4 +17,18 @@ Important boundaries:
   or unsaved game. Raw save names, paths, usernames, and credentials are never exposed.
 - Tokens and secrets should be redacted from reports.
 - Attached or live processes must never be restarted automatically.
+- `agentId`, `clientInstanceId`, `connectionSessionId`, correlation IDs, and
+  `participantId` are caller metadata only. They do not bypass transport
+  authentication, in-game confirmation, write leases, coordinator ownership, or
+  capacity limits. Diagnostics expose sanitized identity values.
+- Shared operations authorize each participant independently. Detaching one client
+  does not authorize another client to impersonate it; final-detach behavior is
+  deterministic and persisted.
+- Managed runtime slots use separate user, save, log, IPC, coordinator, evidence,
+  and deployment paths. Attached/manual processes are refused, and PID reuse is
+  rejected unless process-start identity, session, lifecycle, slot, and loaded
+  fingerprint all match.
+- Artifacts and deployments are content-derived and provenance-bound. Deployment
+  locks are scoped and atomic; modified files, wrong-agent artifacts, stale locks,
+  and loaded-fingerprint mismatches are rejected.
 - Proprietary RimWorld/Unity/Harmony files must not be attached to reports or commits.

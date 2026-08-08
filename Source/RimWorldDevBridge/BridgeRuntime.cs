@@ -5,11 +5,13 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using HarmonyLib;
+using RimWorld;
 using Verse;
 
 namespace RimWorldDevBridge
@@ -19,21 +21,26 @@ namespace RimWorldDevBridge
         private const int IdleSeconds = 180;
         private static readonly object Gate = new object();
         private static readonly BridgeAuthorization Authorization = new BridgeAuthorization();
+        private static readonly BridgeIdentityAuthority IdentityAuthority = new BridgeIdentityAuthority();
         private static readonly BridgeMutationConfirmation MutationConfirmation =
             new BridgeMutationConfirmation();
+        private static BridgeSharedOperationCoordinator SharedOperations;
+        private static BridgeRuntimeSlotManager RuntimeSlots;
+        private static BridgeDeploymentManager DeploymentManager;
         private static readonly BridgeScheduledRequestExecutor RequestExecutor =
             new BridgeScheduledRequestExecutor(Authorization, () => SessionId,
                 () => Settings.RemoteMutationEnabled, IsCurrentRequestTransport,
                 ObserveMutationAuthorization, Decorate);
         private static readonly BridgeScheduler Scheduler =
-            new BridgeScheduler(RequestExecutor.Execute, RequestExecutor.Complete);
+            new BridgeScheduler(RequestExecutor.Execute, CompleteScheduledRequest);
         private static readonly string BootId = Guid.NewGuid().ToString("N");
         private static readonly BridgeMainThreadContext MainThread = new BridgeMainThreadContext();
         private static readonly BridgeRequestPreparation RequestPreparation =
-            new BridgeRequestPreparation(MainThread, () => SessionId, IsCurrentRequestTransport);
+            new BridgeRequestPreparation(MainThread, () => SessionId, IsCurrentRequestTransport,
+                CoordinateRequest, CompleteCoordinatedRequest);
         private static readonly BridgeLegacyFileProtocol LegacyFileProtocol =
             new BridgeLegacyFileProtocol(() => AssertMainThread("legacy file processing"),
-                () => SessionId, RequestPreparation, Scheduler, Decorate);
+                () => SessionId, RequestPreparation, Scheduler, Decorate, CompleteCoordinatedRequest);
         private static readonly Harmony Harmony = new Harmony("lan.rimworld.devbridge.v2");
         private static readonly BridgeFileActivation FileActivation = new BridgeFileActivation(
             () => shuttingDown, () => active, () => AssertMainThread("file activation"), StartTransport,
@@ -64,6 +71,8 @@ namespace RimWorldDevBridge
         private static long bootstrapManagedDeltaBytes;
         private static long leaseExpiryTicks;
         private static string coreFingerprint;
+        private static string loadedAssemblyFingerprint;
+        private static string activeRuntimeSlotId;
         private static bool bootstrapped;
         private static readonly BridgeLifecycleDispatch LifecycleDispatch =
             new BridgeLifecycleDispatch(MainThread, () => shuttingDown, CompleteFinalizeInit);
@@ -91,6 +100,18 @@ namespace RimWorldDevBridge
         internal static string BootIdForClients => BootId;
         internal static int ProcessIdForClients => Process.GetCurrentProcess().Id;
         internal static string CoreFingerprint => coreFingerprint ?? (coreFingerprint = ComputeCoreFingerprint());
+        internal static string ActiveRuntimeSlotId => activeRuntimeSlotId;
+        internal static string LoadedAssemblyFingerprint => loadedAssemblyFingerprint ??
+            (loadedAssemblyFingerprint = ComputeLoadedAssemblyFingerprint());
+        internal static string ArtifactFingerprint
+        {
+            get
+            {
+                if (DeploymentManager == null || string.IsNullOrWhiteSpace(activeRuntimeSlotId)) return "none";
+                try { return DeploymentManager.ReadCurrent(activeRuntimeSlotId)?.ArtifactFingerprint ?? "none"; }
+                catch { return "none"; }
+            }
+        }
         internal static BridgeRuntimeStateSnapshot StateSnapshot => CaptureStateSnapshot();
         internal static BridgeSessionContextSnapshot SessionContext => StateSnapshot.Context;
         internal static int StatusWriteCountForTests => BridgeStatusPublisher.WriteCountForTests;
@@ -211,6 +232,454 @@ namespace RimWorldDevBridge
 
         private static long CurrentStateVersion() => Interlocked.Read(ref stateVersion);
 
+        private static BridgeResult CoordinateRequest(BridgeRequest request)
+        {
+            if (SharedOperations == null || string.IsNullOrWhiteSpace(request.OperationKind)) return null;
+            if (!Enum.TryParse(request.OperationKind, true, out BridgeOperationKind operationKind))
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_operation_kind");
+            if (!TryParseDesiredState(request.DesiredState, out BridgeDesiredState desiredState))
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_desired_state");
+
+            BridgeClientIdentity identity = null;
+            BridgeOperationJoinResult joined = null;
+            BridgeRuntimeSlotAllocation allocatedSlot = null;
+            try
+            {
+                BridgeOperationCompatibilityKey compatibility = BuildCompatibility(request, operationKind,
+                    desiredState);
+                identity = BridgeClientIdentity.Create(request.AgentId,
+                    request.ClientInstanceId, request.ConnectionSessionId, request.CorrelationId,
+                    request.ParticipantId);
+                // Persist normalized defaults on the request. Completion, cancellation, and
+                // child work must reconstruct the same caller identity rather than minting
+                // a different anonymous identity on each path.
+                request.AgentId = identity.AgentId;
+                request.ClientInstanceId = identity.ClientInstanceId;
+                request.ConnectionSessionId = identity.ConnectionSessionId;
+                request.CorrelationId = identity.RequestCorrelationId;
+                request.ParticipantId = identity.ParticipantId;
+                if (!AuthenticateIdentity(request, identity))
+                    return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "client_identity_authentication_failed");
+                joined = SharedOperations.Join(new BridgeOperationJoinRequest
+                {
+                    Identity = identity,
+                    OperationId = request.OperationId,
+                    OperationKind = operationKind,
+                    DesiredState = desiredState,
+                    Compatibility = compatibility,
+                    RuntimeSlotId = request.RuntimeSlotId,
+                    DeploymentId = request.DeploymentId,
+                    ArtifactFingerprint = request.ArtifactFingerprint,
+                    LoadedAssemblyFingerprint = request.ExpectedLoadedAssemblyFingerprint,
+                    KeepRunning = request.KeepRunning
+                });
+                if (joined.Operation == null)
+                    return BridgeResult.Fail(BridgeStatus.BUSY, "operation_capacity", joined.NextAction)
+                        .Add("capacityState", joined.CapacityState ?? "queued");
+
+                request.OperationId = joined.Operation.OperationId;
+                request.ParticipantId = joined.ParticipantId;
+                request.CompatibilityKey = joined.Operation.CompatibilityKey;
+                if (!joined.Created)
+                {
+                    if (joined.Operation.OperationState == BridgeOperationState.Queued && RuntimeSlots != null)
+                    {
+                        PromoteQueuedCapacity();
+                        BridgeRuntimeSlotDefinition queuedSlot = RuntimeSlots.FindLease(joined.Operation.OperationId,
+                            identity.AgentId, identity.ClientInstanceId);
+                        if (queuedSlot == null)
+                        {
+                            BridgeRuntimeSlotAllocation retryAllocation = RuntimeSlots.Allocate(new BridgeRuntimeSlotRequest
+                            {
+                                Compatibility = compatibility,
+                                RequestedRuntimeSlotId = request.RuntimeSlotId,
+                                AgentId = identity.AgentId,
+                                ClientInstanceId = identity.ClientInstanceId,
+                                OperationId = joined.Operation.OperationId,
+                                RequiresNewProcess = request.RequiresProcessReplacement
+                            });
+                            queuedSlot = retryAllocation?.Slot;
+                        }
+                        if (queuedSlot != null)
+                        {
+                            activeRuntimeSlotId = queuedSlot.RuntimeSlotId;
+                            joined.Operation = SharedOperations.BindRuntimeSlot(joined.Operation.OperationId,
+                                identity, queuedSlot.RuntimeSlotId, request.DeploymentId,
+                                request.ArtifactFingerprint);
+                            request.SharedOperationRegistered = true;
+                            ApplyOperationFields(request, joined.Operation, null);
+                            return null;
+                        }
+                    }
+                    request.SharedOperationRegistered = false;
+                    return OperationResult(request, joined.Operation,
+                        joined.Operation.OperationState == BridgeOperationState.Queued ? BridgeStatus.BUSY : BridgeStatus.PARTIAL,
+                        joined.Operation.OperationState == BridgeOperationState.Queued ? "runtime_slot_capacity" : "operation_joined",
+                        joined.NextAction ?? "observe the shared operation");
+                }
+                BridgeRuntimeSlotAllocation allocation = RuntimeSlots?.Allocate(new BridgeRuntimeSlotRequest
+                {
+                    Compatibility = compatibility,
+                    RequestedRuntimeSlotId = request.RuntimeSlotId,
+                    AgentId = identity.AgentId,
+                    ClientInstanceId = identity.ClientInstanceId,
+                    OperationId = joined.Operation.OperationId,
+                    RequiresNewProcess = request.RequiresProcessReplacement
+                });
+                allocatedSlot = allocation;
+                if (allocation != null && !allocation.Allocated)
+                {
+                    request.SharedOperationRegistered = false;
+                    BridgeOperationRecord queued = SharedOperations.SetCapacity(joined.Operation.OperationId,
+                        identity, allocation.CapacityState, allocation.NextAction, true);
+                    return OperationResult(request, queued, BridgeStatus.BUSY, "runtime_slot_capacity",
+                        allocation.NextAction);
+                }
+                if (allocation?.Slot != null)
+                {
+                    if (!RegisterCurrentManagedProcess(request, allocation.Slot, identity))
+                    {
+                        RuntimeSlots.Release(allocation.Slot.RuntimeSlotId, joined.Operation.OperationId,
+                            identity.AgentId, identity.ClientInstanceId, false);
+                        AbortCoordinatedOperation(request, identity, joined,
+                            BridgeResult.Fail(BridgeStatus.FORBIDDEN, "managed_process_identity_required"));
+                        return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "managed_process_identity_required");
+                    }
+                    BridgeResult deploymentFailure = VerifyDeploymentForRequest(request,
+                        allocation.Slot.RuntimeSlotId);
+                    if (deploymentFailure != null)
+                    {
+                        RuntimeSlots.Release(allocation.Slot.RuntimeSlotId, joined.Operation.OperationId,
+                            identity.AgentId, identity.ClientInstanceId, false);
+                        AbortCoordinatedOperation(request, identity, joined, deploymentFailure);
+                        return deploymentFailure;
+                    }
+                    activeRuntimeSlotId = allocation.Slot.RuntimeSlotId;
+                    joined.Operation = SharedOperations.BindRuntimeSlot(joined.Operation.OperationId, identity,
+                        allocation.Slot.RuntimeSlotId, request.DeploymentId, request.ArtifactFingerprint);
+                }
+                request.SharedOperationRegistered = true;
+                ApplyOperationFields(request, joined.Operation, null);
+                return null;
+            }
+            catch (ArgumentException exception)
+            {
+                ReleaseFailedAllocation(allocatedSlot, joined, identity);
+                BridgeResult failure = BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "invalid_operation_request",
+                    BridgeText.Clean(exception.GetBaseException().Message));
+                AbortCoordinatedOperation(request, identity, joined, failure);
+                return failure;
+            }
+            catch (Exception exception)
+            {
+                ReleaseFailedAllocation(allocatedSlot, joined, identity);
+                BridgeResult failure = BridgeResult.Fail(BridgeStatus.ERROR, "operation_coordination_failed",
+                    BridgeText.Clean(exception.GetBaseException().Message));
+                AbortCoordinatedOperation(request, identity, joined, failure);
+                return failure;
+            }
+        }
+
+        internal static BridgeResult CoordinateRequestForTests(BridgeRequest request,
+            BridgeSharedOperationCoordinator sharedOperations, BridgeRuntimeSlotManager runtimeSlots)
+        {
+            BridgeSharedOperationCoordinator previousOperations = SharedOperations;
+            BridgeRuntimeSlotManager previousSlots = RuntimeSlots;
+            BridgeDeploymentManager previousDeployment = DeploymentManager;
+            SharedOperations = sharedOperations;
+            RuntimeSlots = runtimeSlots;
+            DeploymentManager = null;
+            try { return CoordinateRequest(request); }
+            finally
+            {
+                SharedOperations = previousOperations;
+                RuntimeSlots = previousSlots;
+                DeploymentManager = previousDeployment;
+            }
+        }
+
+        private static void ReleaseFailedAllocation(BridgeRuntimeSlotAllocation allocation,
+            BridgeOperationJoinResult joined, BridgeClientIdentity identity)
+        {
+            if (allocation?.Slot == null || joined == null || identity == null || RuntimeSlots == null) return;
+            try
+            {
+                RuntimeSlots.Release(allocation.Slot.RuntimeSlotId, joined.OperationId,
+                    identity.AgentId, identity.ClientInstanceId, false);
+            }
+            catch { }
+        }
+
+        private static bool AuthenticateIdentity(BridgeRequest request, BridgeClientIdentity identity)
+        {
+            // Legacy callers remain transport-authenticated. New clients bind the stable
+            // client label to a separate credential before it can own a lease or operation.
+            if (string.IsNullOrWhiteSpace(request.ClientCredential)) return true;
+            BridgeClientRegistration registration;
+            if (IdentityAuthority.Authenticate(identity, request.ClientCredential, out registration)) return true;
+            try
+            {
+                IdentityAuthority.Register(identity.AgentId, identity.ClientInstanceId,
+                    request.ClientCredential);
+                return IdentityAuthority.Authenticate(identity, request.ClientCredential, out registration);
+            }
+            catch (InvalidOperationException) { return false; }
+        }
+
+        private static bool AuthenticateClient(string agentId, string clientInstanceId, string credential)
+        {
+            if (string.IsNullOrWhiteSpace(clientInstanceId)) return true;
+            if (string.Equals(clientInstanceId, "client-legacy", StringComparison.Ordinal) &&
+                (string.IsNullOrWhiteSpace(agentId) || string.Equals(agentId, "anonymous",
+                    StringComparison.Ordinal))) return true;
+            if (string.IsNullOrWhiteSpace(credential)) return false;
+            BridgeClientIdentity identity = BridgeClientIdentity.Create(agentId, clientInstanceId,
+                "lease-connection", "lease-correlation", "lease-participant");
+            BridgeClientRegistration registration;
+            if (IdentityAuthority.Authenticate(identity, credential, out registration)) return true;
+            try
+            {
+                IdentityAuthority.Register(identity.AgentId, identity.ClientInstanceId, credential);
+                return IdentityAuthority.Authenticate(identity, credential, out registration);
+            }
+            catch (InvalidOperationException) { return false; }
+        }
+
+        private static BridgeResult VerifyDeploymentForRequest(BridgeRequest request, string runtimeSlotId)
+        {
+            if (DeploymentManager == null || string.IsNullOrWhiteSpace(request.DeploymentId)) return null;
+            if (string.IsNullOrWhiteSpace(runtimeSlotId))
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "deployment_slot_required");
+            try
+            {
+                BridgeDeploymentManifest manifest = DeploymentManager.ReadCurrent(runtimeSlotId);
+                if (manifest == null || !string.Equals(manifest.DeploymentId, request.DeploymentId,
+                        StringComparison.Ordinal) ||
+                    (!string.IsNullOrWhiteSpace(request.ArtifactFingerprint) &&
+                     !string.Equals(manifest.ArtifactFingerprint, request.ArtifactFingerprint,
+                         StringComparison.OrdinalIgnoreCase)))
+                    return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "deployed_fingerprint_mismatch");
+                if (!string.IsNullOrWhiteSpace(request.ExpectedLoadedAssemblyFingerprint) &&
+                    !DeploymentManager.VerifyLoaded(manifest, request.ExpectedLoadedAssemblyFingerprint))
+                    return BridgeResult.Fail(BridgeStatus.INCOMPATIBLE, "loaded_assembly_fingerprint_mismatch");
+                return null;
+            }
+            catch (Exception exception)
+            {
+                return BridgeResult.Fail(BridgeStatus.INVALID_ARGUMENT, "deployment_verification_failed",
+                    BridgeText.Clean(exception.GetBaseException().Message));
+            }
+        }
+
+        private static bool RegisterCurrentManagedProcess(BridgeRequest request,
+            BridgeRuntimeSlotDefinition slot, BridgeClientIdentity identity)
+        {
+            if (request == null || slot == null || identity == null || RuntimeSlots == null) return false;
+            try
+            {
+                using (Process process = Process.GetCurrentProcess())
+                {
+                    string start = process.StartTime.ToUniversalTime().Ticks.ToString(
+                        CultureInfo.InvariantCulture);
+                    long lifecycle = 0;
+                    long.TryParse(slot.LifecycleGeneration, out lifecycle);
+                    if (request.ExpectedProcessId > 0 && request.ExpectedProcessId != process.Id ||
+                        !string.IsNullOrWhiteSpace(request.ExpectedProcessStartIdentity) &&
+                        !string.Equals(request.ExpectedProcessStartIdentity, start, StringComparison.Ordinal) ||
+                        !string.IsNullOrWhiteSpace(request.ExpectedProcessSessionId) &&
+                        !string.Equals(request.ExpectedProcessSessionId, SessionId, StringComparison.Ordinal) ||
+                        request.ExpectedProcessLifecycleGeneration > 0 &&
+                        request.ExpectedProcessLifecycleGeneration != lifecycle) return false;
+                    BridgeProcessIdentity current = new BridgeProcessIdentity
+                    {
+                        Pid = process.Id,
+                        ProcessStartIdentity = start,
+                        SessionId = SessionId,
+                        LifecycleGeneration = lifecycle,
+                        RuntimeSlotId = slot.RuntimeSlotId,
+                        LoadedAssemblyFingerprint = LoadedAssemblyFingerprint,
+                        ExecutablePath = process.MainModule == null ? string.Empty : process.MainModule.FileName,
+                        ProfileFingerprint = BridgeHashing.Sha256(slot.ManagedProfile ?? string.Empty)
+                    };
+                    return RuntimeSlots.ClaimManagedProcess(slot.RuntimeSlotId, current,
+                        request.OperationId, identity.AgentId, identity.ClientInstanceId);
+                }
+            }
+            catch { return false; }
+        }
+
+        private static void AbortCoordinatedOperation(BridgeRequest request, BridgeClientIdentity identity,
+            BridgeOperationJoinResult joined, BridgeResult failure)
+        {
+            if (joined == null || !joined.Created || identity == null || SharedOperations == null ||
+                request.SharedOperationRegistered || failure == null) return;
+            try
+            {
+                SharedOperations.Complete(joined.OperationId, identity, null,
+                    failure.Status.ToString().ToLowerInvariant());
+            }
+            catch { }
+        }
+
+        private static bool TryParseDesiredState(string value, out BridgeDesiredState desiredState)
+        {
+            string normalized = string.IsNullOrWhiteSpace(value) ? "bridge" : value.Trim();
+            normalized = normalized.Replace("_", string.Empty).Replace("-", string.Empty);
+            if (string.Equals(normalized, "testready", StringComparison.OrdinalIgnoreCase))
+            {
+                desiredState = BridgeDesiredState.TestReady;
+                return true;
+            }
+            return Enum.TryParse(normalized, true, out desiredState);
+        }
+
+        private static BridgeOperationCompatibilityKey BuildCompatibility(BridgeRequest request,
+            BridgeOperationKind operationKind, BridgeDesiredState desiredState)
+        {
+            BridgeOperationCompatibilityKey calculated = BridgeOperationCompatibilityKey.Create(operationKind,
+                desiredState, request.ManagedProfile ?? "attached",
+                request.RimWorldVersion ?? VersionControl.CurrentVersionStringWithoutBuild,
+                request.ModSetFingerprint, request.ModLoadOrderFingerprint,
+                request.SourceBuildIdentity ?? CoreFingerprint, request.RuntimeSlotId,
+                 request.ExpectedCoreFingerprint ?? CoreFingerprint, request.ExpectedAdapterFingerprint,
+                 request.ConfigurationFingerprint,
+                 request.UserRootFingerprint ?? BridgeHashing.StablePathFingerprint(new[] { BridgePaths.UserRoot }),
+                 request.SaveTarget, request.MapTarget, request.RequiresProcessReplacement,
+                 request.LifecycleGeneration, request.MutationScope ?? request.Command,
+                 request.DeploymentId, request.ArtifactFingerprint,
+                 request.ExpectedLoadedAssemblyFingerprint);
+            if (!string.IsNullOrWhiteSpace(request.CompatibilityKey) &&
+                !string.Equals(calculated.ToString(),
+                    BridgeOperationCompatibilityKey.FromDigest(request.CompatibilityKey).ToString(),
+                    StringComparison.Ordinal))
+                throw new ArgumentException("compatibility_key_mismatch");
+            return calculated;
+        }
+
+        private static void CompleteScheduledRequest(BridgeRequest request, BridgeResult result)
+        {
+            RequestExecutor.Complete(request, result);
+            CompleteCoordinatedRequest(request, result);
+        }
+
+        private static void CompleteCoordinatedRequest(BridgeRequest request, BridgeResult result)
+        {
+            if (!request.SharedOperationRegistered || SharedOperations == null || result == null) return;
+            if (Interlocked.Exchange(ref request.SharedOperationCompletionClaimed, 1) != 0) return;
+            request.SharedOperationRegistered = false;
+            BridgeOperationRecord operation = null;
+            BridgeClientIdentity identity = BridgeClientIdentity.Create(request.AgentId,
+                request.ClientInstanceId, request.ConnectionSessionId, request.CorrelationId,
+                request.ParticipantId);
+            try
+            {
+                operation = SharedOperations.Complete(request.OperationId, identity,
+                    result.LoadedAssemblyFingerprint,
+                    result.IsSuccess ? null : result.Status.ToString().ToLowerInvariant());
+                ApplyOperationFields(request, operation, result);
+            }
+            catch (Exception exception)
+            {
+                result.Status = BridgeStatus.ERROR;
+                result.Add("error", "operation_completion_failed");
+                result.Warn(BridgeText.Clean(exception.GetBaseException().Message));
+            }
+            finally
+            {
+                string runtimeSlotId = operation?.RuntimeSlotId ?? request.RuntimeSlotId;
+                string operationId = operation?.OperationId ?? request.OperationId;
+                bool keepRunning = operation != null && operation.KeepRunning;
+                if (RuntimeSlots != null && !string.IsNullOrWhiteSpace(runtimeSlotId))
+                    RuntimeSlots.Release(runtimeSlotId, operationId, identity.AgentId,
+                        identity.ClientInstanceId, keepRunning);
+                if (!keepRunning) activeRuntimeSlotId = null;
+                if (!keepRunning) PromoteQueuedCapacity();
+            }
+        }
+
+        private static void PromoteQueuedCapacity()
+        {
+            if (RuntimeSlots == null || SharedOperations == null) return;
+            for (int attempt = 0; attempt < 64; attempt++)
+            {
+                BridgeRuntimeSlotAllocation allocation = RuntimeSlots.TryAllocateNext();
+                if (allocation == null || !allocation.Allocated || allocation.Slot == null) return;
+                BridgeRuntimeSlotLease lease = allocation.Slot.ActiveLeases.LastOrDefault();
+                if (lease == null) return;
+                BridgeClientIdentity identity;
+                try { identity = SharedOperations.ParticipantIdentity(lease.OperationId); }
+                catch { identity = null; }
+                if (identity == null)
+                {
+                    RuntimeSlots.Release(allocation.Slot.RuntimeSlotId, lease.OperationId, lease.AgentId,
+                        lease.ClientInstanceId, false);
+                    continue;
+                }
+                try
+                {
+                    BridgeOperationRecord operation = SharedOperations.Snapshot().FirstOrDefault(item =>
+                        string.Equals(item.OperationId, lease.OperationId, StringComparison.Ordinal));
+                    if (operation == null || operation.Terminal)
+                    {
+                        RuntimeSlots.Release(allocation.Slot.RuntimeSlotId, lease.OperationId,
+                            lease.AgentId, lease.ClientInstanceId, false);
+                        continue;
+                    }
+                    SharedOperations.BindRuntimeSlot(lease.OperationId, identity,
+                        allocation.Slot.RuntimeSlotId, operation.DeploymentId, operation.ArtifactFingerprint);
+                    activeRuntimeSlotId = allocation.Slot.RuntimeSlotId;
+                }
+                catch
+                {
+                    RuntimeSlots.Release(allocation.Slot.RuntimeSlotId, lease.OperationId, lease.AgentId,
+                        lease.ClientInstanceId, false);
+                }
+                return;
+            }
+        }
+
+        private static BridgeResult OperationResult(BridgeRequest request, BridgeOperationRecord operation,
+            BridgeStatus status, string code, string nextAction)
+        {
+            BridgeResult result = BridgeResult.Fail(status, code);
+            if (!string.IsNullOrWhiteSpace(nextAction)) result.Add("nextAction", nextAction);
+            ApplyOperationFields(request, operation, result);
+            return result;
+        }
+
+        private static void ApplyOperationFields(BridgeRequest request, BridgeOperationRecord operation,
+            BridgeResult result)
+        {
+            if (operation == null) return;
+            request.OperationId = operation.OperationId;
+            request.CompatibilityKey = operation.CompatibilityKey;
+            request.RuntimeSlotId = operation.RuntimeSlotId;
+            request.DeploymentId = operation.DeploymentId;
+            request.ArtifactFingerprint = operation.ArtifactFingerprint;
+            if (result == null) return;
+            result.OperationId = operation.OperationId;
+            result.OperationKind = operation.OperationKind.ToString();
+            result.OperationState = operation.OperationState.ToString();
+            result.CompatibilityKey = operation.CompatibilityKey;
+            result.DesiredState = operation.DesiredState.ToString();
+            result.RuntimeSlotId = operation.RuntimeSlotId;
+            result.DeploymentId = operation.DeploymentId;
+            result.ArtifactFingerprint = operation.ArtifactFingerprint;
+            result.LoadedAssemblyFingerprint = operation.LoadedAssemblyFingerprint;
+            result.ProcessId = operation.Pid;
+            result.ProcessStartIdentity = operation.ProcessStartIdentity;
+            result.SessionId = operation.SessionId ?? result.SessionId;
+            result.LifecycleGeneration = operation.LifecycleGeneration;
+            result.ProgressSequence = operation.ProgressSequence;
+            result.LastProgressAtUtc = operation.LastProgressAtUtc;
+            result.Terminal = operation.Terminal;
+            result.Recoverable = operation.Recoverable;
+            result.RetrySafe = operation.RetrySafe;
+            result.NextAction = operation.NextAction;
+            result.CapacityState = operation.CapacityState;
+            result.KeepRunning = operation.KeepRunning;
+        }
+
         internal static void Bootstrap(string modRoot, long constructionStart, long managedBefore)
         {
             AssertMainThread("bootstrap");
@@ -218,6 +687,15 @@ namespace RimWorldDevBridge
             bootstrapped = true;
             BridgePaths.Initialize(modRoot);
             statusPath = BridgePaths.StatusPath;
+            string coordinationRoot = Path.Combine(BridgePaths.UserRoot, "Coordination");
+            Directory.CreateDirectory(coordinationRoot);
+            SharedOperations = new BridgeSharedOperationCoordinator(
+                statePath: Path.Combine(coordinationRoot, "operations.json"));
+            RuntimeSlots = new BridgeRuntimeSlotManager(2, root: Path.Combine(coordinationRoot, "slots"));
+            DeploymentManager = new BridgeDeploymentManager(Path.Combine(coordinationRoot, "deployments"));
+            IdentityAuthority.Load(Path.Combine(coordinationRoot, "identities.json"));
+            SharedOperations.RecoverAfterCoordinatorRestart();
+            RestoreActiveRuntimeSlot();
             Authorization.RotateSession(identity.SessionId);
             Scheduler.Configure(MainThread, identity.SessionId, Settings.QueueCapacity, Settings.MainThreadBudgetMs);
             long harmonyStart = Stopwatch.GetTimestamp();
@@ -232,6 +710,19 @@ namespace RimWorldDevBridge
             PublishStateIfDirty(true);
             bootstrapMs = BridgeTiming.Milliseconds(constructionStart);
             bootstrapManagedDeltaBytes = GC.GetTotalMemory(false) - managedBefore;
+        }
+
+        private static void RestoreActiveRuntimeSlot()
+        {
+            if (SharedOperations == null || RuntimeSlots == null) return;
+            HashSet<string> validSlots = new HashSet<string>(RuntimeSlots.Snapshot()
+                .Where(item => item.ManagedOwnership && item.ActiveProcess && item.Process != null &&
+                    item.Process.Pid == Process.GetCurrentProcess().Id)
+                .Select(item => item.RuntimeSlotId), StringComparer.Ordinal);
+            BridgeOperationRecord active = SharedOperations.Snapshot().Where(item => !item.Terminal &&
+                !string.IsNullOrWhiteSpace(item.RuntimeSlotId) && validSlots.Contains(item.RuntimeSlotId))
+                .OrderByDescending(item => item.LastProgressAtUtc).FirstOrDefault();
+            activeRuntimeSlotId = active == null ? null : active.RuntimeSlotId;
         }
 
         public static void OnFinalizeInit()
@@ -412,6 +903,11 @@ namespace RimWorldDevBridge
         internal static BridgeResult BeginRestartDrain(BridgeRequest request)
         {
             AssertMainThread("restart drain");
+            BridgeClientIdentity identity = BridgeClientIdentity.Create(request.AgentId,
+                request.ClientInstanceId, request.ConnectionSessionId, request.CorrelationId,
+                request.ParticipantId);
+            if (!AuthenticateIdentity(request, identity))
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "client_identity_authentication_failed");
             long barrierId = Scheduler.BeginDrain();
             Authorization.ClearLeases();
             MutationConfirmation.Revoke();
@@ -428,9 +924,24 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult AcquireWriteLease(string context, string agentId)
         {
+            return AcquireWriteLease(context, agentId, null);
+        }
+
+        internal static BridgeResult AcquireWriteLease(string context, string agentId,
+            string clientInstanceId)
+        {
+            return AcquireWriteLease(context, agentId, clientInstanceId, null);
+        }
+
+        internal static BridgeResult AcquireWriteLease(string context, string agentId,
+            string clientInstanceId, string clientCredential)
+        {
+            if (!AuthenticateClient(agentId, clientInstanceId, clientCredential))
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "client_identity_authentication_failed");
             BridgeResult gate = RequireMutationConfirmation();
             if (gate != null) return gate;
-            BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled, agentId);
+            BridgeResult result = Authorization.Acquire(context, Settings.RemoteMutationEnabled, agentId,
+                clientInstanceId);
             if (result.IsSuccess)
             {
                 MarkStateDirty();
@@ -443,9 +954,24 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult RenewWriteLease(string leaseToken, string agentId)
         {
+            return RenewWriteLease(leaseToken, agentId, null);
+        }
+
+        internal static BridgeResult RenewWriteLease(string leaseToken, string agentId,
+            string clientInstanceId)
+        {
+            return RenewWriteLease(leaseToken, agentId, clientInstanceId, null);
+        }
+
+        internal static BridgeResult RenewWriteLease(string leaseToken, string agentId,
+            string clientInstanceId, string clientCredential)
+        {
+            if (!AuthenticateClient(agentId, clientInstanceId, clientCredential))
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "client_identity_authentication_failed");
             BridgeResult gate = RequireMutationConfirmation();
             if (gate != null) return gate;
-            BridgeResult result = Authorization.Renew(leaseToken, Settings.RemoteMutationEnabled, agentId);
+            BridgeResult result = Authorization.Renew(leaseToken, Settings.RemoteMutationEnabled, agentId,
+                clientInstanceId);
             if (result.IsSuccess)
             {
                 MarkStateDirty();
@@ -458,7 +984,21 @@ namespace RimWorldDevBridge
 
         internal static BridgeResult RevokeWriteLease(string leaseToken, string agentId)
         {
-            BridgeResult result = Authorization.Revoke(leaseToken, agentId);
+            return RevokeWriteLease(leaseToken, agentId, null);
+        }
+
+        internal static BridgeResult RevokeWriteLease(string leaseToken, string agentId,
+            string clientInstanceId)
+        {
+            return RevokeWriteLease(leaseToken, agentId, clientInstanceId, null);
+        }
+
+        internal static BridgeResult RevokeWriteLease(string leaseToken, string agentId,
+            string clientInstanceId, string clientCredential)
+        {
+            if (!AuthenticateClient(agentId, clientInstanceId, clientCredential))
+                return BridgeResult.Fail(BridgeStatus.FORBIDDEN, "client_identity_authentication_failed");
+            BridgeResult result = Authorization.Revoke(leaseToken, agentId, clientInstanceId);
             if (result.IsSuccess)
             {
                 MarkStateDirty();
@@ -618,12 +1158,15 @@ namespace RimWorldDevBridge
                     transportReady = false;
                     activationIndexStarted = false;
                     Interlocked.Exchange(ref lastActivityUtcTicks, DateTime.UtcNow.Ticks);
-                    new BridgeTransportServer(next, IsCurrentTransport, RequestPreparation.Prepare,
-                        Scheduler.Enqueue, Scheduler.Cancel, () => Settings.ConnectedClientLimit, Decorate, () => SessionId, CheckIdle,
-                        RequestIndicatorRefresh, state =>
-                        {
-                            if (ReferenceEquals(Volatile.Read(ref transportState), state)) MarkStateDirty();
-                        }, MarkTransportActivity).Start();
+                     new BridgeTransportServer(next, IsCurrentTransport, RequestPreparation.Prepare,
+                         Scheduler.Enqueue, Scheduler.Cancel, () => Settings.ConnectedClientLimit, Decorate, () => SessionId, CheckIdle,
+                         RequestIndicatorRefresh, state =>
+                         {
+                             if (ReferenceEquals(Volatile.Read(ref transportState), state)) MarkStateDirty();
+                         }, MarkTransportActivity,
+                          (requestId, agentId, clientInstanceId, participantId) =>
+                              Scheduler.Cancel(requestId, agentId, clientInstanceId, participantId),
+                          CompleteCoordinatedRequest).Start();
                     MarkStateDirty();
                     started = true;
                 }
@@ -748,8 +1291,22 @@ namespace RimWorldDevBridge
         {
             result = result ?? BridgeResult.Fail(BridgeStatus.ERROR, "empty_result");
             result.RequestId = request?.RequestId ?? result.RequestId ?? "unknown";
+            result.CorrelationId = request?.CorrelationId ?? result.CorrelationId;
+            result.AgentId = request?.AgentId ?? result.AgentId;
+            result.ClientInstanceId = request?.ClientInstanceId ?? result.ClientInstanceId;
+            result.ParticipantId = request?.ParticipantId ?? result.ParticipantId;
             result.SessionId = request?.SessionId ?? identity.SessionId;
+            result.ConnectionSessionId = request?.ConnectionSessionId ?? result.ConnectionSessionId;
             result.Command = request?.Command ?? result.Command ?? "unknown";
+            result.OperationId = request?.OperationId ?? result.OperationId;
+            result.OperationKind = request?.OperationKind ?? result.OperationKind;
+            result.DesiredState = request?.DesiredState ?? result.DesiredState;
+            result.CompatibilityKey = request?.CompatibilityKey ?? result.CompatibilityKey;
+            result.RuntimeSlotId = request?.RuntimeSlotId ?? result.RuntimeSlotId;
+            result.DeploymentId = request?.DeploymentId ?? result.DeploymentId;
+            result.ArtifactFingerprint = result.ArtifactFingerprint ?? ArtifactFingerprint;
+            if (string.IsNullOrWhiteSpace(result.LoadedAssemblyFingerprint))
+                result.LoadedAssemblyFingerprint = LoadedAssemblyFingerprint;
             result.Provider = provider ?? "core";
             result.ProviderVersion = providerVersion ?? BridgeProtocol.BridgeVersion;
             result.Mode = request?.Mode ?? BridgeCommandMode.PureRead;
@@ -816,6 +1373,33 @@ namespace RimWorldDevBridge
             catch
             {
                 return "unknown";
+            }
+        }
+
+        private static string ComputeLoadedAssemblyFingerprint()
+        {
+            try
+            {
+                Assembly assembly = typeof(BridgeRuntime).Assembly;
+                AssemblyName name = assembly.GetName();
+                string path = assembly.Location;
+                string hash = !string.IsNullOrWhiteSpace(path) && File.Exists(path) ?
+                    BridgeHashing.FileSha256(path) : CoreFingerprint;
+                BridgeAssemblyMetadata metadata = new BridgeAssemblyMetadata
+                {
+                    AssemblyName = name == null ? string.Empty : name.Name,
+                    AssemblyVersion = name == null || name.Version == null ? string.Empty : name.Version.ToString(),
+                    ModuleVersionId = assembly.ManifestModule.ModuleVersionId.ToString("N"),
+                    Sha256 = hash,
+                    RelativePath = string.IsNullOrWhiteSpace(path) ? "RimWorldDevBridge.dll" :
+                        Path.GetFileName(path)
+                };
+                return BridgeArtifactIdentity.ComputeLoadedAssemblyFingerprint(
+                    new[] { metadata }, null);
+            }
+            catch
+            {
+                return BridgeHashing.Sha256("runtime-assembly\n" + (CoreFingerprint ?? string.Empty));
             }
         }
 

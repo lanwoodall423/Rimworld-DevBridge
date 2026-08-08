@@ -26,6 +26,9 @@ public sealed class BridgeMcpTools
         [Description("Maximum managed launch attempts, from 1 through 5.")] int maxLaunchAttempts = 2,
         [Description("Backoff between managed launch attempts in milliseconds.")] int launchBackoffMs = 500,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for a shared activation operation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = RequireCorrelation(correlationId, out var error);
@@ -38,13 +41,16 @@ public sealed class BridgeMcpTools
             return Task.FromResult(error!);
         }
 
-        return _client.InvokeAsync("discover", new[]
+        var values = new List<string>();
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation!);
+        values.AddRange(new[]
         {
             $"--startup-timeout-ms={startupTimeoutMs}",
             $"--progress-interval-ms={progressIntervalMs}",
             $"--max-launch-attempts={maxLaunchAttempts}",
             $"--launch-backoff-ms={launchBackoffMs}"
-        }, correlation!, startupTimeoutMs, cancellationToken);
+        });
+        return _client.InvokeAsync("discover", values, correlation!, startupTimeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = false, Destructive = true, OpenWorld = false, Idempotent = true,
@@ -56,6 +62,9 @@ public sealed class BridgeMcpTools
         [Description("Bounded total goal timeout in milliseconds.")] int timeoutMs = 300000,
         [Description("Bounded no-progress watchdog timeout in milliseconds.")] int noProgressTimeoutMs = 120000,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for this durable goal participation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
@@ -63,7 +72,9 @@ public sealed class BridgeMcpTools
         if (desiredState is not ("bridge" or "map" or "test_ready")) return Task.FromResult(McpToolResponse.Error("desired_state_invalid", "Use bridge, map, or test_ready.", correlation));
         if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error) ||
             !TryBounds(noProgressTimeoutMs, 1000, 600000, "noProgressTimeoutMs", correlation, out error)) return Task.FromResult(error!);
-        return _client.InvokeAsync("goal", new[] { "ensure", $"--goal-id={goalId}", $"--desired-state={desiredState}", $"--timeout-ms={timeoutMs}", $"--no-progress-timeout-ms={noProgressTimeoutMs}" }, correlation, timeoutMs, cancellationToken);
+        var values = new List<string> { "ensure", $"--goal-id={goalId}", $"--desired-state={desiredState}", $"--timeout-ms={timeoutMs}", $"--no-progress-timeout-ms={noProgressTimeoutMs}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("goal", values, correlation, timeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true, Destructive = false, OpenWorld = false, Idempotent = true,
@@ -72,11 +83,16 @@ public sealed class BridgeMcpTools
     public Task<McpToolResponse> GetRuntimeGoalStatusAsync(
         [Description("Stable durable goal identifier.")] string goalId,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for this durable goal participation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
-        return _client.InvokeAsync("goal", new[] { "status", $"--goal-id={goalId}" }, correlation, _options.DefaultTimeoutMs, cancellationToken);
+        var values = new List<string> { "status", $"--goal-id={goalId}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("goal", values, correlation, _options.DefaultTimeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true, Destructive = false, OpenWorld = false, Idempotent = true,
@@ -86,12 +102,17 @@ public sealed class BridgeMcpTools
         [Description("Stable durable goal identifier.")] string goalId,
         [Description("Bounded wait timeout in milliseconds.")] int timeoutMs = 120000,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for this durable goal participation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
         if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error)) return Task.FromResult(error!);
-        return _client.InvokeAsync("goal", new[] { "wait", $"--goal-id={goalId}", $"--timeout-ms={timeoutMs}" }, correlation, timeoutMs, cancellationToken);
+        var values = new List<string> { "wait", $"--goal-id={goalId}", $"--timeout-ms={timeoutMs}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("goal", values, correlation, timeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = false, Idempotent = true,
@@ -100,11 +121,16 @@ public sealed class BridgeMcpTools
     public Task<McpToolResponse> CancelRuntimeGoalAsync(
         [Description("Stable durable goal identifier.")] string goalId,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for this durable goal participation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
-        return _client.InvokeAsync("goal", new[] { "cancel", $"--goal-id={goalId}" }, correlation, _options.DefaultTimeoutMs, cancellationToken);
+        var values = new List<string> { "cancel", $"--goal-id={goalId}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("goal", values, correlation, _options.DefaultTimeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = false, Idempotent = true,
@@ -113,11 +139,16 @@ public sealed class BridgeMcpTools
     public Task<McpToolResponse> CheckpointRuntimeGoalAsync(
         [Description("Stable durable goal identifier.")] string goalId,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for this durable goal participation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
-        return _client.InvokeAsync("goal", new[] { "checkpoint", $"--goal-id={goalId}" }, correlation, _options.DefaultTimeoutMs, cancellationToken);
+        var values = new List<string> { "checkpoint", $"--goal-id={goalId}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("goal", values, correlation, _options.DefaultTimeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = false, Destructive = true, OpenWorld = false, Idempotent = true,
@@ -128,13 +159,18 @@ public sealed class BridgeMcpTools
         [Description("Desired terminal postcondition: bridge, map, or test_ready.")] string desiredState = "test_ready",
         [Description("Bounded total goal timeout in milliseconds.")] int timeoutMs = 300000,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for this durable goal participation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!IsSafeId(goalId)) return Task.FromResult(McpToolResponse.Error("goal_id_invalid", "The goal ID is invalid.", correlation));
         if (desiredState is not ("bridge" or "map" or "test_ready")) return Task.FromResult(McpToolResponse.Error("desired_state_invalid", "Use bridge, map, or test_ready.", correlation));
         if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error)) return Task.FromResult(error!);
-        return _client.InvokeAsync("goal", new[] { "resume", $"--goal-id={goalId}", $"--desired-state={desiredState}", $"--timeout-ms={timeoutMs}" }, correlation, timeoutMs, cancellationToken);
+        var values = new List<string> { "resume", $"--goal-id={goalId}", $"--desired-state={desiredState}", $"--timeout-ms={timeoutMs}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("goal", values, correlation, timeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = false, Idempotent = true,
@@ -185,6 +221,9 @@ public sealed class BridgeMcpTools
         [Description("Bounded command argument.")] string argument = "",
         [Description("Bounded query timeout in milliseconds.")] int timeoutMs = 120000,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for a shared read/verification operation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
@@ -198,7 +237,9 @@ public sealed class BridgeMcpTools
             return Task.FromResult(McpToolResponse.Error("read_only_command_invalid", "The command is not in the explicit pure-read allowlist.", correlation));
         }
 
-        return _client.InvokeAsync("read", new[] { $"--command={command.Trim().ToUpperInvariant()}", $"--argument={Bound(argument, 4096)}", $"--timeout-ms={timeoutMs}" }, correlation, timeoutMs, cancellationToken);
+        var values = new List<string> { $"--command={command.Trim().ToUpperInvariant()}", $"--argument={Bound(argument, 4096)}", $"--timeout-ms={timeoutMs}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("read", values, correlation, timeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = false, Destructive = false, OpenWorld = true, Idempotent = true,
@@ -242,20 +283,26 @@ public sealed class BridgeMcpTools
         [Description("Maximum managed launch attempts, from 1 through 5.")] int maxLaunchAttempts = 2,
         [Description("Backoff between managed launch attempts in milliseconds.")] int launchBackoffMs = 500,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for the shared restart operation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error) ||
             !TryBounds(maxLaunchAttempts, 1, 5, "maxLaunchAttempts", correlation, out error) ||
             !TryBounds(launchBackoffMs, 0, 10000, "launchBackoffMs", correlation, out error)) return Task.FromResult(error!);
-        return _client.InvokeAsync("restart", new[]
+        var values = new List<string>();
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        values.AddRange(new[]
         {
             "ensure", "--readiness=bridge", "--save-policy=none", "--keep-running",
             $"--startup-timeout-ms={timeoutMs}", $"--timeout-ms={timeoutMs}",
             "--target-postcondition=bridge", "--requires-new-process", "--allow-supersede",
             $"--progress-interval-ms=2000",
             $"--max-launch-attempts={maxLaunchAttempts}", $"--launch-backoff-ms={launchBackoffMs}"
-        }, correlation, timeoutMs, cancellationToken);
+        });
+        return _client.InvokeAsync("restart", values, correlation, timeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true, Destructive = false, OpenWorld = false,
@@ -265,12 +312,17 @@ public sealed class BridgeMcpTools
         [Description("Existing coordinator restart ticket.")] string ticket,
         [Description("Bounded wait timeout in milliseconds.")] int timeoutMs = 120000,
         [Description("Caller correlation identifier.")] string? correlationId = null,
+        [Description("Explicit logical agent identity; labels never grant authorization.")] string? agentId = null,
+        [Description("Stable client-instance identity for reconnect and quota accounting.")] string? clientInstanceId = null,
+        [Description("Participant identity for the shared restart operation.")] string? participantId = null,
         CancellationToken cancellationToken = default)
     {
         var correlation = Correlation(correlationId);
         if (!IsSafeId(ticket)) return Task.FromResult(McpToolResponse.Error("ticket_invalid", "The ticket is invalid.", correlation));
         if (!TryBounds(timeoutMs, 100, 600000, "timeoutMs", correlation, out var error)) return Task.FromResult(error!);
-        return _client.InvokeAsync("restart", new[] { "wait", $"--ticket={ticket}", $"--timeout-ms={timeoutMs}" }, correlation, timeoutMs, cancellationToken);
+        var values = new List<string> { "wait", $"--ticket={ticket}", $"--timeout-ms={timeoutMs}" };
+        AddIdentity(values, agentId, clientInstanceId, participantId, correlation);
+        return _client.InvokeAsync("restart", values, correlation, timeoutMs, cancellationToken);
     }
 
     [McpServerTool(ReadOnly = true, Destructive = false, OpenWorld = false, Idempotent = true,
@@ -377,6 +429,15 @@ public sealed class BridgeMcpTools
         {
             if (!string.IsNullOrWhiteSpace(options[i])) values.Add(prefix == "--option-" ? $"{prefix}{i + 1}={Bound(options[i], 4096)}" : $"{prefix}={Bound(options[i], 4096)}");
         }
+    }
+
+    private static void AddIdentity(List<string> values, string? agentId, string? clientInstanceId,
+        string? participantId, string correlationId)
+    {
+        if (!string.IsNullOrWhiteSpace(agentId)) values.Add($"--agent-id={Bound(agentId, 128)}");
+        if (!string.IsNullOrWhiteSpace(clientInstanceId)) values.Add($"--client-instance-id={Bound(clientInstanceId, 128)}");
+        if (!string.IsNullOrWhiteSpace(participantId)) values.Add($"--participant-id={Bound(participantId, 128)}");
+        values.Add($"--correlation-id={correlationId}");
     }
 
     private static string Bound(string? value, int length) => string.IsNullOrWhiteSpace(value) ? "" : value.Length <= length ? value : value[..length];

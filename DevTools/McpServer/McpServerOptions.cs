@@ -7,6 +7,9 @@ public sealed class McpServerOptions
     public string ClientPath { get; private init; } = "";
     public string PowerShellPath { get; private init; } = "powershell.exe";
     public int DefaultTimeoutMs { get; private init; } = 120000;
+    public string AgentId { get; private init; } = "";
+    public string ClientInstanceId { get; private init; } = "";
+    public string ConnectionSessionId { get; private init; } = "";
 
     public static McpServerOptions FromArgs(string[] args)
     {
@@ -19,6 +22,17 @@ public sealed class McpServerOptions
         var powerShell = GetOption(args, "--powershell") ??
             Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_POWERSHELL") ?? "powershell.exe";
         var timeout = ParseBounded(GetOption(args, "--tool-timeout-ms"), 120000, 100, 600000);
+        var agentId = GetOption(args, "--agent-id") ??
+            Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_AGENT_ID") ??
+            "mcp-agent-" + Guid.NewGuid().ToString("N");
+        var clientInstanceId = GetOption(args, "--client-instance-id") ??
+            Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_CLIENT_INSTANCE_ID") ??
+            "mcp-client-" + Guid.NewGuid().ToString("N");
+        var connectionSessionId = GetOption(args, "--connection-session-id") ??
+            Environment.GetEnvironmentVariable("RIMWORLD_DEVBRIDGE_CONNECTION_SESSION_ID") ?? "";
+        ValidateIdentity(agentId, "agent_id_invalid");
+        ValidateIdentity(clientInstanceId, "client_instance_id_invalid");
+        if (!string.IsNullOrWhiteSpace(connectionSessionId)) ValidateIdentity(connectionSessionId, "connection_session_id_invalid");
 
         return new McpServerOptions
         {
@@ -26,7 +40,10 @@ public sealed class McpServerOptions
             UserRoot = ValidateOptionalRoot(userRoot, "user_root"),
             ClientPath = ValidateOptionalFile(client, "client"),
             PowerShellPath = ValidateExecutable(powerShell),
-            DefaultTimeoutMs = timeout
+            DefaultTimeoutMs = timeout,
+            AgentId = agentId,
+            ClientInstanceId = clientInstanceId,
+            ConnectionSessionId = connectionSessionId
         };
     }
 
@@ -116,5 +133,12 @@ public sealed class McpServerOptions
         }
 
         return parsed;
+    }
+
+    private static void ValidateIdentity(string value, string error)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Length > 128 || !char.IsLetterOrDigit(value[0]) ||
+            value.Any(character => !(char.IsLetterOrDigit(character) || character is '.' or '_' or '-' or ':')))
+            throw new InvalidOperationException(error);
     }
 }
