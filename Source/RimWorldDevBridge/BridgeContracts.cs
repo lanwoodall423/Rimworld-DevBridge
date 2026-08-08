@@ -111,8 +111,19 @@ namespace RimWorldDevBridge
         public string ConnectionSessionId { get; set; }
         public string Command { get; set; }
         public string OperationId { get; set; }
+        public int OperationVersion { get; set; }
+        public string GoalId { get; set; }
         public string OperationKind { get; set; }
         public string OperationState { get; set; }
+        public string OperationPhase { get; set; }
+        public List<string> CompletedPhases { get; } = new List<string>();
+        public string RequestedWorkflow { get; set; }
+        public DateTime? OperationDeadlineUtc { get; set; }
+        public DateTime? ProgressDeadlineUtc { get; set; }
+        public string AuthorizationReference { get; set; }
+        public string TerminalResultCode { get; set; }
+        public string TerminalResultDetail { get; set; }
+        public string CleanupStatus { get; set; }
         public string CompatibilityKey { get; set; }
         public string DesiredState { get; set; }
         public string RuntimeSlotId { get; set; }
@@ -130,6 +141,20 @@ namespace RimWorldDevBridge
         public string NextAction { get; set; }
         public string CapacityState { get; set; }
         public bool KeepRunning { get; set; }
+        public string CapabilityVersion { get; set; }
+        public List<string> SupportedOperationStates { get; } = new List<string>();
+        public List<string> SupportedOperationKinds { get; } = new List<string>();
+        public List<string> ReadOperations { get; } = new List<string>();
+        public List<string> MutationClasses { get; } = new List<string>();
+        public int SupportedRuntimeSlotCount { get; set; }
+        public bool ConcurrentReadDiagnostics { get; set; }
+        public string BuildProvider { get; set; }
+        public string DeploymentProvider { get; set; }
+        public bool AdapterReloadSupported { get; set; }
+        public bool SaveFixtureSupported { get; set; }
+        public List<string> EvidenceTypes { get; } = new List<string>();
+        public string AuthorizationMechanism { get; set; }
+        public List<string> PlatformRestrictions { get; } = new List<string>();
         public string Provider { get; set; } = "core";
         public string ProviderVersion { get; set; } = BridgeProtocol.BridgeVersion;
         public BridgeCommandMode Mode { get; set; } = BridgeCommandMode.PureRead;
@@ -229,6 +254,13 @@ namespace RimWorldDevBridge
                 string bounded = BridgeText.Bound(Warnings[i], 4096);
                 if (bounded != Warnings[i]) { Warnings[i] = bounded; changed = true; }
             }
+            changed |= BoundList(CompletedPhases, 64, 128);
+            changed |= BoundList(SupportedOperationStates, 32, 64);
+            changed |= BoundList(SupportedOperationKinds, 32, 64);
+            changed |= BoundList(ReadOperations, 128, 128);
+            changed |= BoundList(MutationClasses, 64, 128);
+            changed |= BoundList(EvidenceTypes, 64, 128);
+            changed |= BoundList(PlatformRestrictions, 256, 128);
             changed |= BoundProperty(RequestId, 256, out string requestId); RequestId = requestId;
             changed |= BoundProperty(CorrelationId, 256, out string correlationId); CorrelationId = correlationId;
             changed |= BoundProperty(AgentId, 128, out string agentId); AgentId = agentId;
@@ -238,6 +270,16 @@ namespace RimWorldDevBridge
             changed |= BoundProperty(ConnectionSessionId, 256, out string connectionSessionId); ConnectionSessionId = connectionSessionId;
             changed |= BoundProperty(Command, 128, out string command); Command = command;
             changed |= BoundProperty(OperationId, 256, out string operationId); OperationId = operationId;
+            changed |= BoundProperty(GoalId, 256, out string goalId); GoalId = goalId;
+            changed |= BoundProperty(OperationPhase, 128, out string operationPhase); OperationPhase = operationPhase;
+            changed |= BoundProperty(RequestedWorkflow, 128, out string requestedWorkflow); RequestedWorkflow = requestedWorkflow;
+            changed |= BoundProperty(AuthorizationReference, 256, out string authorizationReference); AuthorizationReference = authorizationReference;
+            changed |= BoundProperty(TerminalResultCode, 128, out string terminalResultCode); TerminalResultCode = terminalResultCode;
+            changed |= BoundProperty(TerminalResultDetail, 512, out string terminalResultDetail); TerminalResultDetail = terminalResultDetail;
+            changed |= BoundProperty(CleanupStatus, 64, out string cleanupStatus); CleanupStatus = cleanupStatus;
+            changed |= BoundProperty(CapabilityVersion, 64, out string capabilityVersion); CapabilityVersion = capabilityVersion;
+            changed |= BoundProperty(BuildProvider, 128, out string buildProvider); BuildProvider = buildProvider;
+            changed |= BoundProperty(DeploymentProvider, 128, out string deploymentProvider); DeploymentProvider = deploymentProvider;
             changed |= BoundProperty(OperationKind, 64, out string operationKind); OperationKind = operationKind;
             changed |= BoundProperty(OperationState, 64, out string operationState); OperationState = operationState;
             changed |= BoundProperty(CompatibilityKey, 256, out string compatibilityKey); CompatibilityKey = compatibilityKey;
@@ -262,6 +304,23 @@ namespace RimWorldDevBridge
             if (value == null) { bounded = null; return false; }
             bounded = BridgeText.Bound(value, maximumCharacters);
             return bounded != value;
+        }
+
+        private static bool BoundList(List<string> values, int maximumCount, int maximumCharacters)
+        {
+            if (values == null) return false;
+            bool changed = false;
+            if (values.Count > maximumCount)
+            {
+                values.RemoveRange(maximumCount, values.Count - maximumCount);
+                changed = true;
+            }
+            for (int i = 0; i < values.Count; i++)
+            {
+                string bounded = BridgeText.Bound(values[i], maximumCharacters);
+                if (bounded != values[i]) { values[i] = bounded; changed = true; }
+            }
+            return changed;
         }
 
         public static BridgeResult Ok(string schema = "core.result") =>
@@ -333,6 +392,10 @@ namespace RimWorldDevBridge
         public string Command { get; set; }
         public string OperationId { get; set; }
         public string OperationKind { get; set; }
+        public string GoalId { get; set; }
+        public string RequestedWorkflow { get; set; }
+        public string AuthorizationReference { get; set; }
+        public DateTime ProgressDeadlineUtc { get; set; }
         public string DesiredState { get; set; }
         public string CompatibilityKey { get; set; }
         public string ManagedProfile { get; set; }

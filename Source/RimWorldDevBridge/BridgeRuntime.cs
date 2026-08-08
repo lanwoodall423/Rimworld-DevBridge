@@ -101,6 +101,7 @@ namespace RimWorldDevBridge
         internal static int ProcessIdForClients => Process.GetCurrentProcess().Id;
         internal static string CoreFingerprint => coreFingerprint ?? (coreFingerprint = ComputeCoreFingerprint());
         internal static string ActiveRuntimeSlotId => activeRuntimeSlotId;
+        internal static int SupportedRuntimeSlotCount => RuntimeSlots?.MaximumActiveProcesses ?? 1;
         internal static string LoadedAssemblyFingerprint => loadedAssemblyFingerprint ??
             (loadedAssemblyFingerprint = ComputeLoadedAssemblyFingerprint());
         internal static string ArtifactFingerprint
@@ -265,6 +266,11 @@ namespace RimWorldDevBridge
                     Identity = identity,
                     OperationId = request.OperationId,
                     OperationKind = operationKind,
+                    GoalId = request.GoalId,
+                    RequestedWorkflow = request.RequestedWorkflow,
+                    DeadlineUtc = request.DeadlineUtc,
+                    ProgressDeadlineUtc = request.ProgressDeadlineUtc,
+                    AuthorizationReference = request.AuthorizationReference,
                     DesiredState = desiredState,
                     Compatibility = compatibility,
                     RuntimeSlotId = request.RuntimeSlotId,
@@ -282,7 +288,8 @@ namespace RimWorldDevBridge
                 request.CompatibilityKey = joined.Operation.CompatibilityKey;
                 if (!joined.Created)
                 {
-                    if (joined.Operation.OperationState == BridgeOperationState.Queued && RuntimeSlots != null)
+                    if ((joined.Operation.OperationState == BridgeOperationState.Queued ||
+                        joined.Operation.OperationState == BridgeOperationState.WaitingForCapacity) && RuntimeSlots != null)
                     {
                         PromoteQueuedCapacity();
                         BridgeRuntimeSlotDefinition queuedSlot = RuntimeSlots.FindLease(joined.Operation.OperationId,
@@ -313,8 +320,10 @@ namespace RimWorldDevBridge
                     }
                     request.SharedOperationRegistered = false;
                     return OperationResult(request, joined.Operation,
-                        joined.Operation.OperationState == BridgeOperationState.Queued ? BridgeStatus.BUSY : BridgeStatus.PARTIAL,
-                        joined.Operation.OperationState == BridgeOperationState.Queued ? "runtime_slot_capacity" : "operation_joined",
+                        (joined.Operation.OperationState == BridgeOperationState.Queued ||
+                         joined.Operation.OperationState == BridgeOperationState.WaitingForCapacity) ? BridgeStatus.BUSY : BridgeStatus.PARTIAL,
+                        (joined.Operation.OperationState == BridgeOperationState.Queued ||
+                         joined.Operation.OperationState == BridgeOperationState.WaitingForCapacity) ? "runtime_slot_capacity" : "operation_joined",
                         joined.NextAction ?? "observe the shared operation");
                 }
                 BridgeRuntimeSlotAllocation allocation = RuntimeSlots?.Allocate(new BridgeRuntimeSlotRequest
@@ -589,9 +598,25 @@ namespace RimWorldDevBridge
                 string runtimeSlotId = operation?.RuntimeSlotId ?? request.RuntimeSlotId;
                 string operationId = operation?.OperationId ?? request.OperationId;
                 bool keepRunning = operation != null && operation.KeepRunning;
+                bool cleanupSucceeded = true;
                 if (RuntimeSlots != null && !string.IsNullOrWhiteSpace(runtimeSlotId))
-                    RuntimeSlots.Release(runtimeSlotId, operationId, identity.AgentId,
+                    cleanupSucceeded = RuntimeSlots.Release(runtimeSlotId, operationId, identity.AgentId,
                         identity.ClientInstanceId, keepRunning);
+                if (operation != null)
+                {
+                    try
+                    {
+                        BridgeOperationRecord cleaned = SharedOperations.MarkCleanup(operationId, identity,
+                            cleanupSucceeded, cleanupSucceeded ? null : "runtime_slot_release_failed");
+                        ApplyOperationFields(request, cleaned, result);
+                    }
+                    catch (Exception cleanupException)
+                    {
+                        result.Status = BridgeStatus.ERROR;
+                        result.Add("error", "operation_cleanup_failed");
+                        result.Warn(BridgeText.Clean(cleanupException.GetBaseException().Message));
+                    }
+                }
                 if (!keepRunning) activeRuntimeSlotId = null;
                 if (!keepRunning) PromoteQueuedCapacity();
             }
@@ -652,14 +677,32 @@ namespace RimWorldDevBridge
         {
             if (operation == null) return;
             request.OperationId = operation.OperationId;
+            request.GoalId = operation.RequestedGoalId;
             request.CompatibilityKey = operation.CompatibilityKey;
+            request.RequestedWorkflow = operation.RequestedWorkflow;
+            request.AuthorizationReference = operation.AuthorizationReference;
+            request.ProgressDeadlineUtc = operation.ProgressDeadlineUtc;
             request.RuntimeSlotId = operation.RuntimeSlotId;
             request.DeploymentId = operation.DeploymentId;
             request.ArtifactFingerprint = operation.ArtifactFingerprint;
             if (result == null) return;
             result.OperationId = operation.OperationId;
+            result.OperationVersion = operation.Version;
+            result.GoalId = operation.RequestedGoalId;
             result.OperationKind = operation.OperationKind.ToString();
             result.OperationState = operation.OperationState.ToString();
+            result.OperationPhase = operation.CurrentPhase;
+            result.CompletedPhases.Clear();
+            result.CompletedPhases.AddRange(operation.CompletedPhases ?? new List<string>());
+            result.RequestedWorkflow = operation.RequestedWorkflow;
+            result.OperationDeadlineUtc = operation.DeadlineUtc == default(DateTime) ?
+                (DateTime?)null : operation.DeadlineUtc;
+            result.ProgressDeadlineUtc = operation.ProgressDeadlineUtc == default(DateTime) ?
+                (DateTime?)null : operation.ProgressDeadlineUtc;
+            result.AuthorizationReference = operation.AuthorizationReference;
+            result.TerminalResultCode = operation.TerminalResultCode;
+            result.TerminalResultDetail = operation.TerminalResultDetail;
+            result.CleanupStatus = operation.CleanupStatus;
             result.CompatibilityKey = operation.CompatibilityKey;
             result.DesiredState = operation.DesiredState.ToString();
             result.RuntimeSlotId = operation.RuntimeSlotId;
@@ -691,7 +734,7 @@ namespace RimWorldDevBridge
             Directory.CreateDirectory(coordinationRoot);
             SharedOperations = new BridgeSharedOperationCoordinator(
                 statePath: Path.Combine(coordinationRoot, "operations.json"));
-            RuntimeSlots = new BridgeRuntimeSlotManager(2, root: Path.Combine(coordinationRoot, "slots"));
+            RuntimeSlots = new BridgeRuntimeSlotManager(1, root: Path.Combine(coordinationRoot, "slots"));
             DeploymentManager = new BridgeDeploymentManager(Path.Combine(coordinationRoot, "deployments"));
             IdentityAuthority.Load(Path.Combine(coordinationRoot, "identities.json"));
             SharedOperations.RecoverAfterCoordinatorRestart();
@@ -1299,7 +1342,12 @@ namespace RimWorldDevBridge
             result.ConnectionSessionId = request?.ConnectionSessionId ?? result.ConnectionSessionId;
             result.Command = request?.Command ?? result.Command ?? "unknown";
             result.OperationId = request?.OperationId ?? result.OperationId;
+            result.GoalId = request?.GoalId ?? result.GoalId;
             result.OperationKind = request?.OperationKind ?? result.OperationKind;
+            result.RequestedWorkflow = request?.RequestedWorkflow ?? result.RequestedWorkflow;
+            result.AuthorizationReference = request?.AuthorizationReference ?? result.AuthorizationReference;
+            if (!result.ProgressDeadlineUtc.HasValue && request != null && request.ProgressDeadlineUtc != default(DateTime))
+                result.ProgressDeadlineUtc = request.ProgressDeadlineUtc;
             result.DesiredState = request?.DesiredState ?? result.DesiredState;
             result.CompatibilityKey = request?.CompatibilityKey ?? result.CompatibilityKey;
             result.RuntimeSlotId = request?.RuntimeSlotId ?? result.RuntimeSlotId;

@@ -14,8 +14,18 @@ public sealed record McpToolResponse
     public string ClientInstanceId { get; init; } = "";
     public string ParticipantId { get; init; } = "";
     public string OperationId { get; init; } = "";
+    public string GoalId { get; init; } = "";
+    public int OperationVersion { get; init; }
     public string OperationKind { get; init; } = "";
     public string OperationState { get; init; } = "";
+    public string OperationPhase { get; init; } = "";
+    public string RequestedWorkflow { get; init; } = "";
+    public string OperationDeadlineUtc { get; init; } = "";
+    public string ProgressDeadlineUtc { get; init; } = "";
+    public string CleanupStatus { get; init; } = "";
+    public string TerminalResultCode { get; init; } = "";
+    public string TerminalResultDetail { get; init; } = "";
+    public bool Terminal { get; init; }
     public string CompatibilityKey { get; init; } = "";
     public string DesiredState { get; init; } = "";
     public string RuntimeSlotId { get; init; } = "";
@@ -36,6 +46,10 @@ public sealed record McpToolResponse
     public bool RetrySafe { get; init; }
     public bool OperatorActionRequired { get; init; }
     public string NextAction { get; init; } = "none";
+    public string CapabilityVersion { get; init; } = "";
+    public int SupportedRuntimeSlotCount { get; init; }
+    public bool ConcurrentReadDiagnostics { get; init; }
+    public string AuthorizationMechanism { get; init; } = "";
     public JsonElement? Data { get; init; }
 
     public static McpToolResponse FromJson(JsonElement root, string correlationId)
@@ -60,8 +74,18 @@ public sealed record McpToolResponse
             ClientInstanceId = ReadString(root, "clientInstanceId") ?? "",
             ParticipantId = ReadString(root, "participantId") ?? "",
             OperationId = ReadString(root, "operationId") ?? "",
+            GoalId = ReadString(root, "goalId") ?? "",
+            OperationVersion = ReadInt(root, "operationVersion", 0),
             OperationKind = ReadString(root, "operationKind") ?? "",
             OperationState = ReadString(root, "operationState") ?? ReadString(root, "state") ?? "",
+            OperationPhase = ReadString(root, "operationPhase") ?? "",
+            RequestedWorkflow = ReadString(root, "requestedWorkflow") ?? "",
+            OperationDeadlineUtc = ReadString(root, "operationDeadlineUtc") ?? "",
+            ProgressDeadlineUtc = ReadString(root, "progressDeadlineUtc") ?? "",
+            CleanupStatus = ReadString(root, "cleanupStatus") ?? "",
+            TerminalResultCode = ReadString(root, "terminalResultCode") ?? "",
+            TerminalResultDetail = McpRedaction.RedactText(ReadString(root, "terminalResultDetail") ?? ""),
+            Terminal = ReadBool(root, "terminal"),
             CompatibilityKey = ReadString(root, "compatibilityKey") ?? "",
             DesiredState = ReadString(root, "desiredState") ?? "",
             RuntimeSlotId = ReadString(root, "runtimeSlotId") ?? "",
@@ -82,6 +106,10 @@ public sealed record McpToolResponse
             RetrySafe = ReadBool(root, "retrySafe", ok && IsReadResult(root)),
             OperatorActionRequired = ReadBool(root, "operatorActionRequired", code == "attached_live_process_requires_operator"),
             NextAction = McpRedaction.RedactText(FirstNonEmpty(ReadString(root, "nextAction"), ok ? "none" : "retry bounded recovery")),
+            CapabilityVersion = ReadString(root, "capabilityVersion") ?? "",
+            SupportedRuntimeSlotCount = ReadInt(root, "supportedRuntimeSlotCount", 0),
+            ConcurrentReadDiagnostics = ReadBool(root, "concurrentReadDiagnostics"),
+            AuthorizationMechanism = McpRedaction.RedactText(ReadString(root, "authorizationMechanism") ?? ""),
             Data = redactedRoot
         };
     }

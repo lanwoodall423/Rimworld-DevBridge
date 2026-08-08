@@ -28,6 +28,8 @@ internal static class Program
         Run("agent identity isolation", AgentIdentityIsolation);
         Run("multi-agent identity reconnect and spoofing", MultiAgentIdentityReconnectAndSpoofing);
         Run("shared operation coalescing and abandonment", SharedOperationCoalescingAndAbandonment);
+        Run("serialized operation state machine", SerializedOperationStateMachine);
+        Run("capability description matches topology", CapabilityDescriptionMatchesTopology);
         Run("artifact deployment fingerprint and lock isolation", ArtifactDeploymentFingerprintAndLockIsolation);
         Run("runtime slot compatibility and fair capacity", RuntimeSlotCompatibilityAndFairCapacity);
         Run("coordination wire contract and slot boundary", CoordinationWireContractAndSlotBoundary);
@@ -385,6 +387,130 @@ internal static class Program
         Check(!manager.VerifyDeployment(manifest), "modified deployment was not detected");
     }
 
+    private static void SerializedOperationStateMachine()
+    {
+        DateTime initial = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        BridgeManualClock clock = new BridgeManualClock(initial);
+        BridgeOperationLimits limits = new BridgeOperationLimits
+        {
+            MaximumActiveOperations = 1,
+            MaximumActivePerAgent = 2,
+            MaximumActivePerClient = 2,
+            MaximumQueuedOperations = 8,
+            MaximumQueuedPerAgent = 8,
+            MaximumQueuedPerClient = 8
+        };
+        string path = Path.Combine(HarnessUserRoot, "stage2-operations.json");
+        BridgeSharedOperationCoordinator coordinator = new BridgeSharedOperationCoordinator(clock, path, limits);
+        BridgeClientIdentity first = BridgeClientIdentity.Create("stage2-agent-a", "stage2-client-a",
+            "stage2-connection-a", "stage2-correlation-a", "stage2-participant-a");
+        BridgeOperationJoinResult firstJoin = coordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = first,
+            OperationId = "stage2-operation-a",
+            OperationKind = BridgeOperationKind.Restart,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = TestCompatibility("stage2-a", 1, false),
+            RequestedWorkflow = "restart-v1",
+            DeadlineUtc = clock.UtcNow.AddMinutes(2),
+            ProgressDeadlineUtc = clock.UtcNow.AddSeconds(20),
+            AuthorizationReference = "auth-stage2-a"
+        });
+        Check(firstJoin.Operation.OperationState == BridgeOperationState.Running,
+            "first operation did not enter the single serialized lane");
+        Equal(2, firstJoin.Operation.Version, "operation version");
+        Equal("restart-v1", firstJoin.Operation.RequestedWorkflow, "workflow persistence");
+        Equal("runtime", firstJoin.Operation.CurrentPhase, "running phase");
+
+        BridgeClientIdentity second = BridgeClientIdentity.Create("stage2-agent-b", "stage2-client-b",
+            "stage2-connection-b", "stage2-correlation-b", "stage2-participant-b");
+        BridgeOperationJoinResult secondJoin = coordinator.Join(new BridgeOperationJoinRequest
+        {
+            Identity = second,
+            OperationId = "stage2-operation-b",
+            OperationKind = BridgeOperationKind.Deployment,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = TestCompatibility("stage2-b", 1, false),
+            RequestedWorkflow = "deployment-v1",
+            DeadlineUtc = clock.UtcNow.AddMinutes(2),
+            ProgressDeadlineUtc = clock.UtcNow.AddSeconds(20)
+        });
+        Check(secondJoin.Operation.OperationState == BridgeOperationState.Queued,
+            "incompatible operation did not wait for serialized capacity");
+        BridgeOperationRecord waiting = coordinator.SetCapacity(secondJoin.OperationId, second,
+            "global_capacity", "wait for the single runtime lane", true);
+        Check(waiting.OperationState == BridgeOperationState.WaitingForCapacity,
+            "capacity wait did not use its explicit state");
+
+        BridgeOperationRecord authorizationWait = coordinator.WaitForAuthorization(firstJoin.OperationId, first,
+            "auth-stage2-required");
+        Check(authorizationWait.OperationState == BridgeOperationState.WaitingForAuthorization,
+            "authorization wait state was not persisted");
+        BridgeOperationRecord denied = coordinator.Deny(firstJoin.OperationId, first,
+            "authorization_denied", "operator approval was not present");
+        Check(denied.OperationState == BridgeOperationState.Denied && denied.Terminal,
+            "denial did not become terminal");
+
+        BridgeOperationRecord admitted = coordinator.Snapshot().Single(item =>
+            item.OperationId == secondJoin.OperationId);
+        Check(admitted.OperationState == BridgeOperationState.Running,
+            "capacity promotion did not advance after denial");
+        BridgeOperationRecord completed = coordinator.Complete(secondJoin.OperationId, second);
+        BridgeOperationRecord duplicate = coordinator.Complete(secondJoin.OperationId, second);
+        Check(completed.OperationState == BridgeOperationState.Succeeded &&
+            duplicate.OperationState == completed.OperationState &&
+            duplicate.TerminalResultCode == completed.TerminalResultCode,
+            "duplicate completion repeated or changed a terminal operation");
+        BridgeOperationRecord cleaned = coordinator.MarkCleanup(secondJoin.OperationId, second, true);
+        Equal("complete", cleaned.CleanupStatus, "cleanup completion");
+
+        BridgeSharedOperationCoordinator recovered = new BridgeSharedOperationCoordinator(clock, path, limits);
+        BridgeOperationRecord recoveredRecord = recovered.Reconnect(secondJoin.OperationId, second);
+        Check(recoveredRecord.CleanupStatus == "complete", "cleanup state did not persist across reconnect");
+
+        string deadlinePath = Path.Combine(HarnessUserRoot, "stage2-deadline.json");
+        BridgeSharedOperationCoordinator deadlines = new BridgeSharedOperationCoordinator(clock, deadlinePath, limits);
+        BridgeClientIdentity deadlineIdentity = BridgeClientIdentity.Create("stage2-agent-c", "stage2-client-c",
+            "stage2-connection-c", "stage2-correlation-c", "stage2-participant-c");
+        BridgeOperationJoinResult deadlineJoin = deadlines.Join(new BridgeOperationJoinRequest
+        {
+            Identity = deadlineIdentity,
+            OperationKind = BridgeOperationKind.Verification,
+            DesiredState = BridgeDesiredState.Bridge,
+            Compatibility = TestCompatibility("stage2-deadline", 1, false),
+            DeadlineUtc = clock.UtcNow.AddSeconds(1),
+            ProgressDeadlineUtc = clock.UtcNow.AddSeconds(10)
+        });
+        clock.Advance(TimeSpan.FromSeconds(2));
+        Check(deadlines.AdvanceDeadlines() == 1, "deadline did not advance once");
+        BridgeOperationRecord timedOut = deadlines.Snapshot().Single(item => item.OperationId == deadlineJoin.OperationId);
+        Check(timedOut.OperationState == BridgeOperationState.TimedOut && timedOut.Terminal,
+            "deadline did not produce a terminal timeout");
+        Check(deadlines.AdvanceDeadlines() == 0, "repeated deadline polling changed terminal state");
+    }
+
+    private static void CapabilityDescriptionMatchesTopology()
+    {
+        BridgeRequest capabilityRequest = Request("capability-agent", "capability-session");
+        capabilityRequest.Command = "CAPABILITIES";
+        BridgeResult capabilities = BridgeCommands.Execute(new BridgeExecutionContext(capabilityRequest,
+            null, () => false));
+        Equal(BridgeCapabilities.Version, capabilities.CapabilityVersion, "capability version");
+        Check(capabilities.SupportedOperationStates.Contains("Pending") &&
+            capabilities.SupportedOperationStates.Contains("TimedOut"), "state capability mismatch");
+        Check(capabilities.SupportedRuntimeSlotCount == 1 && !capabilities.SaveFixtureSupported,
+            "future runtime or fixture capability advertised");
+        Check(capabilities.ConcurrentReadDiagnostics && capabilities.AdapterReloadSupported,
+            "supported read/reload capability missing");
+        Check(capabilities.MutationClasses.Contains("LeaseWrite") &&
+            capabilities.MutationClasses.Contains("AdapterReload") &&
+            capabilities.MutationClasses.Contains("RestartDrain"),
+            "stateful runtime operations were omitted from capabilities");
+        string json = BridgeProtocol.Serialize(capabilities, "json");
+        Check(json.Contains("capabilityVersion") && json.Contains("supportedRuntimeSlotCount") &&
+            json.Contains("platformRestrictions"), "capability fields missing from JSON");
+    }
+
     private static void RuntimeSlotCompatibilityAndFairCapacity()
     {
         BridgeOperationCompatibilityKey firstKey = TestCompatibility("build-a", 1, false);
@@ -491,8 +617,9 @@ internal static class Program
     private static void CoordinationWireContractAndSlotBoundary()
     {
         string raw = "wire|STATUS||agentId=agent-a&clientInstanceId=client-a&connectionSessionId=conn-a" +
-            "&participantId=participant-a&correlationId=corr-a&operationId=operation-a" +
-            "&operationKind=Restart&desiredState=Bridge&keepRunning=true" +
+             "&participantId=participant-a&correlationId=corr-a&operationId=operation-a&goalId=goal-a" +
+            "&operationKind=Restart&desiredState=Bridge&requestedWorkflow=restart-v1" +
+            "&authorizationReference=auth-a&progressTimeoutMs=60000&keepRunning=true" +
             "&loadedAssemblyFingerprint=loaded-a&deploymentId=deployment-a&artifactFingerprint=artifact-a" +
             "&expectedProcessId=42&expectedProcessStartIdentity=start-a&expectedProcessSessionId=session-a" +
             "&expectedProcessLifecycleGeneration=7";
@@ -503,22 +630,34 @@ internal static class Program
         Check(request.ExpectedProcessId == 42 && request.ExpectedProcessStartIdentity == "start-a" &&
             request.ExpectedProcessSessionId == "session-a" && request.ExpectedProcessLifecycleGeneration == 7,
             "expected process identity fields were not parsed");
+        Equal("restart-v1", request.RequestedWorkflow, "workflow was not parsed");
+        Equal("auth-a", request.AuthorizationReference, "authorization reference was not parsed");
+        Check(request.ProgressDeadlineUtc > request.ReceivedUtc.AddSeconds(50), "progress deadline was not parsed");
         Check(!BridgeProtocol.TryParse(raw + "&expectedProcessLifecycleGeneration=8", "session-a",
             out _, out _), "duplicate expected process lifecycle option was accepted");
         Equal("operation-a", request.OperationId, "operation id round trip");
+        Equal("goal-a", request.GoalId, "goal id round trip");
         BridgeResult result = BridgeResult.Ok("coordination.contract");
         result.CorrelationId = request.CorrelationId;
         result.AgentId = request.AgentId;
         result.ClientInstanceId = request.ClientInstanceId;
         result.ParticipantId = request.ParticipantId;
         result.OperationId = request.OperationId;
+        result.GoalId = request.GoalId;
+        result.OperationVersion = 2;
+        result.OperationPhase = "runtime";
+        result.RequestedWorkflow = request.RequestedWorkflow;
+        result.CleanupStatus = "not_started";
+        result.CapabilityVersion = BridgeCapabilities.Version;
+        result.SupportedRuntimeSlotCount = 1;
         result.RuntimeSlotId = "slot-a";
         result.DeploymentId = request.DeploymentId;
         result.ArtifactFingerprint = request.ArtifactFingerprint;
         result.LoadedAssemblyFingerprint = request.ExpectedLoadedAssemblyFingerprint;
         result.KeepRunning = request.KeepRunning;
         string json = BridgeProtocol.Serialize(result, "json");
-        Check(json.Contains("loadedAssemblyFingerprint") && json.Contains("keepRunning"),
+        Check(json.Contains("goalId") && json.Contains("loadedAssemblyFingerprint") && json.Contains("keepRunning") &&
+            json.Contains("operationPhase") && json.Contains("capabilityVersion"),
             "coordination response fields were not serialized");
 
         BridgeOperationCompatibilityKey artifactA = BridgeOperationCompatibilityKey.Create(

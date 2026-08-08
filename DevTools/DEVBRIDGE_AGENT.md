@@ -103,3 +103,10 @@ Treat `attached_live_process_requires_operator`, artifact/deployment mismatch, s
 PID/start identity, stale observation, and capacity responses as actionable states,
 not as reasons to launch a second process. Recovery is bounded and idempotent; a
 recorded launch is never duplicated after coordinator restart.
+
+Stage 2 is intentionally serialized: one coordinator per user, one managed runtime slot, one active
+mutating workflow, and bounded concurrent pure-read diagnostics. Durable operations expose explicit
+authorization/capacity waits, running/recovery, terminal timeout, and cleanup states. Read
+`CAPABILITIES` before relying on a behavior; it does not advertise parallel-runtime orchestration.
+Waiting work owns no runtime or mutation lease. A manual or externally owned process cannot establish
+managed ownership from its observed PID or caller-supplied labels.

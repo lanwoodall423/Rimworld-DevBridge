@@ -106,3 +106,27 @@ session, lifecycle/progress sequence, capacity state, terminal/recoverable/retry
 values, and `nextAction`/`keepRunning`. Mark each result `real`, `simulated`,
 `unavailable`, or `blocked`; do not convert an unavailable managed instance or MCP
 Inspector into a passing runtime result.
+
+## Stage 2 Serialized Operating Model
+
+The current supported topology is deliberately smaller than the coordination
+foundation: one coordinator per user, one managed runtime slot, one active
+mutating workflow, and bounded concurrent pure-read diagnostics. Incompatible
+work remains queued or returns structured `BUSY` capacity state; the build does
+not advertise parallel-runtime orchestration.
+
+Operations use versioned durable states: `Pending`, `Queued`,
+`WaitingForAuthorization`, `WaitingForCapacity`, `Running`, `Recovering`,
+`Succeeded`, `Failed`, `Denied`, `Cancelled`, `TimedOut`, and `Abandoned`.
+Records include workflow/phase, completed phases, operation and progress
+deadlines, authorization reference, terminal result, and cleanup status.
+Transitions are validated, persisted atomically, and deadline advancement is
+idempotent. Waiting work owns no runtime, mutation, deployment, save, or
+restart lease. Cleanup is recorded separately from terminal completion.
+
+`CAPABILITIES` reports the versioned serialized topology, supported states and
+operation kinds, available reads and mutation classes, one runtime slot,
+fingerprint-bound deployment, adapter reload, authorization mechanism, evidence
+types, and platform restrictions. Future multi-runtime behavior is not
+advertised. External or manually started RimWorld processes remain fail-closed
+and cannot bootstrap managed ownership.

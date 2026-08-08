@@ -642,7 +642,8 @@ function Invoke-BridgeCommand([string] $command, [string] $argument, [string[]] 
             "mod-set-fingerprint", "mod-load-order-fingerprint", "source-build-identity",
              "expected-core-fingerprint", "expected-adapter-fingerprint", "configuration-fingerprint",
              "user-root-fingerprint", "save-target", "map-target", "requires-process-replacement",
-             "lifecycle-generation", "mutation-scope", "expected-process-id",
+            "goal-id", "lifecycle-generation", "mutation-scope", "requested-workflow", "authorization-reference",
+            "progress-timeout-ms", "expected-process-id",
              "expected-process-start-identity", "expected-process-session-id",
              "expected-process-lifecycle-generation")) {
         $identityValue = Get-Value $values "--$identityOption"
@@ -1366,7 +1367,8 @@ function New-ActivationEnsureValues([string[]] $values, [string] $bridgeRoot, [s
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $allowed = @(
         "--agent-id", "--client-instance-id", "--connection-session-id", "--participant-id", "--correlation-id",
-         "--operation-id", "--operation-kind", "--desired-state", "--compatibility-key", "--runtime-slot-id", "--deployment-id",
+         "--operation-id", "--goal-id", "--operation-kind", "--desired-state", "--requested-workflow", "--authorization-reference",
+         "--progress-timeout-ms", "--compatibility-key", "--runtime-slot-id", "--deployment-id",
          "--artifact-fingerprint", "--loaded-assembly-fingerprint", "--required-adapter-fingerprint",
          "--expected-process-id", "--expected-process-start-identity", "--expected-process-session-id",
          "--expected-process-lifecycle-generation",
