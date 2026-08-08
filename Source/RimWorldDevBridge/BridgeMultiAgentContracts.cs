@@ -276,7 +276,12 @@ namespace RimWorldDevBridge
         Succeeded,
         Failed,
         Cancelled,
-        Abandoned
+        Abandoned,
+        Pending = 7,
+        WaitingForAuthorization = 8,
+        WaitingForCapacity = 9,
+        Denied = 10,
+        TimedOut = 11
     }
 
     public enum BridgeParticipationState

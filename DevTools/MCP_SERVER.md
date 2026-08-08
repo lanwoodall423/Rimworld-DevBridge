@@ -260,3 +260,9 @@ cap. Manual and attached processes are never claimed. Deployments use scoped loc
 staged files, atomic publication, exact artifact manifests, and loaded-assembly
 fingerprint matching. Modified output, wrong-agent provenance, stale ownership, PID
 reuse, and loaded mismatch are rejection states, not reasons to relaunch.
+
+The current MCP-visible topology is serialized: one coordinator per user, one managed
+runtime slot, one mutating workflow, and bounded pure-read diagnostics. `CAPABILITIES`
+reports the versioned operation states, actual read and mutation classes, capacity,
+authorization mechanism, evidence types, and platform restrictions. Waiting operations
+hold no runtime or mutation lease, and MCP approval never grants attached-process control.

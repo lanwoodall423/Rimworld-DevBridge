@@ -73,6 +73,11 @@ namespace RimWorldDevBridge
         [DataMember(Order = 41)] public bool RetrySafe;
         [DataMember(Order = 42)] public string CapacityState;
         [DataMember(Order = 43)] public bool KeepRunning;
+        [DataMember(Order = 44)] public string GoalId;
+        [DataMember(Order = 45)] public string RequestedWorkflow;
+        [DataMember(Order = 46)] public string AuthorizationReference;
+        [DataMember(Order = 47)] public DateTime? OperationDeadlineUtc;
+        [DataMember(Order = 48)] public DateTime? ProgressDeadlineUtc;
     }
 
     [DataContract]
@@ -147,6 +152,10 @@ namespace RimWorldDevBridge
         [DataMember(Order = 58)] public string MapTarget;
         [DataMember(Order = 59)] public string MutationScope;
         [DataMember(Order = 60)] public string ProcessStartIdentity;
+        [DataMember(Order = 61)] public string GoalId;
+        [DataMember(Order = 62)] public string RequestedWorkflow;
+        [DataMember(Order = 63)] public string AuthorizationReference;
+        [DataMember(Order = 64)] public DateTime? OperationDeadlineUtc;
     }
 
     [DataContract]
@@ -206,7 +215,9 @@ namespace RimWorldDevBridge
             int progressTimeoutMs = 120000, BridgeClientIdentity identity = null,
             BridgeOperationCompatibilityKey compatibility = null, string operationId = null,
             string runtimeSlotId = null, string deploymentId = null, string artifactFingerprint = null,
-            string loadedAssemblyFingerprint = null)
+             string loadedAssemblyFingerprint = null, string goalId = null,
+             string requestedWorkflow = null, string authorizationReference = null,
+             DateTime? operationDeadlineUtc = null, DateTime? progressDeadlineUtc = null)
         {
             lock (gate)
             {
@@ -238,6 +249,8 @@ namespace RimWorldDevBridge
                         requestedSessionId);
                     PopulateTicket(unauthorized, identity, sharedOperationId, canonicalCompatibility,
                         runtimeSlotId, deploymentId, artifactFingerprint, loadedAssemblyFingerprint);
+                    PopulateWorkflow(unauthorized, goalId, requestedWorkflow, authorizationReference,
+                        operationDeadlineUtc, progressDeadlineUtc);
                     state.Tickets.Add(unauthorized);
                     Touch();
                     return Clone(unauthorized);
@@ -263,6 +276,8 @@ namespace RimWorldDevBridge
                             requestedSessionId);
                         PopulateTicket(staleBlocked, identity, sharedOperationId, canonicalCompatibility,
                             runtimeSlotId, deploymentId, artifactFingerprint, loadedAssemblyFingerprint);
+                        PopulateWorkflow(staleBlocked, goalId, requestedWorkflow, authorizationReference,
+                            operationDeadlineUtc, progressDeadlineUtc);
                         state.Tickets.Add(staleBlocked);
                         Touch();
                         return Clone(staleBlocked);
@@ -276,6 +291,8 @@ namespace RimWorldDevBridge
                             requestedSessionId);
                         PopulateTicket(blocked, identity, sharedOperationId, canonicalCompatibility,
                             runtimeSlotId, deploymentId, artifactFingerprint, loadedAssemblyFingerprint);
+                        PopulateWorkflow(blocked, goalId, requestedWorkflow, authorizationReference,
+                            operationDeadlineUtc, progressDeadlineUtc);
                         state.Tickets.Add(blocked);
                         Touch();
                         return Clone(blocked);
@@ -309,7 +326,11 @@ namespace RimWorldDevBridge
                         RuntimeSlotId = Bound(runtimeSlotId, 128),
                         DeploymentId = Bound(deploymentId, 128),
                         ArtifactFingerprint = Bound(artifactFingerprint, 256),
-                         LoadedAssemblyFingerprint = Bound(loadedAssemblyFingerprint, 256),
+                          LoadedAssemblyFingerprint = Bound(loadedAssemblyFingerprint, 256),
+                          GoalId = Bound(goalId, 256),
+                          RequestedWorkflow = Bound(requestedWorkflow, 128),
+                          AuthorizationReference = Bound(authorizationReference, 256),
+                          OperationDeadlineUtc = operationDeadlineUtc,
                          ManagedProfile = Bound(compatibility == null ? string.Empty : compatibility.ManagedProfile, 256),
                          RimWorldVersion = Bound(compatibility == null ? string.Empty : compatibility.RimWorldVersion, 128),
                          ModSetFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ModSetFingerprint, 256),
@@ -352,17 +373,23 @@ namespace RimWorldDevBridge
                     if (string.IsNullOrEmpty(cycle.ConfigurationFingerprint)) cycle.ConfigurationFingerprint = Bound(compatibility == null ? string.Empty : compatibility.ConfigurationFingerprint, 256);
                     if (string.IsNullOrEmpty(cycle.UserRootFingerprint)) cycle.UserRootFingerprint = Bound(compatibility == null ? string.Empty : compatibility.UserRootFingerprint, 256);
                     if (string.IsNullOrEmpty(cycle.SaveTarget)) cycle.SaveTarget = Bound(compatibility == null ? string.Empty : compatibility.SaveTarget, 256);
-                    if (string.IsNullOrEmpty(cycle.MapTarget)) cycle.MapTarget = Bound(compatibility == null ? string.Empty : compatibility.MapTarget, 256);
-                    if (string.IsNullOrEmpty(cycle.MutationScope)) cycle.MutationScope = Bound(compatibility == null ? string.Empty : compatibility.MutationScope, 256);
+                     if (string.IsNullOrEmpty(cycle.MapTarget)) cycle.MapTarget = Bound(compatibility == null ? string.Empty : compatibility.MapTarget, 256);
+                     if (string.IsNullOrEmpty(cycle.MutationScope)) cycle.MutationScope = Bound(compatibility == null ? string.Empty : compatibility.MutationScope, 256);
+                     if (string.IsNullOrEmpty(cycle.GoalId)) cycle.GoalId = Bound(goalId, 256);
+                     if (string.IsNullOrEmpty(cycle.RequestedWorkflow)) cycle.RequestedWorkflow = Bound(requestedWorkflow, 128);
+                     if (string.IsNullOrEmpty(cycle.AuthorizationReference)) cycle.AuthorizationReference = Bound(authorizationReference, 256);
+                     if (!cycle.OperationDeadlineUtc.HasValue) cycle.OperationDeadlineUtc = operationDeadlineUtc;
                 }
                 BridgeRestartPhase ticketPhase = ParsePhase(cycle.Phase);
                 BridgeRestartTicketRecord ticket = NewTicket(cycle.CycleId, agentId, packageId, reason,
                     readiness, savePolicy, requiredCoreFingerprint, requiredAdapterFingerprint,
                     ticketPhase, "restart_requested", target, cycle.RequiresNewProcess || requiresNewProcess,
                     requestedLifecycleGeneration, requestedPid, requestedSessionId);
-                PopulateTicket(ticket, identity, cycle.OperationId, cycle.CompatibilityKey,
-                    cycle.RuntimeSlotId, cycle.DeploymentId, cycle.ArtifactFingerprint,
-                    cycle.LoadedAssemblyFingerprint);
+                 PopulateTicket(ticket, identity, cycle.OperationId, cycle.CompatibilityKey,
+                     cycle.RuntimeSlotId, cycle.DeploymentId, cycle.ArtifactFingerprint,
+                     cycle.LoadedAssemblyFingerprint);
+                 PopulateWorkflow(ticket, cycle.GoalId, cycle.RequestedWorkflow, cycle.AuthorizationReference,
+                     cycle.OperationDeadlineUtc, cycle.ProgressDeadlineUtc);
                 cycle.TicketIds.Add(ticket.Ticket);
                 AddParticipant(cycle, identity);
                 state.Tickets.Add(ticket);
@@ -913,6 +940,18 @@ namespace RimWorldDevBridge
             ticket.Terminal = ticket.Phase == BridgeRestartPhase.READY.ToString() ||
                 ticket.Phase == BridgeRestartPhase.FAILED.ToString() ||
                 ticket.Phase == BridgeRestartPhase.USER_RESTART_REQUIRED.ToString();
+        }
+
+        private static void PopulateWorkflow(BridgeRestartTicketRecord ticket, string goalId,
+            string requestedWorkflow, string authorizationReference, DateTime? operationDeadlineUtc,
+            DateTime? progressDeadlineUtc)
+        {
+            if (ticket == null) return;
+            ticket.GoalId = Bound(goalId, 256);
+            ticket.RequestedWorkflow = Bound(requestedWorkflow, 128);
+            ticket.AuthorizationReference = Bound(authorizationReference, 256);
+            ticket.OperationDeadlineUtc = operationDeadlineUtc;
+            ticket.ProgressDeadlineUtc = progressDeadlineUtc;
         }
 
         private static void ValidateRequest(string readiness, string savePolicy)

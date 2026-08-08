@@ -17,7 +17,7 @@ using System.Threading;
 using RimWorldDevBridge;
 
 namespace RimWorldDevBridge.RestartCoordinator
-{
+                 {
     [DataContract]
     internal sealed class CoordinatorMessage
     {
@@ -74,6 +74,11 @@ namespace RimWorldDevBridge.RestartCoordinator
         [DataMember(Order = 51)] public string MutationScope;
         [DataMember(Order = 52)] public string ClientCredential;
         [DataMember(Order = 53)] public string SandboxAuthorizationPath;
+        [DataMember(Order = 54)] public string GoalId;
+        [DataMember(Order = 55)] public string RequestedWorkflow;
+        [DataMember(Order = 56)] public string AuthorizationReference;
+        [DataMember(Order = 57)] public DateTime? OperationDeadlineUtc;
+        [DataMember(Order = 58)] public int ProgressTimeoutMs = 120000;
     }
 
     [DataContract]
@@ -226,9 +231,14 @@ namespace RimWorldDevBridge.RestartCoordinator
                  UserRootFingerprint = Get(options, "user-root-fingerprint"),
                  SaveTarget = Get(options, "save-target"),
                  MapTarget = Get(options, "map-target"),
-                  MutationScope = Get(options, "mutation-scope"),
-                  ClientCredential = Get(options, "client-credential"),
-                  SandboxAuthorizationPath = Get(options, "sandbox-authorization-path")
+                   MutationScope = Get(options, "mutation-scope"),
+                   ClientCredential = Get(options, "client-credential"),
+                   SandboxAuthorizationPath = Get(options, "sandbox-authorization-path"),
+                   GoalId = Get(options, "goal-id"),
+                   RequestedWorkflow = Get(options, "requested-workflow"),
+                   AuthorizationReference = Get(options, "authorization-reference"),
+                   OperationDeadlineUtc = ParseDateTime(Get(options, "operation-deadline-utc")),
+                   ProgressTimeoutMs = ParseInt(Get(options, "progress-timeout-ms", "120000"), 120000)
              };
         }
 
@@ -271,6 +281,12 @@ namespace RimWorldDevBridge.RestartCoordinator
         {
             long result;
             return long.TryParse(value, out result) ? result : fallback;
+        }
+
+        private static DateTime? ParseDateTime(string value)
+        {
+            DateTime result;
+            return DateTime.TryParse(value, out result) ? result.ToUniversalTime() : (DateTime?)null;
         }
 
         internal static string Json(object value)
@@ -441,8 +457,10 @@ namespace RimWorldDevBridge.RestartCoordinator
                 message.LaunchBackoffMs, message.TargetPostcondition, requiresNewProcess,
                 message.RequestedLifecycleGeneration, message.RequestedPid, message.RequestedSessionId,
                 message.AllowSupersede, message.TimeoutMs, identity, compatibility, message.OperationId,
-                message.RuntimeSlotId, message.DeploymentId, message.ArtifactFingerprint,
-                 message.LoadedAssemblyFingerprint);
+                 message.RuntimeSlotId, message.DeploymentId, message.ArtifactFingerprint,
+                  message.LoadedAssemblyFingerprint, message.GoalId, message.RequestedWorkflow,
+                  message.AuthorizationReference, message.OperationDeadlineUtc,
+                  message.OperationDeadlineUtc?.AddMilliseconds(message.ProgressTimeoutMs));
              RememberCredential(message, ticket.Ticket);
             Persist("request " + ticket.Ticket);
             return TicketResponse(ticket);
@@ -1330,8 +1348,19 @@ namespace RimWorldDevBridge.RestartCoordinator
                     "participantId=" + Uri.EscapeDataString(ticket?.ParticipantId ?? "restart-participant"),
                     "correlationId=" + Uri.EscapeDataString(ticket?.CorrelationId ?? id),
                     "operationKind=Restart",
-                    "desiredState=" + Uri.EscapeDataString(cycle.TargetPostcondition ?? "bridge")
-                };
+                     "desiredState=" + Uri.EscapeDataString(cycle.TargetPostcondition ?? "bridge")
+                 };
+                 AddBridgeOption(optionValues, "goalId", ticket?.GoalId ?? cycle.GoalId);
+                 AddBridgeOption(optionValues, "requestedWorkflow", ticket?.RequestedWorkflow ?? cycle.RequestedWorkflow);
+                 AddBridgeOption(optionValues, "authorizationReference", ticket?.AuthorizationReference ?? cycle.AuthorizationReference);
+                 if ((ticket?.OperationDeadlineUtc ?? cycle.OperationDeadlineUtc).HasValue)
+                     AddBridgeOption(optionValues, "operationDeadlineUtc",
+                         (ticket?.OperationDeadlineUtc ?? cycle.OperationDeadlineUtc).Value.ToUniversalTime().ToString("o"));
+                 DateTime progressDeadline = ticket != null && ticket.ProgressDeadlineUtc.HasValue
+                     ? ticket.ProgressDeadlineUtc.Value : cycle.ProgressDeadlineUtc;
+                 if (progressDeadline != default(DateTime))
+                     AddBridgeOption(optionValues, "progressTimeoutMs",
+                         Math.Max(1, (int)(progressDeadline - DateTime.UtcNow).TotalMilliseconds).ToString(CultureInfo.InvariantCulture));
                 string credential;
                 if (ticket != null && TryGetCredential(ticket.Ticket, out credential) &&
                     !string.IsNullOrWhiteSpace(credential))

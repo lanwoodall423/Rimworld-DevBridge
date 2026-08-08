@@ -8,7 +8,7 @@ namespace RimWorldDevBridge
     [DataContract]
     public sealed class BridgeOperationLimits
     {
-        [DataMember(Order = 1)] public int MaximumActiveOperations = 4;
+        [DataMember(Order = 1)] public int MaximumActiveOperations = 1;
         [DataMember(Order = 2)] public int MaximumQueuedOperations = 64;
         [DataMember(Order = 3)] public int MaximumActivePerAgent = 2;
         [DataMember(Order = 4)] public int MaximumQueuedPerAgent = 16;
@@ -82,6 +82,16 @@ namespace RimWorldDevBridge
         [DataMember(Order = 30)] public List<string> CallerGoalIds = new List<string>();
         [DataMember(Order = 31)] public List<BridgeOperationParticipantRecord> Participants =
             new List<BridgeOperationParticipantRecord>();
+        [DataMember(Order = 32)] public int Version = 2;
+        [DataMember(Order = 33)] public string RequestedWorkflow;
+        [DataMember(Order = 34)] public string CurrentPhase;
+        [DataMember(Order = 35)] public List<string> CompletedPhases = new List<string>();
+        [DataMember(Order = 36)] public DateTime DeadlineUtc;
+        [DataMember(Order = 37)] public DateTime ProgressDeadlineUtc;
+        [DataMember(Order = 38)] public string AuthorizationReference;
+        [DataMember(Order = 39)] public string TerminalResultCode;
+        [DataMember(Order = 40)] public string TerminalResultDetail;
+        [DataMember(Order = 41)] public string CleanupStatus;
 
         public int ActiveParticipantCount => Participants.Count(item => item.State == BridgeParticipationState.Attached);
     }
@@ -89,7 +99,7 @@ namespace RimWorldDevBridge
     [DataContract]
     internal sealed class BridgeSharedOperationState
     {
-        [DataMember(Order = 1)] public int SchemaVersion = 1;
+        [DataMember(Order = 1)] public int SchemaVersion = 2;
         [DataMember(Order = 2)] public long Sequence;
         [DataMember(Order = 3)] public long QueueSequence;
         [DataMember(Order = 4)] public List<BridgeOperationRecord> Operations =
@@ -110,6 +120,104 @@ namespace RimWorldDevBridge
         public string ArtifactFingerprint;
         public string LoadedAssemblyFingerprint;
         public bool KeepRunning;
+        public string RequestedWorkflow;
+        public DateTime DeadlineUtc;
+        public DateTime ProgressDeadlineUtc;
+        public string AuthorizationReference;
+    }
+
+    internal static class BridgeOperationStateMachine
+    {
+        internal static bool IsTerminal(BridgeOperationState state)
+        {
+            return state == BridgeOperationState.Succeeded || state == BridgeOperationState.Failed ||
+                state == BridgeOperationState.Denied || state == BridgeOperationState.Cancelled ||
+                state == BridgeOperationState.TimedOut || state == BridgeOperationState.Abandoned;
+        }
+
+        internal static void Transition(BridgeOperationRecord operation, BridgeOperationState next,
+            DateTime nowUtc, string phase, string resultCode = null, string resultDetail = null)
+        {
+            if (operation == null) throw new InvalidOperationException("operation_not_found");
+            BridgeOperationState current = operation.OperationState;
+            if (current == next)
+            {
+                if (!string.IsNullOrWhiteSpace(phase)) operation.CurrentPhase = Bound(phase, 64);
+                return;
+            }
+            if (IsTerminal(current)) throw new InvalidOperationException("operation_terminal");
+            if (!CanTransition(current, next))
+                throw new InvalidOperationException("operation_transition_invalid");
+            if (!string.IsNullOrWhiteSpace(operation.CurrentPhase) &&
+                (operation.CompletedPhases == null || !operation.CompletedPhases.Contains(operation.CurrentPhase)))
+            {
+                if (operation.CompletedPhases == null) operation.CompletedPhases = new List<string>();
+                operation.CompletedPhases.Add(Bound(operation.CurrentPhase, 64));
+            }
+            operation.OperationState = next;
+            operation.CurrentPhase = Bound(phase ?? next.ToString().ToLowerInvariant(), 64);
+            operation.UpdatedAtUtc = nowUtc;
+            if (IsTerminal(next))
+            {
+                operation.Terminal = true;
+                operation.TerminalResultCode = Bound(resultCode, 128);
+                operation.TerminalResultDetail = Bound(resultDetail, 512);
+                operation.CleanupStatus = string.Equals(next.ToString(), "Succeeded", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(next.ToString(), "Failed", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(next.ToString(), "Denied", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(next.ToString(), "TimedOut", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(next.ToString(), "Cancelled", StringComparison.OrdinalIgnoreCase) ?
+                    "pending" : "complete";
+            }
+        }
+
+        internal static bool CanTransition(BridgeOperationState current, BridgeOperationState next)
+        {
+            if (current == next) return true;
+            switch (current)
+            {
+                case BridgeOperationState.Pending:
+                    return next == BridgeOperationState.Queued || next == BridgeOperationState.WaitingForAuthorization ||
+                        next == BridgeOperationState.WaitingForCapacity || next == BridgeOperationState.Denied ||
+                        next == BridgeOperationState.Failed || next == BridgeOperationState.Cancelled ||
+                        next == BridgeOperationState.TimedOut || next == BridgeOperationState.Abandoned;
+                case BridgeOperationState.Queued:
+                    return next == BridgeOperationState.Running || next == BridgeOperationState.WaitingForCapacity ||
+                        next == BridgeOperationState.WaitingForAuthorization || next == BridgeOperationState.Denied ||
+                        next == BridgeOperationState.Failed || next == BridgeOperationState.Cancelled ||
+                        next == BridgeOperationState.TimedOut || next == BridgeOperationState.Abandoned;
+                case BridgeOperationState.WaitingForAuthorization:
+                    return next == BridgeOperationState.Pending || next == BridgeOperationState.Queued ||
+                        next == BridgeOperationState.Running || next == BridgeOperationState.Denied ||
+                        next == BridgeOperationState.Failed || next == BridgeOperationState.Cancelled ||
+                        next == BridgeOperationState.TimedOut || next == BridgeOperationState.Abandoned;
+                case BridgeOperationState.WaitingForCapacity:
+                    return next == BridgeOperationState.Queued || next == BridgeOperationState.Running ||
+                        next == BridgeOperationState.WaitingForAuthorization ||
+                        next == BridgeOperationState.Denied || next == BridgeOperationState.Failed ||
+                        next == BridgeOperationState.Cancelled || next == BridgeOperationState.TimedOut ||
+                        next == BridgeOperationState.Abandoned;
+                case BridgeOperationState.Running:
+                    return next == BridgeOperationState.WaitingForAuthorization ||
+                        next == BridgeOperationState.Recovering || next == BridgeOperationState.Succeeded ||
+                        next == BridgeOperationState.Failed || next == BridgeOperationState.Denied ||
+                        next == BridgeOperationState.Cancelled || next == BridgeOperationState.TimedOut ||
+                        next == BridgeOperationState.Abandoned;
+                case BridgeOperationState.Recovering:
+                    return next == BridgeOperationState.Queued || next == BridgeOperationState.Running ||
+                        next == BridgeOperationState.Succeeded || next == BridgeOperationState.Failed ||
+                        next == BridgeOperationState.Denied || next == BridgeOperationState.Cancelled ||
+                        next == BridgeOperationState.TimedOut || next == BridgeOperationState.Abandoned;
+                default:
+                    return false;
+            }
+        }
+
+        private static string Bound(string value, int maximum)
+        {
+            if (string.IsNullOrEmpty(value)) return value;
+            return value.Length <= maximum ? value : value.Substring(0, maximum);
+        }
     }
 
     [DataContract]
@@ -165,6 +273,7 @@ namespace RimWorldDevBridge
                 using (BridgeDurableJson.AcquireStateLock(statePath))
                 {
                     ReloadLocked();
+                    AdvanceDeadlinesLocked();
                 BridgeOperationRecord operation = state.Operations.LastOrDefault(item =>
                     !item.Terminal && string.Equals(item.CompatibilityKey, request.Compatibility.ToString(),
                         StringComparison.Ordinal));
@@ -182,6 +291,8 @@ namespace RimWorldDevBridge
                         return CapacityResult(null, request.Identity.ParticipantId, "client_queue_limit",
                             "wait for this client instance's fair capacity and retry");
                     operation = NewOperation(request);
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Queued,
+                        clock.UtcNow, "capacity");
                     state.Operations.Add(operation);
                     byId.Add(operation.OperationId, operation);
                     created = true;
@@ -217,7 +328,8 @@ namespace RimWorldDevBridge
                 }
                 if (!string.IsNullOrWhiteSpace(request.GoalId) && !operation.CallerGoalIds.Contains(request.GoalId))
                     operation.CallerGoalIds.Add(request.GoalId);
-                if (created || operation.OperationState == BridgeOperationState.Queued)
+                if (created || operation.OperationState == BridgeOperationState.Queued ||
+                    operation.OperationState == BridgeOperationState.WaitingForCapacity)
                     StartAvailableLocked();
                 TouchLocked(operation);
                 PersistLocked();
@@ -247,8 +359,9 @@ namespace RimWorldDevBridge
                     operation.ArtifactFingerprint = artifactFingerprint;
                 operation.CapacityState = "admitted";
                 operation.NextAction = "retry the original request to execute admitted work in the managed runtime slot";
-                if (operation.OperationState == BridgeOperationState.Queued)
-                    operation.OperationState = BridgeOperationState.Running;
+                if (operation.OperationState != BridgeOperationState.Running)
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Running,
+                        clock.UtcNow, "runtime");
                 operation.Recoverable = false;
                 operation.RetrySafe = false;
                 TouchLocked(operation);
@@ -274,7 +387,15 @@ namespace RimWorldDevBridge
                 operation.NextAction = Bound(nextAction, 256);
                 operation.Recoverable = queued;
                 operation.RetrySafe = queued;
-                if (queued) operation.OperationState = BridgeOperationState.Queued;
+                if (queued)
+                {
+                    if (operation.OperationState == BridgeOperationState.Running)
+                        BridgeOperationStateMachine.Transition(operation, BridgeOperationState.WaitingForCapacity,
+                            clock.UtcNow, "capacity");
+                    else if (operation.OperationState != BridgeOperationState.WaitingForCapacity)
+                        BridgeOperationStateMachine.Transition(operation, BridgeOperationState.WaitingForCapacity,
+                            clock.UtcNow, "capacity");
+                }
                 TouchLocked(operation);
                 PersistLocked();
                 return Clone(operation);
@@ -290,6 +411,7 @@ namespace RimWorldDevBridge
                 using (BridgeDurableJson.AcquireStateLock(statePath))
                 {
                     ReloadLocked();
+                AdvanceDeadlinesLocked();
                 BridgeOperationRecord operation = Find(operationId);
                 BridgeOperationParticipantRecord participant = RequireOwnedParticipant(operation, identity, true);
                 participant.LastSeenAtUtc = clock.UtcNow;
@@ -308,6 +430,7 @@ namespace RimWorldDevBridge
                 using (BridgeDurableJson.AcquireStateLock(statePath))
                 {
                     ReloadLocked();
+                AdvanceDeadlinesLocked();
                 BridgeOperationRecord operation = Find(operationId);
                 BridgeOperationParticipantRecord participant = RequireOwnedParticipant(operation, identity, true);
                 string quotaFailure = ParticipantQuotaFailureLocked(operation, identity);
@@ -349,6 +472,12 @@ namespace RimWorldDevBridge
                 if (sequence <= operation.ProgressSequence) return Clone(operation);
                 operation.ProgressSequence = sequence;
                 operation.LastProgressAtUtc = clock.UtcNow;
+                if (operation.ProgressDeadlineUtc != default(DateTime))
+                {
+                    TimeSpan progressWindow = operation.ProgressDeadlineUtc - operation.LastProgressAtUtc;
+                    if (progressWindow <= TimeSpan.Zero) progressWindow = TimeSpan.FromSeconds(1);
+                    operation.ProgressDeadlineUtc = clock.UtcNow.Add(progressWindow);
+                }
                 operation.NextAction = nextAction ?? operation.NextAction;
                 participant.LastObservedProgressSequence = sequence;
                 participant.LastSeenAtUtc = clock.UtcNow;
@@ -411,10 +540,11 @@ namespace RimWorldDevBridge
                     throw new InvalidOperationException("operation_loaded_fingerprint_mismatch");
                 if (!string.IsNullOrEmpty(loadedAssemblyFingerprint))
                     operation.LoadedAssemblyFingerprint = loadedAssemblyFingerprint;
-                operation.OperationState = string.IsNullOrEmpty(failureCode) ? BridgeOperationState.Succeeded :
+                BridgeOperationState next = string.IsNullOrEmpty(failureCode) ? BridgeOperationState.Succeeded :
                     BridgeOperationState.Failed;
+                BridgeOperationStateMachine.Transition(operation, next, clock.UtcNow, "cleanup",
+                    failureCode, failureCode);
                 operation.FailureCode = failureCode;
-                operation.Terminal = true;
                 operation.Recoverable = !string.IsNullOrEmpty(failureCode);
                 operation.RetrySafe = operation.Recoverable;
                 operation.NextAction = operation.Recoverable ? "inspect operation evidence and retry" : "none";
@@ -423,6 +553,91 @@ namespace RimWorldDevBridge
                 PersistLocked();
                 return Clone(operation);
                 }
+            }
+        }
+
+        public BridgeOperationRecord MarkCleanup(string operationId, BridgeClientIdentity identity,
+            bool succeeded, string detail = null)
+        {
+            if (identity == null) throw new ArgumentException("identity_required");
+            lock (gate)
+            using (BridgeDurableJson.AcquireStateLock(statePath))
+            {
+                ReloadLocked();
+                BridgeOperationRecord operation = Find(operationId);
+                RequireOwnedParticipant(operation, identity, true);
+                if (!operation.Terminal) throw new InvalidOperationException("operation_not_terminal");
+                operation.CleanupStatus = succeeded ? "complete" : "failed";
+                if (!succeeded)
+                {
+                    operation.Recoverable = true;
+                    operation.RetrySafe = true;
+                    operation.NextAction = "retry cleanup after inspecting the retained runtime state";
+                }
+                if (!string.IsNullOrWhiteSpace(detail)) operation.TerminalResultDetail = Bound(detail, 512);
+                TouchLocked(operation);
+                PersistLocked();
+                return Clone(operation);
+            }
+        }
+
+        public BridgeOperationRecord WaitForAuthorization(string operationId, BridgeClientIdentity identity,
+            string authorizationReference)
+        {
+            if (identity == null) throw new ArgumentException("identity_required");
+            lock (gate)
+            using (BridgeDurableJson.AcquireStateLock(statePath))
+            {
+                ReloadLocked();
+                BridgeOperationRecord operation = Find(operationId);
+                RequireOwnedParticipant(operation, identity, false);
+                if (operation.Terminal) return Clone(operation);
+                if (operation.OperationState != BridgeOperationState.WaitingForAuthorization)
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.WaitingForAuthorization,
+                        clock.UtcNow, "authorization");
+                operation.AuthorizationReference = Bound(authorizationReference, 256);
+                operation.Recoverable = true;
+                operation.RetrySafe = true;
+                operation.NextAction = "provide the required authorization and retry";
+                TouchLocked(operation);
+                PersistLocked();
+                return Clone(operation);
+            }
+        }
+
+        public BridgeOperationRecord Deny(string operationId, BridgeClientIdentity identity,
+            string code = "authorization_denied", string detail = null)
+        {
+            if (identity == null) throw new ArgumentException("identity_required");
+            lock (gate)
+            using (BridgeDurableJson.AcquireStateLock(statePath))
+            {
+                ReloadLocked();
+                BridgeOperationRecord operation = Find(operationId);
+                RequireOwnedParticipant(operation, identity, false);
+                if (!operation.Terminal)
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Denied,
+                        clock.UtcNow, "cleanup", Bound(code, 128), Bound(detail, 512));
+                operation.FailureCode = Bound(code, 128);
+                operation.Recoverable = false;
+                operation.RetrySafe = false;
+                operation.NextAction = "none";
+                TouchLocked(operation);
+                StartAvailableLocked();
+                PersistLocked();
+                return Clone(operation);
+            }
+        }
+
+        public int AdvanceDeadlines()
+        {
+            lock (gate)
+            using (BridgeDurableJson.AcquireStateLock(statePath))
+            {
+                ReloadLocked();
+                int changed = AdvanceDeadlinesLocked();
+                if (changed > 0) PersistLocked();
+                return changed;
             }
         }
 
@@ -441,22 +656,30 @@ namespace RimWorldDevBridge
                     bool valid = ownershipStillValid == null || ownershipStillValid(Clone(operation));
                     if (!valid && operation.LaunchIssued)
                     {
-                        operation.OperationState = BridgeOperationState.Failed;
-                        operation.Terminal = true;
+                        BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Failed,
+                            clock.UtcNow, "cleanup", "stale_operation_ownership",
+                            "persisted process ownership no longer matches");
                         operation.Recoverable = true;
                         operation.RetrySafe = true;
                         operation.FailureCode = "stale_operation_ownership";
                         operation.NextAction = "reconcile PID, process start identity, session, and slot before retrying";
                     }
-                    else if (operation.OperationState == BridgeOperationState.Queued)
+                    else if (operation.OperationState == BridgeOperationState.Queued ||
+                        operation.OperationState == BridgeOperationState.Pending ||
+                        operation.OperationState == BridgeOperationState.WaitingForCapacity ||
+                        operation.OperationState == BridgeOperationState.WaitingForAuthorization)
                     {
                         operation.Recoverable = true;
                         operation.RetrySafe = true;
-                        operation.NextAction = "wait for fair capacity scheduling";
+                        operation.NextAction = operation.OperationState == BridgeOperationState.WaitingForAuthorization ?
+                            "obtain the required authorization before retrying" :
+                            "wait for fair capacity scheduling";
                     }
                     else
                     {
-                        operation.OperationState = BridgeOperationState.Recovering;
+                        if (operation.OperationState != BridgeOperationState.Recovering)
+                            BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Recovering,
+                                clock.UtcNow, "recovery");
                         operation.Recoverable = true;
                         operation.RetrySafe = true;
                         operation.NextAction = "reconnect or detach the persisted participants";
@@ -477,6 +700,8 @@ namespace RimWorldDevBridge
             using (BridgeDurableJson.AcquireStateLock(statePath))
             {
                 ReloadLocked();
+                bool changed = AdvanceDeadlinesLocked() > 0;
+                if (changed) PersistLocked();
                 return state.Operations.Select(Clone).ToList();
             }
         }
@@ -522,18 +747,21 @@ namespace RimWorldDevBridge
             switch (operation.AbandonmentPolicy)
             {
                 case BridgeAbandonmentPolicy.CancelSafely:
-                    operation.OperationState = BridgeOperationState.Cancelled;
-                    operation.Terminal = true;
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Cancelled,
+                        clock.UtcNow, "cleanup", "participant_abandoned", "all participants detached");
                     operation.KeepRunning = false;
                     operation.NextAction = "none";
                     break;
                 case BridgeAbandonmentPolicy.LeaveRuntimeRunning:
-                    operation.OperationState = BridgeOperationState.Abandoned;
-                    operation.Terminal = true;
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Abandoned,
+                        clock.UtcNow, "cleanup", "participant_abandoned", "all participants detached");
                     operation.KeepRunning = true;
                     operation.NextAction = "managed runtime remains running; inspect or retire the slot explicitly";
                     break;
                 default:
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Succeeded,
+                        clock.UtcNow, "cleanup", "participant_abandoned",
+                        "safe work completed after all participants detached");
                     operation.KeepRunning = true;
                     operation.NextAction = "complete safe shared work without waiting participants";
                     break;
@@ -556,7 +784,8 @@ namespace RimWorldDevBridge
                 .SelectMany(item => ClientKeys(item)).GroupBy(item => item)
                 .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
             List<BridgeOperationRecord> pending = state.Operations.Where(item => !item.Terminal &&
-                item.OperationState == BridgeOperationState.Queued).OrderBy(item => item.QueueSequence).ToList();
+                (item.OperationState == BridgeOperationState.Queued ||
+                 item.OperationState == BridgeOperationState.WaitingForCapacity)).OrderBy(item => item.QueueSequence).ToList();
             while (active < limits.MaximumActiveOperations && pending.Count > 0)
             {
                 BridgeOperationRecord operation = pending.FirstOrDefault(item =>
@@ -580,7 +809,8 @@ namespace RimWorldDevBridge
                     pending.Remove(operation);
                     continue;
                 }
-                operation.OperationState = BridgeOperationState.Running;
+                BridgeOperationStateMachine.Transition(operation, BridgeOperationState.Running,
+                    clock.UtcNow, "runtime");
                 operation.CapacityState = "admitted";
                 operation.NextAction = "observe progress or wait";
                 operation.LaunchIssued = false;
@@ -603,13 +833,15 @@ namespace RimWorldDevBridge
         private int QueuedCountLocked()
         {
             return state.Operations.Count(item => !item.Terminal &&
-                item.OperationState == BridgeOperationState.Queued);
+                (item.OperationState == BridgeOperationState.Queued ||
+                 item.OperationState == BridgeOperationState.WaitingForCapacity));
         }
 
         private int QueuedCountForAgentLocked(string agentId)
         {
             return state.Operations.Count(item => !item.Terminal &&
-                item.OperationState == BridgeOperationState.Queued &&
+                (item.OperationState == BridgeOperationState.Queued ||
+                 item.OperationState == BridgeOperationState.WaitingForCapacity) &&
                 AgentKeys(item).Contains(agentId));
         }
 
@@ -633,7 +865,8 @@ namespace RimWorldDevBridge
         {
             string client = ClientKey(identity.AgentId, identity.ClientInstanceId);
             if (ClientKeys(operation).Contains(client)) return null;
-            if (operation.OperationState == BridgeOperationState.Queued &&
+            if ((operation.OperationState == BridgeOperationState.Queued ||
+                 operation.OperationState == BridgeOperationState.WaitingForCapacity) &&
                 QueuedCountForClientLocked(identity.AgentId, identity.ClientInstanceId) >=
                 limits.MaximumQueuedPerClient)
                 return "client_queue_limit";
@@ -671,7 +904,7 @@ namespace RimWorldDevBridge
                 OperationId = string.IsNullOrWhiteSpace(request.OperationId) ?
                     "operation-" + Guid.NewGuid().ToString("N") : request.OperationId,
                 OperationKind = kind,
-                OperationState = BridgeOperationState.Queued,
+                OperationState = BridgeOperationState.Pending,
                 CompatibilityKey = request.Compatibility.ToString(),
                 DesiredState = request.DesiredState,
                 RuntimeSlotId = request.RuntimeSlotId ?? string.Empty,
@@ -685,6 +918,15 @@ namespace RimWorldDevBridge
                 RetrySafe = true,
                 NextAction = "wait for fair capacity scheduling",
                 RequestedGoalId = request.GoalId ?? string.Empty,
+                Version = 2,
+                RequestedWorkflow = Bound(request.RequestedWorkflow, 128),
+                CurrentPhase = "register",
+                DeadlineUtc = request.DeadlineUtc == default(DateTime) ?
+                    clock.UtcNow.AddMinutes(5) : request.DeadlineUtc,
+                ProgressDeadlineUtc = request.ProgressDeadlineUtc == default(DateTime) ?
+                    clock.UtcNow.AddSeconds(30) : request.ProgressDeadlineUtc,
+                AuthorizationReference = Bound(request.AuthorizationReference, 256),
+                CleanupStatus = "not_started",
                 QueueSequence = ++state.QueueSequence,
                 CreatedAtUtc = clock.UtcNow,
                 UpdatedAtUtc = clock.UtcNow,
@@ -815,6 +1057,43 @@ namespace RimWorldDevBridge
             state.Sequence++;
         }
 
+        private int AdvanceDeadlinesLocked()
+        {
+            DateTime now = clock.UtcNow;
+            int changed = 0;
+            foreach (BridgeOperationRecord operation in state.Operations.Where(item => !item.Terminal).ToList())
+            {
+                if (operation.DeadlineUtc != default(DateTime) && now >= operation.DeadlineUtc)
+                {
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.TimedOut, now,
+                        "cleanup", "operation_deadline_expired", "operation deadline elapsed");
+                    operation.FailureCode = "operation_deadline_expired";
+                    operation.Recoverable = true;
+                    operation.RetrySafe = true;
+                    operation.NextAction = "retry the operation after inspecting cleanup evidence";
+                    TouchLocked(operation);
+                    changed++;
+                    continue;
+                }
+                if ((operation.OperationState == BridgeOperationState.Running ||
+                    operation.OperationState == BridgeOperationState.Recovering) &&
+                    operation.ProgressDeadlineUtc != default(DateTime) &&
+                    now >= operation.ProgressDeadlineUtc)
+                {
+                    BridgeOperationStateMachine.Transition(operation, BridgeOperationState.TimedOut, now,
+                        "cleanup", "progress_deadline_expired", "no progress was observed before the deadline");
+                    operation.FailureCode = "progress_deadline_expired";
+                    operation.Recoverable = true;
+                    operation.RetrySafe = true;
+                    operation.NextAction = "reconnect or retry after inspecting cleanup evidence";
+                    TouchLocked(operation);
+                    changed++;
+                }
+            }
+            if (changed > 0) StartAvailableLocked();
+            return changed;
+        }
+
         private void PersistLocked()
         {
             if (!string.IsNullOrWhiteSpace(statePath)) BridgeDurableJson.WriteAtomic(statePath, state);
@@ -871,6 +1150,18 @@ namespace RimWorldDevBridge
             if (string.IsNullOrEmpty(operation.OperationId)) operation.OperationId = "operation-" + Guid.NewGuid().ToString("N");
             if (operation.LastProgressAtUtc == default(DateTime)) operation.LastProgressAtUtc = operation.UpdatedAtUtc;
             if (operation.UpdatedAtUtc == default(DateTime)) operation.UpdatedAtUtc = operation.CreatedAtUtc;
+            if (operation.Version <= 0) operation.Version = 1;
+            if (operation.CompletedPhases == null) operation.CompletedPhases = new List<string>();
+            if (string.IsNullOrEmpty(operation.CurrentPhase)) operation.CurrentPhase =
+                operation.OperationState.ToString().ToLowerInvariant();
+            if (string.IsNullOrEmpty(operation.CleanupStatus)) operation.CleanupStatus =
+                operation.Terminal ? "complete" : "not_started";
+            if (operation.DeadlineUtc == default(DateTime) && operation.CreatedAtUtc != default(DateTime))
+                operation.DeadlineUtc = operation.CreatedAtUtc.AddMinutes(5);
+            if (operation.ProgressDeadlineUtc == default(DateTime) &&
+                (operation.OperationState == BridgeOperationState.Running ||
+                 operation.OperationState == BridgeOperationState.Recovering))
+                operation.ProgressDeadlineUtc = operation.LastProgressAtUtc.AddSeconds(30);
         }
 
         private static BridgeOperationRecord Clone(BridgeOperationRecord source)
@@ -906,6 +1197,16 @@ namespace RimWorldDevBridge
                 QueueSequence = source.QueueSequence,
                 CreatedAtUtc = source.CreatedAtUtc,
                 UpdatedAtUtc = source.UpdatedAtUtc,
+                Version = source.Version,
+                RequestedWorkflow = source.RequestedWorkflow,
+                CurrentPhase = source.CurrentPhase,
+                CompletedPhases = source.CompletedPhases.ToList(),
+                DeadlineUtc = source.DeadlineUtc,
+                ProgressDeadlineUtc = source.ProgressDeadlineUtc,
+                AuthorizationReference = source.AuthorizationReference,
+                TerminalResultCode = source.TerminalResultCode,
+                TerminalResultDetail = source.TerminalResultDetail,
+                CleanupStatus = source.CleanupStatus,
                 CallerGoalIds = source.CallerGoalIds.ToList(),
                 Participants = source.Participants.Select(item => new BridgeOperationParticipantRecord
                 {

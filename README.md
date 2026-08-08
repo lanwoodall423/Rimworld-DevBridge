@@ -32,6 +32,12 @@ from a client label, command, naming convention, dev mode, or bridge state. The 
 coordinator controls only explicitly owned sandbox processes. Attached or live processes require a
 person or external orchestrator.
 
+Stage 2 uses one coordinator per user, one managed runtime slot, one active mutating workflow, and
+bounded concurrent pure-read diagnostics. Durable operations expose explicit pending, authorization,
+capacity, running, recovery, terminal, timeout, and cleanup states through `CAPABILITIES` and JSON
+responses. Incompatible work queues or returns structured busy capacity; parallel runtime orchestration
+is not advertised. A manual or externally owned RimWorld process cannot establish managed ownership.
+
 ## License
 
 Dev Bridge-owned source is released under the MIT License in `LICENSE`. The notice is included in

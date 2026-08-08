@@ -81,6 +81,7 @@ namespace RimWorldDevBridge
                 return false;
             }
             DateTime receivedUtc = DateTime.UtcNow;
+            int progressTimeoutMs = ParseBoundedInt(Value(options, "progressTimeoutMs"), 30000, 1000, 3600000);
             request = new BridgeRequest
             {
                 RequestId = id,
@@ -104,6 +105,10 @@ namespace RimWorldDevBridge
                 AuthToken = Value(options, "lease"),
                 OperationId = Value(options, "operationId"),
                 OperationKind = Value(options, "operationKind"),
+                GoalId = Value(options, "goalId"),
+                RequestedWorkflow = Value(options, "requestedWorkflow"),
+                AuthorizationReference = Value(options, "authorizationReference"),
+                ProgressDeadlineUtc = receivedUtc.AddMilliseconds(progressTimeoutMs),
                 DesiredState = Value(options, "desiredState"),
                 CompatibilityKey = Value(options, "compatibilityKey"),
                 ManagedProfile = Value(options, "managedProfile"),
@@ -137,6 +142,9 @@ namespace RimWorldDevBridge
                 !ValidOptionValue(request.SessionId, 128) || !ValidOptionValue(request.IdempotencyKey, 128) ||
                 !ValidOptionValue(request.AuthToken, 128) || !ValidOptionValue(request.DetailLevel, 32) ||
                  !ValidOptionValue(request.OperationId, 256) || !ValidOptionValue(request.OperationKind, 64) ||
+                 !ValidOptionValue(request.GoalId, 256) ||
+                 !ValidOptionValue(request.RequestedWorkflow, 128) ||
+                 !ValidOptionValue(request.AuthorizationReference, 256) ||
                  !ValidOptionValue(request.DesiredState, 64) || !ValidOptionValue(request.CompatibilityKey, 256) ||
                  !ValidOptionValue(request.RuntimeSlotId, 128) ||
                  !ValidOptionValue(request.DeploymentId, 256) || !ValidOptionValue(request.ArtifactFingerprint, 256) ||
@@ -193,6 +201,15 @@ namespace RimWorldDevBridge
             };
             if (result != null)
             {
+                if (!string.IsNullOrWhiteSpace(result.OperationId))
+                    lines.Add("operation=" + BridgeText.Clean(result.OperationId) + " state=" +
+                        BridgeText.Clean(result.OperationState) + " phase=" + BridgeText.Clean(result.OperationPhase));
+                if (!string.IsNullOrWhiteSpace(result.GoalId))
+                    lines.Add("goal=" + BridgeText.Clean(result.GoalId));
+                if (!string.IsNullOrWhiteSpace(result.CleanupStatus))
+                    lines.Add("cleanup=" + BridgeText.Clean(result.CleanupStatus));
+                if (!string.IsNullOrWhiteSpace(result.CapabilityVersion))
+                    lines.Add("capabilityVersion=" + BridgeText.Clean(result.CapabilityVersion));
                 lines.AddRange(result.Data.Select(field => BridgeText.Clean(field.Name) + "=" +
                     BridgeText.Clean(field.Value)));
                 lines.AddRange(result.Lines.Select(BridgeText.Clean));
@@ -372,6 +389,31 @@ namespace RimWorldDevBridge
             [System.Runtime.Serialization.DataMember(Order = 43)] public List<BridgeField> data;
             [System.Runtime.Serialization.DataMember(Order = 44)] public List<string> lines;
             [System.Runtime.Serialization.DataMember(Order = 45)] public List<string> warnings;
+            [System.Runtime.Serialization.DataMember(Order = 46)] public int operationVersion;
+            [System.Runtime.Serialization.DataMember(Order = 47)] public string operationPhase;
+            [System.Runtime.Serialization.DataMember(Order = 48)] public List<string> completedPhases;
+            [System.Runtime.Serialization.DataMember(Order = 49)] public string requestedWorkflow;
+            [System.Runtime.Serialization.DataMember(Order = 50)] public DateTime? operationDeadlineUtc;
+            [System.Runtime.Serialization.DataMember(Order = 51)] public DateTime? progressDeadlineUtc;
+            [System.Runtime.Serialization.DataMember(Order = 52)] public string authorizationReference;
+            [System.Runtime.Serialization.DataMember(Order = 53)] public string terminalResultCode;
+            [System.Runtime.Serialization.DataMember(Order = 54)] public string terminalResultDetail;
+            [System.Runtime.Serialization.DataMember(Order = 55)] public string cleanupStatus;
+            [System.Runtime.Serialization.DataMember(Order = 56)] public string capabilityVersion;
+            [System.Runtime.Serialization.DataMember(Order = 57)] public List<string> supportedOperationStates;
+            [System.Runtime.Serialization.DataMember(Order = 58)] public List<string> supportedOperationKinds;
+            [System.Runtime.Serialization.DataMember(Order = 59)] public List<string> readOperations;
+            [System.Runtime.Serialization.DataMember(Order = 60)] public List<string> mutationClasses;
+            [System.Runtime.Serialization.DataMember(Order = 61)] public int supportedRuntimeSlotCount;
+            [System.Runtime.Serialization.DataMember(Order = 62)] public bool concurrentReadDiagnostics;
+            [System.Runtime.Serialization.DataMember(Order = 63)] public string buildProvider;
+            [System.Runtime.Serialization.DataMember(Order = 64)] public string deploymentProvider;
+            [System.Runtime.Serialization.DataMember(Order = 65)] public bool adapterReloadSupported;
+            [System.Runtime.Serialization.DataMember(Order = 66)] public bool saveFixtureSupported;
+            [System.Runtime.Serialization.DataMember(Order = 67)] public List<string> evidenceTypes;
+            [System.Runtime.Serialization.DataMember(Order = 68)] public string authorizationMechanism;
+             [System.Runtime.Serialization.DataMember(Order = 69)] public List<string> platformRestrictions;
+             [System.Runtime.Serialization.DataMember(Order = 70)] public string goalId;
 
             internal static JsonResult From(BridgeResult result) => new JsonResult
             {
@@ -383,7 +425,8 @@ namespace RimWorldDevBridge
                 sessionId = result?.SessionId,
                 connectionSessionId = result?.ConnectionSessionId,
                 command = result?.Command,
-                operationId = result?.OperationId,
+                 operationId = result?.OperationId,
+                 goalId = result?.GoalId,
                 operationKind = result?.OperationKind,
                 operationState = result?.OperationState,
                 compatibilityKey = result?.CompatibilityKey,
@@ -420,6 +463,30 @@ namespace RimWorldDevBridge
                 data = result?.Data.ToList() ?? new List<BridgeField>(),
                 lines = result?.Lines.ToList() ?? new List<string>(),
                 warnings = result?.Warnings.ToList() ?? new List<string>()
+                ,operationVersion = result?.OperationVersion ?? 0
+                ,operationPhase = result?.OperationPhase
+                ,completedPhases = result?.CompletedPhases.ToList() ?? new List<string>()
+                ,requestedWorkflow = result?.RequestedWorkflow
+                ,operationDeadlineUtc = result?.OperationDeadlineUtc
+                ,progressDeadlineUtc = result?.ProgressDeadlineUtc
+                ,authorizationReference = result?.AuthorizationReference
+                ,terminalResultCode = result?.TerminalResultCode
+                ,terminalResultDetail = result?.TerminalResultDetail
+                ,cleanupStatus = result?.CleanupStatus
+                ,capabilityVersion = result?.CapabilityVersion
+                ,supportedOperationStates = result?.SupportedOperationStates.ToList() ?? new List<string>()
+                ,supportedOperationKinds = result?.SupportedOperationKinds.ToList() ?? new List<string>()
+                ,readOperations = result?.ReadOperations.ToList() ?? new List<string>()
+                ,mutationClasses = result?.MutationClasses.ToList() ?? new List<string>()
+                ,supportedRuntimeSlotCount = result?.SupportedRuntimeSlotCount ?? 0
+                ,concurrentReadDiagnostics = result?.ConcurrentReadDiagnostics ?? false
+                ,buildProvider = result?.BuildProvider
+                ,deploymentProvider = result?.DeploymentProvider
+                ,adapterReloadSupported = result?.AdapterReloadSupported ?? false
+                ,saveFixtureSupported = result?.SaveFixtureSupported ?? false
+                ,evidenceTypes = result?.EvidenceTypes.ToList() ?? new List<string>()
+                ,authorizationMechanism = result?.AuthorizationMechanism
+                ,platformRestrictions = result?.PlatformRestrictions.ToList() ?? new List<string>()
             };
         }
     }

@@ -50,6 +50,10 @@ namespace RimWorldDevBridge
                 Command = BridgeText.NormalizeCommand(command),
                 OperationId = parent.OperationId,
                 OperationKind = parent.OperationKind,
+                GoalId = parent.GoalId,
+                RequestedWorkflow = parent.RequestedWorkflow,
+                AuthorizationReference = parent.AuthorizationReference,
+                ProgressDeadlineUtc = parent.ProgressDeadlineUtc,
                 DesiredState = parent.DesiredState,
                 CompatibilityKey = parent.CompatibilityKey,
                 ManagedProfile = parent.ManagedProfile,
@@ -129,6 +133,10 @@ namespace RimWorldDevBridge
                 Argument = source.Argument,
                 OperationId = source.OperationId,
                 OperationKind = source.OperationKind,
+                GoalId = source.GoalId,
+                RequestedWorkflow = source.RequestedWorkflow,
+                AuthorizationReference = source.AuthorizationReference,
+                ProgressDeadlineUtc = source.ProgressDeadlineUtc,
                 DesiredState = source.DesiredState,
                 CompatibilityKey = source.CompatibilityKey,
                 ManagedProfile = source.ManagedProfile,
@@ -188,7 +196,11 @@ namespace RimWorldDevBridge
             result.ConnectionSessionId = call.Request.ConnectionSessionId;
             result.Command = call.Request.Command;
             result.OperationId = call.Request.OperationId;
+            result.GoalId = call.Request.GoalId;
             result.OperationKind = call.Request.OperationKind;
+            result.RequestedWorkflow = call.Request.RequestedWorkflow;
+            result.AuthorizationReference = call.Request.AuthorizationReference;
+            result.ProgressDeadlineUtc = call.Request.ProgressDeadlineUtc;
             result.DesiredState = call.Request.DesiredState;
             result.CompatibilityKey = call.Request.CompatibilityKey;
             result.RuntimeSlotId = call.Request.RuntimeSlotId;

@@ -1,5 +1,18 @@
 # RimWorld Dev Bridge architecture
 
+## Serialized Stage 2 Topology
+
+The supported operating model is intentionally serialized: one coordinator per user, one managed
+RimWorld runtime slot, and at most one mutating workflow. Pure diagnostics may overlap only when the
+scheduler classifies them as non-interfering. Incompatible work queues or returns a bounded structured
+busy result. Waiting work retains no runtime, mutation, deployment, save, or restart lease.
+
+Durable operations use a small validated state machine with versioned phase, completed-phase,
+authorization, deadline, terminal-result, and cleanup fields. Deadline polling and duplicate delivery
+are idempotent. `CAPABILITIES` describes only this topology and does not advertise general parallel
+runtime orchestration. Coordinator-created launch provenance remains the only route to managed process
+ownership; observing a live process never creates that provenance.
+
 ## Objective
 
 Provide an on-demand, local-only bridge that gives development clients compact,

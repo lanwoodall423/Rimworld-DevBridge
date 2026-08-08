@@ -370,8 +370,18 @@ namespace RimWorldDevBridge
                 ConnectionSessionId = source.ConnectionSessionId,
                 Command = source.Command,
                 OperationId = source.OperationId,
+                OperationVersion = source.OperationVersion,
+                GoalId = source.GoalId,
                 OperationKind = source.OperationKind,
                 OperationState = source.OperationState,
+                OperationPhase = source.OperationPhase,
+                RequestedWorkflow = source.RequestedWorkflow,
+                OperationDeadlineUtc = source.OperationDeadlineUtc,
+                ProgressDeadlineUtc = source.ProgressDeadlineUtc,
+                AuthorizationReference = source.AuthorizationReference,
+                TerminalResultCode = source.TerminalResultCode,
+                TerminalResultDetail = source.TerminalResultDetail,
+                CleanupStatus = source.CleanupStatus,
                 CompatibilityKey = source.CompatibilityKey,
                 DesiredState = source.DesiredState,
                 RuntimeSlotId = source.RuntimeSlotId,
@@ -389,6 +399,14 @@ namespace RimWorldDevBridge
                 NextAction = source.NextAction,
                 CapacityState = source.CapacityState,
                 KeepRunning = source.KeepRunning,
+                CapabilityVersion = source.CapabilityVersion,
+                SupportedRuntimeSlotCount = source.SupportedRuntimeSlotCount,
+                ConcurrentReadDiagnostics = source.ConcurrentReadDiagnostics,
+                BuildProvider = source.BuildProvider,
+                DeploymentProvider = source.DeploymentProvider,
+                AdapterReloadSupported = source.AdapterReloadSupported,
+                SaveFixtureSupported = source.SaveFixtureSupported,
+                AuthorizationMechanism = source.AuthorizationMechanism,
                 Provider = source.Provider,
                 ProviderVersion = source.ProviderVersion,
                 Mode = source.Mode,
@@ -412,6 +430,13 @@ namespace RimWorldDevBridge
             foreach (BridgeField field in source.Data) copy.AddCopiedField(field);
             foreach (string line in source.Lines) copy.AddLine(line);
             foreach (string warning in source.Warnings) copy.Warn(warning);
+            copy.CompletedPhases.AddRange(source.CompletedPhases);
+            copy.SupportedOperationStates.AddRange(source.SupportedOperationStates);
+            copy.SupportedOperationKinds.AddRange(source.SupportedOperationKinds);
+            copy.ReadOperations.AddRange(source.ReadOperations);
+            copy.MutationClasses.AddRange(source.MutationClasses);
+            copy.EvidenceTypes.AddRange(source.EvidenceTypes);
+            copy.PlatformRestrictions.AddRange(source.PlatformRestrictions);
             return copy;
         }
     }

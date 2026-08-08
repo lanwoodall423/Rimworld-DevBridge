@@ -290,8 +290,10 @@ namespace RimWorldDevBridge
 
         private static BridgeResult Capabilities()
         {
-            BridgeResult result = BridgeResult.Ok("core.capabilities")
-                .Add("bridge", BridgeProtocol.BridgeVersion)
+            BridgeResult result = BridgeCapabilities.Create(All.Concat(BridgeAdapterCatalog.Commands)
+                .Concat(BridgeFeatureTests.Commands)
+                .Concat(BridgeOrchestration.Commands));
+            result.Add("bridge", BridgeProtocol.BridgeVersion)
                 .Add("protocol", BridgeProtocol.ProtocolVersion)
                 .Add("formats", "line,json")
                 .Add("requestBytes", BridgeProtocol.MaxRequestBytes)
